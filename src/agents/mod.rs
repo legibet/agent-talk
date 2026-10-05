@@ -32,7 +32,7 @@ pub fn delivered(from: &Caller, text: &str) -> String {
     }
 }
 
-/// `text` without the provenance header `delivered` adds, for previews: the vendor's
+/// `text` without the provenance header `delivered` adds, for previews: the agent's
 /// first-prompt preview would otherwise show only the header.
 pub fn strip_provenance(text: &str) -> &str {
     match text.strip_prefix("[from ") {
@@ -58,7 +58,7 @@ pub fn pid_alive(pid: u32) -> bool {
 }
 
 /// The environment variables naming the session an agent-talk command runs in, with
-/// each one's provider, in the order the CLI derives its sender from them (DESIGN.md §4).
+/// the agent each one belongs to, in the order the CLI derives its sender from them (DESIGN.md §4).
 pub const SESSION_VARS: [(&str, &str); 5] = [
     ("CODEX_THREAD_ID", "codex"),
     ("OPENCODE_SESSION_ID", "opencode"),
@@ -67,11 +67,11 @@ pub const SESSION_VARS: [(&str, &str); 5] = [
     ("CLAUDE_CODE_SESSION_ID", "claude"),
 ];
 
-/// A vendor CLI as a child of agent-talk. The environment is passed through except
-/// `AGENT_TALK_CALLER` and the session variables: the vendor would pass them on to its own
+/// An agent CLI as a child of agent-talk. The environment is passed through except
+/// `AGENT_TALK_CALLER` and the session variables: the agent would pass them on to its own
 /// shell commands and MCP servers, attributing the child session's messages to the
-/// caller of this command. Each vendor sets its own variable for its children itself.
-pub fn vendor_cmd(program: &str) -> Command {
+/// caller of this command. Each agent sets its own variable for its children itself.
+pub fn agent_cmd(program: &str) -> Command {
     let mut cmd = Command::new(program);
     cmd.env_remove("AGENT_TALK_CALLER");
     for (var, _) in SESSION_VARS {
@@ -82,7 +82,7 @@ pub fn vendor_cmd(program: &str) -> Command {
 
 /// `<program> --version`, or why it cannot run.
 pub async fn cli_version(program: &str) -> std::result::Result<String, String> {
-    match vendor_cmd(program)
+    match agent_cmd(program)
         .arg("--version")
         .stdin(std::process::Stdio::null())
         .output()
@@ -102,7 +102,7 @@ pub async fn cli_version(program: &str) -> std::result::Result<String, String> {
 
 /// Non-blocking exclusive OS lock on a session, held for the duration of the command so
 /// two agent-talk commands never write to one session at once (DESIGN.md §3): the file
-/// `~/.agent-talk/locks/<provider>-<id>`, opened with O_CLOEXEC so a vendor child does
+/// `~/.agent-talk/locks/<agent>-<id>`, opened with O_CLOEXEC so an agent child does
 /// not inherit it (a run that outlives the command is tracked by pid). `why` says what a
 /// second writer would break.
 pub fn lock(handle: &str, why: &str) -> Result<File> {
@@ -207,7 +207,7 @@ pub enum ApprovalPolicy {
     Deny,
 }
 
-/// The adapters, dispatched by provider name.
+/// The adapters, dispatched by agent name.
 pub enum Adapter<'a> {
     Codex(codex::Codex<'a>),
     Claude(claude::Claude<'a>),
@@ -235,7 +235,7 @@ impl<'a> Adapter<'a> {
                 Error::new(
                     ErrorCode::Unsupported,
                     format!(
-                        "provider {name} is not supported (codex, claude, opencode, grok, antigravity)"
+                        "agent {name} is not supported (codex, claude, opencode, grok, antigravity)"
                     ),
                 )
             })
@@ -252,7 +252,7 @@ impl<'a> Adapter<'a> {
     }
 }
 
-impl Provider for Adapter<'_> {
+impl Agent for Adapter<'_> {
     async fn caps(&self) -> Caps {
         match self {
             Adapter::Codex(p) => p.caps().await,
@@ -361,10 +361,10 @@ pub struct StartRequest<'a> {
     pub cwd: &'a str,
     /// The caller's text, as recorded in the intent.
     pub prompt: &'a str,
-    /// What reaches the vendor: `prompt`, with a provenance header for agent senders.
+    /// What reaches the agent: `prompt`, with a provenance header for agent senders.
     pub delivered: &'a str,
     pub model: Option<&'a str>,
-    /// Title the vendor stores for the session (Codex `thread/name/set`, Claude `--name`,
+    /// Title the agent stores for the session (Codex `thread/name/set`, Claude `--name`,
     /// OpenCode `title`, Grok `_x.ai/session/rename`; Antigravity has none and refuses it);
     /// `ls` shows it as `name`.
     pub name: Option<&'a str>,
@@ -383,7 +383,7 @@ pub struct StartRequest<'a> {
 pub struct SendRequest<'a> {
     /// The caller's text, as recorded in the intent.
     pub text: &'a str,
-    /// What reaches the vendor: `text`, with a provenance header for agent senders.
+    /// What reaches the agent: `text`, with a provenance header for agent senders.
     pub delivered: &'a str,
     pub mode: Mode,
     pub from: &'a Caller,
@@ -392,7 +392,7 @@ pub struct SendRequest<'a> {
     pub depth: u32,
     /// Steer only: the active turn id the caller expects; defaults to the newest turn.
     pub expect_turn: Option<&'a str>,
-    /// Model for the turn this message starts (providers that take it per turn).
+    /// Model for the turn this message starts (agents that take it per turn).
     pub model: Option<&'a str>,
     /// Agentic turn limit (Claude `--max-turns`).
     pub max_turns: Option<u32>,
@@ -401,7 +401,7 @@ pub struct SendRequest<'a> {
 /// Which part of the history `read` returns.
 pub enum ReadRange {
     /// Oldest first after the cursor. Codex counts turns; Claude, Grok and Antigravity
-    /// count messages; OpenCode counts vendor message rows. The cursor is the vendor's
+    /// count messages; OpenCode counts its message rows. The cursor is the agent's
     /// opaque one for Codex and OpenCode, a transcript line uuid for Claude, an
     /// `updates.jsonl` line number for Grok and a transcript line position for Antigravity.
     Forward { since: Option<String>, limit: u32 },
@@ -411,19 +411,19 @@ pub enum ReadRange {
 
 pub struct ReadPage {
     pub messages: Page<Message>,
-    /// Vendor records covering the same span (Codex turns, Claude and Antigravity
+    /// The agent's raw records covering the same span (Codex turns, Claude and Antigravity
     /// transcript lines, Grok `updates.jsonl` lines, OpenCode message rows), for `--raw`.
     pub raw: Vec<Value>,
 }
 
-/// One provider's entry in `caps`: the installed version, the state of the shared process
+/// One agent's entry in `caps`: the installed version, the state of the shared process
 /// agent-talk joins, and which operations can run now (DESIGN.md §2).
 #[derive(Serialize)]
 pub struct Caps {
-    pub provider: &'static str,
-    /// The vendor CLI's `--version` output (OpenCode: the running service's version).
+    pub agent: &'static str,
+    /// The agent CLI's `--version` output (OpenCode: the running service's version).
     pub version: Option<String>,
-    /// The shared daemon, service or leader, for the vendors that have one.
+    /// The shared daemon, service or leader, for the agents that have one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shared: Option<String>,
     pub operations: Vec<Operation>,
@@ -451,10 +451,10 @@ impl Operation {
     }
 }
 
-/// One adapter per vendor. Mutations persist their intent before submitting and
+/// One adapter per agent. Mutations persist their intent before submitting and
 /// return a receipt; a `deadline` makes them observe the resulting turn on the
 /// same connection.
-pub trait Provider {
+pub trait Agent {
     async fn caps(&self) -> Caps;
     async fn list(
         &self,
@@ -462,7 +462,7 @@ pub trait Provider {
         limit: u32,
         cursor: Option<&str>,
     ) -> Result<Page<Session>>;
-    /// `approvals: None` means the provider default.
+    /// `approvals: None` means the agent default.
     async fn start(
         &self,
         req: &StartRequest<'_>,
@@ -487,7 +487,7 @@ pub trait Provider {
 }
 
 // Receipt and approval lifecycle shared by every adapter. The semantics are agent-talk's
-// (DESIGN.md §4), not a vendor's, so they live here and the adapters only supply vendor plumbing.
+// (DESIGN.md §4), not an agent's, so they live here and the adapters only supply agent plumbing.
 
 /// Explicit policy wins; otherwise deny only on sessions agent-talk started.
 pub fn approval_policy(
@@ -502,7 +502,7 @@ pub fn approval_policy(
     })
 }
 
-/// The submission failed. A vendor response is a definitive refusal: `rejected`. A lost
+/// The submission failed. An agent response is a definitive refusal: `rejected`. A lost
 /// outcome (connection lost, HTTP 5xx, undecodable reply, no response in time, Ctrl-C)
 /// is `unknown`, to be recovered with `wait --receipt`.
 pub fn reject(store: &Store, receipt_id: &str, e: Error) -> Error {
@@ -510,7 +510,7 @@ pub fn reject(store: &Store, receipt_id: &str, e: Error) -> Error {
         ErrorCode::Transport | ErrorCode::Timeout | ErrorCode::Interrupted => ReceiptState::Unknown,
         _ => ReceiptState::Rejected,
     };
-    if let Err(store_err) = store.settle_unaccepted(receipt_id, state, e.vendor.as_deref()) {
+    if let Err(store_err) = store.settle_unaccepted(receipt_id, state, e.agent_error.as_deref()) {
         tracing::warn!("{store_err}");
     }
     e
@@ -549,7 +549,7 @@ pub fn wait_receipt(store: &Store, handle: &str, receipt_id: &str) -> Result<Rec
     }
     if rec.state == ReceiptState::Rejected {
         let mut e = Error::new(ErrorCode::Precondition, "the intent was rejected");
-        e.vendor = rec.vendor_error.clone().map(Box::new);
+        e.agent_error = rec.agent_error.clone().map(Box::new);
         e.receipt = Some(Box::new(rec));
         return Err(e);
     }
@@ -630,7 +630,7 @@ pub async fn bounded<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Caller, VendorError};
+    use crate::model::{AgentError, Caller};
     use crate::store::NewIntent;
 
     #[test]
@@ -673,7 +673,7 @@ mod tests {
         store.receipt(id).unwrap().unwrap().state
     }
 
-    /// A lost outcome keeps the intent recoverable, only a vendor refusal is final, and
+    /// A lost outcome keeps the intent recoverable, only an agent refusal is final, and
     /// neither overwrites an acceptance another command already recorded.
     #[test]
     fn submission_failures_settle_by_certainty() {
@@ -686,7 +686,7 @@ mod tests {
         assert_eq!(state(&s, "lost"), ReceiptState::Accepted);
 
         pending(&s, "refused");
-        let vendor = VendorError {
+        let agent_error = AgentError {
             code: -32600,
             message: "stale turn".into(),
             data: None,
@@ -694,7 +694,7 @@ mod tests {
         reject(
             &s,
             "refused",
-            Error::vendor(ErrorCode::Precondition, vendor),
+            Error::from_agent(ErrorCode::Precondition, agent_error),
         );
         assert_eq!(state(&s, "refused"), ReceiptState::Rejected);
 

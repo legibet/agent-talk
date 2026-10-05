@@ -1,9 +1,9 @@
 //! The `claude` CLI as a child process: command line, spawn into a run log, and
-//! `claude agents --json --all`. Reading the run log is `providers::tail`.
+//! `claude agents --json --all`. Reading the run log is `agents::tail`.
 
 use super::io_err;
+use crate::agents::{ApprovalPolicy, agent_cmd};
 use crate::model::Result;
-use crate::providers::{ApprovalPolicy, vendor_cmd};
 use serde::Deserialize;
 use serde_json::Value;
 use std::fs::File;
@@ -38,7 +38,7 @@ pub fn args(
         args.extend(["--max-turns".into(), n.to_string()]);
     }
     match policy {
-        // Vendor default: claude denies whatever would prompt, tells the model, and
+        // Claude's default: it denies whatever would prompt, tells the model, and
         // reports system/permission_denied and result.permission_denials.
         ApprovalPolicy::Observe => {}
         // Also tells the model not to retry anything that needs approval.
@@ -58,7 +58,7 @@ pub fn spawn(cwd: &str, args: &[String], log: &Path) -> Result<Child> {
         .map_err(|e| io_err(&log.display().to_string(), e))?;
     // A nested `claude -p` with the inherited CLAUDECODE=1 runs normally (observed on
     // claude 2.1.288).
-    vendor_cmd("claude")
+    agent_cmd("claude")
         .args(args)
         .current_dir(cwd)
         .stdin(Stdio::piped())
@@ -74,7 +74,7 @@ pub fn spawn(cwd: &str, args: &[String], log: &Path) -> Result<Child> {
 /// `claude -p` processes, so it does not tell a TUI from a headless run.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct Agent {
+pub struct AgentEntry {
     #[serde(default)]
     pub session_id: Option<String>,
     #[serde(default)]
@@ -96,8 +96,8 @@ pub struct Agent {
 }
 
 /// `claude agents --json --all`, each entry decoded and raw.
-pub async fn agents() -> std::result::Result<Vec<(Agent, Value)>, String> {
-    let out = vendor_cmd("claude")
+pub async fn agents() -> std::result::Result<Vec<(AgentEntry, Value)>, String> {
+    let out = agent_cmd("claude")
         .args(["agents", "--json", "--all"])
         .stdin(Stdio::null())
         .output()
@@ -116,7 +116,7 @@ pub async fn agents() -> std::result::Result<Vec<(Agent, Value)>, String> {
     // session, and the caller would then proceed as if nothing ran it.
     list.into_iter()
         .map(|raw| {
-            Agent::deserialize(&raw)
+            AgentEntry::deserialize(&raw)
                 .map(|a| (a, raw))
                 .map_err(|e| format!("claude agents --json: unexpected entry: {e}"))
         })

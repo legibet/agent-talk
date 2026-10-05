@@ -20,7 +20,7 @@ mod updates;
 use self::acp::{Conn, Event, Reply, ServerRequest, Spawn};
 use self::updates::{History, first_prompt};
 use super::{
-    ApprovalPolicy, Caps, Check, ListFilter, Mode, Operation, Provider, ReadPage, ReadRange,
+    Agent, ApprovalPolicy, Caps, Check, ListFilter, Mode, Operation, ReadPage, ReadRange,
     SendRequest, StartRequest, WaitTarget, bounded, cli_version, first_line, lock, pid_alive,
     record, reject, settle, strip_provenance, wait_receipt,
 };
@@ -677,7 +677,7 @@ impl<'a> Grok<'a> {
                     .push_str("; the turn continues in the Grok leader");
             } else {
                 // The child dies with this command and would take the turn down
-                // mid-step; end it the vendor's way instead, so updates.jsonl records
+                // mid-step; end it Grok's way instead, so updates.jsonl records
                 // turn_completed (stop_reason cancelled). A cancel sent before the
                 // prompt runs is ignored, hence the wait for it to start.
                 let _ = tokio::time::timeout(WIND_DOWN, w.observe(self.store, conn, true)).await;
@@ -703,7 +703,7 @@ impl<'a> Grok<'a> {
                     handle: h.clone(),
                     turn_id: intent.client_msg_id.to_string(),
                     status: "failed",
-                    error: Some(json!({"message": e.message, "vendor": e.vendor})),
+                    error: Some(json!({"message": e.message, "agent_error": e.agent_error})),
                     final_text: (!w.text.is_empty()).then(|| w.text.clone()),
                     duration_ms: None,
                     basis: Some("session/prompt error response".into()),
@@ -871,7 +871,7 @@ impl<'a> Grok<'a> {
     }
 }
 
-impl Provider for Grok<'_> {
+impl Agent for Grok<'_> {
     async fn caps(&self) -> Caps {
         let version = cli_version("grok").await;
         let cli: Check = version.as_ref().map(|_| ()).map_err(String::clone);
@@ -890,7 +890,7 @@ impl Provider for Grok<'_> {
             Err(format!("{} does not exist", dir.display()))
         };
         Caps {
-            provider: "grok",
+            agent: "grok",
             version: version.ok(),
             shared: Some(shared.into()),
             operations: vec![
@@ -1009,7 +1009,7 @@ impl Provider for Grok<'_> {
             let loaded = own_pid.is_some() || tui.is_some() || lead.is_some_and(|l| l.resident);
             items.push(Session {
                 handle: h,
-                provider: "grok",
+                agent: "grok",
                 cwd: s.info.cwd.clone(),
                 name: s.generated_title.clone(),
                 preview: first_prompt(&updates_path).map(|p| first_line(strip_provenance(&p), 200)),
@@ -1036,7 +1036,7 @@ impl Provider for Grok<'_> {
                     "leader": lead.map(|l| &l.raw),
                     "dir": dir,
                 }),
-                native_id: id.to_string(),
+                id: id.to_string(),
             });
         }
         Ok(Page { items, next_cursor })

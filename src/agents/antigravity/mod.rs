@@ -7,7 +7,7 @@
 //! the acceptance and its step index the turn id, `result` ends the turn. The process keeps
 //! running when the command stops observing, and its pid is recorded, as for Claude.
 //!
-//! History comes from the vendor's files under `~/.gemini/antigravity-cli/`: the per-
+//! History comes from Antigravity's files under `~/.gemini/antigravity-cli/`: the per-
 //! conversation `brain/<id>/.system_generated/logs/transcript.jsonl` (lossy, see `caps`),
 //! the shared `conversation_summaries.db` (read-only, in place) and `presence/<id>.lock`,
 //! which the process that has a conversation open keeps flocked. agy itself ignores that
@@ -21,13 +21,13 @@ mod process;
 mod stream;
 mod transcript;
 
-use self::process::{args, spawn, vendor_error, wait_init};
+use self::process::{agent_error, args, spawn, wait_init};
 use self::stream::{Event, Run, decode, denials, result_turn};
 use self::transcript::{
     ends_with_reply, load, messages, preview, span_reply, turn_span, user_input,
 };
 use super::{
-    ApprovalPolicy, Caps, Check, ListFilter, Mode, Operation, Provider, ReadPage, ReadRange,
+    Agent, ApprovalPolicy, Caps, Check, ListFilter, Mode, Operation, ReadPage, ReadRange,
     SendRequest, StartRequest, WaitTarget, bounded, cli_version, lock, pid_alive, record, settle,
     tail, wait_receipt,
 };
@@ -350,10 +350,10 @@ impl<'a> Antigravity<'a> {
         exit_code: Option<i32>,
     ) -> Result<(model::Turn, Vec<Approval>)> {
         let Some(turn_id) = run.turn_id() else {
-            let vendor = vendor_error(log, run, exit_code);
+            let agent_error = agent_error(log, run, exit_code);
             self.store
-                .settle_unaccepted(receipt_id, ReceiptState::Rejected, Some(&vendor))?;
-            return Err(Error::vendor(ErrorCode::Precondition, vendor));
+                .settle_unaccepted(receipt_id, ReceiptState::Rejected, Some(&agent_error))?;
+            return Err(Error::from_agent(ErrorCode::Precondition, agent_error));
         };
         let Some(result) = &run.result else {
             let turn = model::Turn {
@@ -510,7 +510,7 @@ impl<'a> Antigravity<'a> {
     }
 }
 
-impl Provider for Antigravity<'_> {
+impl Agent for Antigravity<'_> {
     async fn caps(&self) -> Caps {
         let version = cli_version("agy").await;
         let cli: Check = version.as_ref().map(|_| ()).map_err(String::clone);
@@ -520,7 +520,7 @@ impl Provider for Antigravity<'_> {
             Err(format!("{} does not exist", self.dir.display()))
         };
         Caps {
-            provider: "antigravity",
+            agent: "antigravity",
             version: version.ok(),
             shared: None,
             operations: vec![
@@ -584,7 +584,7 @@ impl Provider for Antigravity<'_> {
             let (has_history, first_prompt) = preview(&self.transcript_path(&row.id));
             items.push(Session {
                 handle: h,
-                provider: "antigravity",
+                agent: "antigravity",
                 cwd: row.cwd,
                 name: (!row.title.is_empty()).then_some(row.title),
                 preview: first_prompt,
@@ -600,7 +600,7 @@ impl Provider for Antigravity<'_> {
                 state,
                 owned,
                 raw: row.raw,
-                native_id: row.id,
+                id: row.id,
             });
         }
         Ok(Page { items, next_cursor })

@@ -3,8 +3,8 @@
 //! unknown fields, line types and block types are tolerated.
 
 use super::io_err;
+use crate::agents::{first_line, strip_provenance};
 use crate::model::{self, Caller, Message, Result};
-use crate::providers::{first_line, strip_provenance};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};

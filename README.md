@@ -1,12 +1,12 @@
 # agent-talk
 
 agent-talk lets an agent send a message to another agent's session and read the reply, across
-vendors, using only each vendor's official non-interactive interfaces. It works as a command-line
+agents, using only each agent's official non-interactive interfaces. It works as a command-line
 tool and as an MCP server, and it supports Codex, Claude Code, OpenCode, Grok CLI and Antigravity
 CLI.
 
-agent-talk does not run a daemon of its own. Each command connects to the vendor, performs one
-operation and exits. The session it reaches is the vendor's own session, with its full history.
+agent-talk does not run a daemon of its own. Each command connects to the agent, performs one
+operation and exits. The session it reaches is the agent's own session, with its full history.
 
 ## Install
 
@@ -16,9 +16,9 @@ cargo install --git https://github.com/legibet/agent-talk
 
 Requires Rust 1.89 or later.
 
-## Vendors
+## Agents
 
-| vendor          | interface                                                          | prerequisite                                           |
+| agent           | interface                                                          | prerequisite                                           |
 | --------------- | ------------------------------------------------------------------ | ------------------------------------------------------ |
 | Codex           | shared app-server daemon                                           | `codex app-server daemon start` before the TUI opens   |
 | Claude Code     | `claude -p`                                                        | none                                                   |
@@ -54,14 +54,14 @@ refuses a send whose reply chain is longer than `--max-hops` (3 by default) with
 
 agent-talk never approves tool calls. With `--approvals observe` it reports pending approval
 requests, and with `--approvals deny` it declines them. `agent-talk caps` prints what the
-installed CLIs and running daemons support, and [DESIGN.md](DESIGN.md) describes how each vendor
+installed CLIs and running daemons support, and [DESIGN.md](DESIGN.md) describes how each agent
 is handled.
 
 The exit code is one of:
 
 - 0: success.
 - 2: the request was refused, with a stable `E_*` error code.
-- 3: the outcome is unknown. The vendor accepted the message, but the command stopped waiting
+- 3: the outcome is unknown. The agent accepted the message, but the command stopped waiting
   because of a timeout or Ctrl-C. agent-talk does not resend the message, and `wait --receipt`
   reports what happened to it.
 - 4: transport failure.
@@ -69,7 +69,7 @@ The exit code is one of:
 ## Sessions open in a TUI or app
 
 agent-talk can read any session. Whether it can send a message to a session that is open in the
-vendor's own TUI or app depends on the vendor.
+agent's own TUI or app depends on the agent.
 
 - Codex: yes, if the TUI runs inside the shared app-server daemon. This is the case when
   `codex app-server daemon start` ran before the TUI started and the TUI was not started with

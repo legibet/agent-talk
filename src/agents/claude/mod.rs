@@ -17,17 +17,17 @@ mod process;
 mod stream;
 mod transcript;
 
-use self::process::{Agent, agents};
+use self::process::{AgentEntry, agents};
 use self::stream::{Run, StreamEvent, System, denial, result_turn};
 use self::transcript::{TurnEnd, head, live_branch, load, slug, transcript_turn, turn_end};
 use super::{
-    ApprovalPolicy, Caps, Check, ListFilter, Mode, Operation, Provider, ReadPage, ReadRange,
+    Agent, ApprovalPolicy, Caps, Check, ListFilter, Mode, Operation, ReadPage, ReadRange,
     SendRequest, StartRequest, WaitTarget, bounded, cli_version, first_line, lock, pid_alive,
     record, settle, tail, wait_receipt,
 };
 use crate::model::{
-    self, Approval, Error, ErrorCode, Observations, Outcome, Page, ReceiptState, Result, Session,
-    VendorError,
+    self, AgentError, Approval, Error, ErrorCode, Observations, Outcome, Page, ReceiptState,
+    Result, Session,
 };
 use crate::store::{NewIntent, Store};
 use serde::Deserialize;
@@ -72,7 +72,7 @@ enum Live {
     /// A claude process agent-talk spawned (by an earlier, possibly finished, command).
     Own(u32),
     /// A process listed by `claude agents --json` that agent-talk did not spawn.
-    Foreign(Agent),
+    Foreign(AgentEntry),
 }
 
 /// What this command observes of the `claude -p` turn it started.
@@ -87,7 +87,7 @@ struct RunWatch {
 
 impl RunWatch {
     /// Apply one run-log line: accept the receipt when the run starts and record
-    /// the vendor's permission denials.
+    /// the agent's permission denials.
     fn on_event(&mut self, store: &Store, line: &str) -> Result<()> {
         let Ok(raw) = serde_json::from_str::<Value>(line) else {
             tracing::warn!("non-JSON line from claude: {line}");
@@ -198,7 +198,7 @@ impl<'a> Claude<'a> {
             }))
     }
 
-    /// Refuse when anything else runs the session: the vendor has no lock and a
+    /// Refuse when anything else runs the session: the agent has no lock and a
     /// second writer forks the transcript.
     async fn refuse_live(&self, id: &str) -> Result<()> {
         match self.live(id).await? {
@@ -296,7 +296,7 @@ impl<'a> Claude<'a> {
                     .unwrap_or_default()
                     .trim()
                     .to_string();
-                let vendor = VendorError {
+                let agent_error = AgentError {
                     code: status.code().unwrap_or(-1).into(),
                     message: if stderr.is_empty() {
                         format!("claude exited with {status} before starting the session")
@@ -308,9 +308,9 @@ impl<'a> Claude<'a> {
                 self.store.settle_unaccepted(
                     &watch.receipt_id,
                     ReceiptState::Rejected,
-                    Some(&vendor),
+                    Some(&agent_error),
                 )?;
-                return Err(Error::vendor(ErrorCode::Precondition, vendor));
+                return Err(Error::from_agent(ErrorCode::Precondition, agent_error));
             }
             let Some(r) = &watch.run.result else {
                 return Ok(model::Turn {
@@ -358,7 +358,7 @@ impl<'a> Claude<'a> {
     }
 }
 
-impl Provider for Claude<'_> {
+impl Agent for Claude<'_> {
     async fn caps(&self) -> Caps {
         let version = cli_version("claude").await;
         let cli: Check = version.as_ref().map(|_| ()).map_err(String::clone);
@@ -373,7 +373,7 @@ impl Provider for Claude<'_> {
             Err(format!("{} does not exist", self.projects.display()))
         };
         Caps {
-            provider: "claude",
+            agent: "claude",
             version: version.ok(),
             shared: None,
             operations: vec![
@@ -399,7 +399,7 @@ impl Provider for Claude<'_> {
     ) -> Result<Page<Session>> {
         struct Row {
             id: String,
-            agent: Option<(Agent, Value)>,
+            agent: Option<(AgentEntry, Value)>,
             file: Option<PathBuf>,
             recency_ms: i64,
         }
@@ -533,7 +533,7 @@ impl Provider for Claude<'_> {
             };
             items.push(Session {
                 handle: h,
-                provider: "claude",
+                agent: "claude",
                 cwd: agent.and_then(|a| a.cwd.clone()).or(t_cwd),
                 name: agent.and_then(|a| a.name.clone()).or(name),
                 preview,
@@ -559,7 +559,7 @@ impl Provider for Claude<'_> {
                     "transcript": row.file,
                     "mtime_ms": row.recency_ms,
                 }),
-                native_id: row.id,
+                id: row.id,
             });
         }
         Ok(Page { items, next_cursor })

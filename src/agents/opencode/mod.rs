@@ -13,7 +13,7 @@ mod transport;
 
 use self::transport::{Events, Service};
 use super::{
-    ApprovalPolicy, Caps, Check, ListFilter, Mode, Operation, Provider, ReadPage, ReadRange,
+    Agent, ApprovalPolicy, Caps, Check, ListFilter, Mode, Operation, ReadPage, ReadRange,
     SendRequest, StartRequest, WaitTarget, approval_policy, bounded, record, reject, resolve,
     settle, wait_receipt,
 };
@@ -179,7 +179,7 @@ impl Span {
             // A user message right after the aborted step is another execution's input
             // (DESIGN.md §6.3); anything else continues this one: its own
             // `idle` (user interrupt), a restart notice, or further steps after the
-            // location closed during a permission prompt (vendor `step.ts`,
+            // location closed during a permission prompt (OpenCode source `step.ts`,
             // `needsContinuation`). Nothing after it yet: undecided.
             (after.get(i + 1)?["type"] == "user").then_some(i)
         });
@@ -382,7 +382,7 @@ impl<'a> OpenCode<'a> {
                 Ok(_) => "declined",
                 // Gone already: one reject answers every pending request of the session
                 // (DESIGN.md §6.3), or someone else replied first.
-                Err(e) if e.vendor.as_ref().is_some_and(|v| v.code == 404) => "resolved",
+                Err(e) if e.agent_error.as_ref().is_some_and(|v| v.code == 404) => "resolved",
                 Err(e) => return Err(e),
             };
         }
@@ -571,7 +571,7 @@ impl<'a> OpenCode<'a> {
         )
     }
 
-    /// Normalized messages of one vendor page, in the given (chronological) order.
+    /// Normalized messages of one OpenCode page, in the given (chronological) order.
     /// `turn` is the user message id in force before the first message of the page.
     fn messages(&self, page: &[Value], mut turn: Option<String>) -> Result<Vec<Message>> {
         let mut out = Vec::new();
@@ -659,7 +659,7 @@ impl<'a> OpenCode<'a> {
         Ok(out)
     }
 
-    /// `read --tail n`: `desc` holds the newest vendor rows, newest first. They are
+    /// `read --tail n`: `desc` holds the newest OpenCode rows, newest first. They are
     /// over-fetched because idle markers are hidden and one assistant row can expand into
     /// several messages, so the trim to the last `n` visible messages happens after
     /// normalization. Returns the rows oldest first and the trimmed messages.
@@ -682,7 +682,7 @@ impl<'a> OpenCode<'a> {
     }
 }
 
-impl Provider for OpenCode<'_> {
+impl Agent for OpenCode<'_> {
     async fn caps(&self) -> Caps {
         let (version, shared, service): (Option<String>, String, Check) = match self.connect().await
         {
@@ -700,7 +700,7 @@ impl Provider for OpenCode<'_> {
             }
         };
         Caps {
-            provider: "opencode",
+            agent: "opencode",
             version,
             shared: Some(shared),
             operations: ["ls", "new", "send", "read", "wait", "steer", "name"]
@@ -741,8 +741,8 @@ impl Provider for OpenCode<'_> {
             let owned = self.store.is_owned(&handle)?;
             items.push(Session {
                 handle,
-                provider: "opencode",
-                native_id: id.clone(),
+                agent: "opencode",
+                id: id.clone(),
                 cwd: text(&s["location"]["directory"]),
                 name: text(&s["title"]),
                 preview: text(&s["title"]),
@@ -1071,7 +1071,7 @@ mod tests {
         assert_eq!(m[0].turn_id, "msg_u0");
     }
 
-    /// `--tail` counts visible messages, not vendor rows (the hidden
+    /// `--tail` counts visible messages, not OpenCode rows (the hidden
     /// idle marker was counted, so `--tail 2` printed only the assistant line).
     #[test]
     fn tail_counts_visible_messages() {

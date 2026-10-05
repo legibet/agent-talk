@@ -1,16 +1,16 @@
+mod agents;
 mod mcp;
 mod model;
 mod ops;
-mod providers;
 mod store;
 
+use agents::{ApprovalPolicy, Mode, ReadRange, WaitTarget};
 use clap::{Args, Parser, Subcommand};
 use model::{Approval, Caller, CallerKind, Outcome, Receipt, Turn};
 use ops::{
     DEFAULT_MAX_HOPS, DEFAULT_TIMEOUT, LsArgs, NewArgs, Output, Read, ReadArgs, Request, SendArgs,
     Sessions, WaitArgs, caller_from_handle, env_var,
 };
-use providers::{ApprovalPolicy, Mode, ReadRange, WaitTarget};
 use serde_json::json;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -21,7 +21,7 @@ use store::Store;
 #[command(
     name = "agent-talk",
     version,
-    about = "Send messages to coding-agent sessions and read the replies"
+    about = "Send messages to agent sessions and read the replies"
 )]
 struct Cli {
     /// Print machine-readable JSON on stdout.
@@ -67,13 +67,13 @@ impl WaitOpts {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Capability matrix per provider: installed CLI, daemon or service, declared limits.
+    /// What each agent can do now: CLI version, daemon, service or leader, available operations.
     Caps,
     /// List sessions with observations, paginated.
     Ls {
-        /// codex, claude, opencode, grok or antigravity; default: every provider's first page.
+        /// codex, claude, opencode, grok or antigravity; default: every agent's first page.
         #[arg(long)]
-        provider: Option<String>,
+        agent: Option<String>,
         #[arg(long)]
         cwd: Option<PathBuf>,
         /// Include every source kind (sub-agents, unknown).
@@ -81,17 +81,17 @@ enum Cmd {
         all: bool,
         #[arg(long, default_value_t = ops::LS_LIMIT)]
         limit: u32,
-        /// Cursor from a previous page of the same provider.
+        /// Cursor from a previous page of the same agent.
         #[arg(long)]
         cursor: Option<String>,
-        /// Include the vendor records under `raw` in --json output (large).
+        /// Include the agent's raw records under `raw` in --json output (large).
         #[arg(long)]
         raw: bool,
     },
     /// Start a session owned by agent-talk; prints handle and receipt.
     New {
         /// codex, claude, opencode, grok or antigravity.
-        provider: String,
+        agent: String,
         prompt: String,
         #[arg(long)]
         cwd: PathBuf,
@@ -99,12 +99,12 @@ enum Cmd {
         /// provider/model[#variant]; Grok: e.g. grok-4.7; Antigravity: e.g. gemini-3.8-flash).
         #[arg(long)]
         model: Option<String>,
-        /// Title stored with the session at the vendor, shown by ls (Codex thread name,
+        /// Title stored with the session by the agent, shown by ls (Codex thread name,
         /// Claude session name, OpenCode title, Grok session title; Antigravity has none).
         #[arg(long)]
         name: Option<String>,
         /// Reasoning effort for the session (Codex, Grok, Antigravity; the model's values,
-        /// e.g. low | medium | high); default: the vendor's.
+        /// e.g. low | medium | high); default: the agent's.
         #[arg(long)]
         effort: Option<String>,
         /// Agentic turn limit for the first turn (Claude only).
@@ -121,7 +121,7 @@ enum Cmd {
         /// Approval requests reaching agent-talk while it observes the turn.
         #[arg(long, value_enum)]
         approvals: Option<ApprovalPolicy>,
-        /// Include the vendor record of the turn under `raw` in --json output (large).
+        /// Include the agent's raw record of the turn under `raw` in --json output (large).
         #[arg(long)]
         raw: bool,
         #[command(flatten)]
@@ -158,7 +158,7 @@ enum Cmd {
         /// Approval requests reaching agent-talk while it observes the turn.
         #[arg(long, value_enum)]
         approvals: Option<ApprovalPolicy>,
-        /// Include the vendor record of the turn under `raw` in --json output (large).
+        /// Include the agent's raw record of the turn under `raw` in --json output (large).
         #[arg(long)]
         raw: bool,
         #[command(flatten)]
@@ -179,7 +179,7 @@ enum Cmd {
         /// The newest N messages instead, printed oldest first; no cursor.
         #[arg(long)]
         tail: Option<u32>,
-        /// Print the vendor records of the span instead of normalized messages.
+        /// Print the agent's raw records of the span instead of normalized messages.
         #[arg(long)]
         raw: bool,
     },
@@ -196,7 +196,7 @@ enum Cmd {
         /// Approval requests reaching agent-talk while it observes the turn.
         #[arg(long, value_enum)]
         approvals: Option<ApprovalPolicy>,
-        /// Include the vendor record of the turn under `raw` in --json output (large).
+        /// Include the agent's raw record of the turn under `raw` in --json output (large).
         #[arg(long)]
         raw: bool,
     },
@@ -218,7 +218,7 @@ enum Cmd {
 
 fn main() -> ExitCode {
     // Die quietly when the reader of stdout goes away (`agent-talk ls --json | head`), like
-    // any Unix tool, instead of panicking on EPIPE. Vendor connections are unaffected:
+    // any Unix tool, instead of panicking on EPIPE. Agent connections are unaffected:
     // std, mio and socket2 set SO_NOSIGPIPE on every socket they open on macOS.
     // SAFETY: called before any thread exists; SIG_DFL is a valid disposition.
     unsafe {
@@ -270,8 +270,8 @@ fn main() -> ExitCode {
                 if let Some(state) = e.state {
                     eprintln!("state: {state}");
                 }
-                if let Some(v) = &e.vendor {
-                    eprintln!("vendor: {} {}", v.code, v.message);
+                if let Some(v) = &e.agent_error {
+                    eprintln!("agent error: {} {}", v.code, v.message);
                 }
                 if let Some(r) = &e.receipt {
                     eprintln!("receipt: {}", receipt_line(r));
@@ -293,9 +293,9 @@ fn cli_caller(explicit: Option<&str>) -> model::Result<Caller> {
     {
         return caller_from_handle(&h);
     }
-    for (var, provider) in providers::SESSION_VARS {
+    for (var, agent) in agents::SESSION_VARS {
         if let Some(id) = env_var(var) {
-            return Ok(Caller::agent(&format!("{provider}:{id}")));
+            return Ok(Caller::agent(&format!("{agent}:{id}")));
         }
     }
     Ok(Caller::UNKNOWN)
@@ -308,14 +308,14 @@ fn request(cmd: Cmd) -> model::Result<Request> {
         },
         Cmd::Mcp { .. } => unreachable!("handled in main"),
         Cmd::Ls {
-            provider,
+            agent,
             cwd,
             all,
             limit,
             cursor,
             raw,
         } => Request::Ls(LsArgs {
-            provider,
+            agent,
             cwd,
             all,
             limit,
@@ -323,7 +323,7 @@ fn request(cmd: Cmd) -> model::Result<Request> {
             raw,
         }),
         Cmd::New {
-            provider,
+            agent,
             prompt,
             cwd,
             model,
@@ -337,7 +337,7 @@ fn request(cmd: Cmd) -> model::Result<Request> {
             wait,
             sender,
         } => Request::New(NewArgs {
-            provider,
+            agent,
             cwd,
             prompt,
             model,
@@ -433,11 +433,11 @@ fn approval_line(a: &Approval) -> String {
 
 fn print_human(out: &Output) {
     match out {
-        Output::Caps { providers, sender } => {
-            for p in providers {
+        Output::Caps { agents, sender } => {
+            for p in agents {
                 println!(
                     "{:<12} {}",
-                    p.provider,
+                    p.agent,
                     p.version.as_deref().unwrap_or("version unknown")
                 );
                 if let Some(shared) = &p.shared {
@@ -483,7 +483,7 @@ fn print_human(out: &Output) {
                 }
             }
             for e in errors {
-                println!("{}: {}", e.provider, e.error.message);
+                println!("{}: {}", e.agent, e.error.message);
             }
         }
         Output::Read(Read {

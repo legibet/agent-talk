@@ -1,9 +1,9 @@
 # agent-talk design
 
-`agent-talk` lets a person or a coding agent send a message to another coding-agent session and
-read the reply, across vendors, using only each vendor's official non-interactive interfaces.
-This is the design as built. Vendor behaviour in §6 was observed on macOS with the version named
-in each heading; facts only read in vendor source or documentation are marked as such.
+`agent-talk` lets a person or an agent send a message to another agent's session and read the
+reply, across agents, using only each agent's official non-interactive interfaces. This is the
+design as built. Agent behaviour in §6 was observed on macOS with the version named in each
+heading; facts only read in agent source or documentation are marked as such.
 
 ## 1. Scope
 
@@ -18,15 +18,15 @@ behalf, deleting sessions.
 
 ## 2. Principles
 
-1. **Native only.** Vendor protocols and CLI flags as documented. No terminal injection, no
-   touching another process's stdio, no binary patching, no edits to vendor configuration.
+1. **Native only.** Agent protocols and CLI flags as documented. No terminal injection, no
+   touching another process's stdio, no binary patching, no edits to agent configuration.
 2. **Observations gate operations, rechecked at execution time.** Each session carries
    observations (§4); a refusal names the observation that blocks it.
 3. **Declare the limits.** `agent-talk caps` prints what the installed CLI and the running daemon
    or service can do. Unsupported cases fail with a stable error code, never a silent downgrade.
 4. **The user's install and login.** Same binaries, same accounts, same permission defaults.
 5. **Thin.** Normalize only conversation-level events (text, role, phase, turn boundaries,
-   approval requests). Everything else passes through as raw vendor JSON behind `--raw`.
+   approval requests). Everything else passes through as raw agent JSON behind `--raw`.
 6. **Receipts, not assumptions.** Every mutation returns a receipt stating what was accepted. A
    timeout is an unknown outcome, not a rejection; mutations are never retried automatically.
 
@@ -34,21 +34,21 @@ behalf, deleting sessions.
 
 ### No agent-talk daemon
 
-State lives where the vendor already keeps it:
+State lives where the agent already keeps it:
 
-| provider                                         | who holds the live session          | agent-talk's connection                                   |
+| agent                                            | who holds the live session          | agent-talk's connection                                   |
 | ------------------------------------------------ | ----------------------------------- | --------------------------------------------------------- |
 | Codex                                            | shared app-server daemon            | per command: connect, subscribe, act, observe, disconnect |
 | OpenCode                                         | `opencode serve --service`          | per command: HTTP, plus SSE while observing               |
 | Grok, leader live                                | shared leader process               | per command: a `grok agent --leader stdio` child (ACP)    |
-| Claude, Grok without leader, Antigravity (owned) | nobody between turns; files on disk | one vendor child per mutation                             |
+| Claude, Grok without leader, Antigravity (owned) | nobody between turns; files on disk | one agent child per mutation                              |
 | Claude, Grok, Antigravity TUI (foreign)          | the user's terminal process         | read-only                                                 |
 
 "Owned" means agent-talk started the session; the `owned` table records creation, not current
 exclusivity. The CLI process is short-lived, but within one command it owns a live connection
 holding the subscription, pending requests and correlation state. SQLite stores intents and
 receipts, not connection state. `agent-talk mcp` is the one long-lived process, one per agent
-session, started and stopped by the vendor like any MCP server; state that must outlive a command
+session, started and stopped by the agent like any MCP server; state that must outlive a command
 belongs there, not in a system daemon (§7).
 
 ### Local state (`~/.agent-talk/`)
@@ -57,23 +57,23 @@ belongs there, not in a system daemon (§7).
 
 - `intents`, written **before** any send: receipt id, handle, client message id, text, delivered
   text when it differs (provenance header), sender, `reply_to`, hop depth.
-- `receipts`: `pending | accepted | unknown | rejected`, queue id, turn id, item id, vendor error.
+- `receipts`: `pending | accepted | unknown | rejected`, queue id, turn id, item id, agent error.
   Intent and receipt are written in one transaction.
 - `owned`: sessions agent-talk started (handle, cwd, start arguments).
-- `processes`: vendor children spawned for an intent (receipt, handle, pid): `claude -p`, a
+- `processes`: agent children spawned for an intent (receipt, handle, pid): `claude -p`, a
   direct-mode `grok agent`, `agy -p`. This is how later commands tell an agent-talk run from a
   foreign writer.
 - `approvals`: every approval request seen and what happened to it.
 
 Claude, Grok (direct mode) and Antigravity sessions are also locked with OS file locks,
-`locks/<provider>-<id>`, opened close-on-exec so a vendor child does not inherit them and released
+`locks/<agent>-<id>`, opened close-on-exec so an agent child does not inherit them and released
 by process exit, never with SQLite rows. A child that outlives its command is tracked by pid
 instead. Claude and Antigravity children write stdout to a run log per receipt
 (`claude-runs/`, `antigravity-runs/`), which the command tails and later commands read to recover
 a receipt.
 
-Vendor children get the user's environment minus `AGENT_TALK_CALLER` and the vendor session
-variables of §4; otherwise the vendor would pass them to its own shells and MCP servers and the
+Agent children get the user's environment minus `AGENT_TALK_CALLER` and the agents' session
+variables of §4; otherwise the agent would pass them to its own shells and MCP servers and the
 child session's messages would be attributed to agent-talk's caller.
 
 ### Layout
@@ -83,27 +83,27 @@ src/
   main.rs              clap definitions, sender from the shell environment, human output, exit codes
   mcp.rs               the five operations as MCP tools (rmcp over stdio); sender from _meta / env
   ops.rs               the operations: handles, provenance header, hop limit, dispatch, typed output
-  model.rs             provider-neutral types and error codes
+  model.rs             agent-neutral types and error codes
   store.rs             SQLite (rusqlite, bundled)
-  providers/mod.rs     provider interface, adapter dispatch, shared receipt/approval lifecycle
-  providers/codex/     adapter, protocol (narrow response types), transport (WebSocket over AF_UNIX)
-  providers/claude/    adapter, transcript rules, stream-json events, process spawning
-  providers/opencode/  adapter, transport (HTTP + SSE)
-  providers/grok/      adapter, ACP client of a grok agent child, updates.jsonl rules
-  providers/antigravity/  adapter (summaries db, presence lock), transcript, stream, process
-tests/live.py          regression harness against the real vendors; see tests/README.md
+  agents/mod.rs        agent interface, adapter dispatch, shared receipt/approval lifecycle
+  agents/codex/        adapter, protocol (narrow response types), transport (WebSocket over AF_UNIX)
+  agents/claude/       adapter, transcript rules, stream-json events, process spawning
+  agents/opencode/     adapter, transport (HTTP + SSE)
+  agents/grok/         adapter, ACP client of a grok agent child, updates.jsonl rules
+  agents/antigravity/  adapter (summaries db, presence lock), transcript, stream, process
+tests/live.py          regression harness against the real agents; see tests/README.md
 ```
 
-The receipt and approval lifecycle (default policy, reject on vendor refusal, record approvals,
+The receipt and approval lifecycle (default policy, reject on agent refusal, record approvals,
 mark answered requests resolved, validate the receipt a `wait` names, settle the outcome) is
-agent-talk's semantics and is implemented once in `providers/mod.rs`. One exception: a process
+agent-talk's semantics and is implemented once in `agents/mod.rs`. One exception: a process
 adapter whose child failed to spawn or exited before taking the message settles the receipt
 `rejected` itself, since nothing ran. Adapters supply discovery, submission, event source,
 history lookup and message normalization. Observe loops stay per adapter because the authority
-for "the turn ended" differs: a vendor event in Codex, a re-read of history in OpenCode, the `-p`
+for "the turn ended" differs: an agent event in Codex, a re-read of history in OpenCode, the `-p`
 process in Claude and Antigravity, the `session/prompt` response in Grok (§7).
 
-Vendor responses are decoded into narrow types only where a decode failure must be an error
+Agent responses are decoded into narrow types only where a decode failure must be an error
 (correlation ids, turn status, pages of correlated objects); everything displayed or passed
 through stays untyped JSON.
 
@@ -113,9 +113,9 @@ through stays untyped JSON.
 
 | observation | values                                                                                                                                   | learned from                                                                                                                                                                             |
 | ----------- | ---------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `history`   | `visible` / `none` / `unknown`                                                                                                           | the vendor's history listing or files                                                                                                                                                    |
+| `history`   | `visible` / `none` / `unknown`                                                                                                           | the agent's history listing or files                                                                                                                                                     |
 | `loaded`    | `yes` / `no` / `unknown`                                                                                                                 | Codex `thread/loaded/list`; Claude `claude agents` (pid present); OpenCode `yes` while the service answers; Grok own child, live TUI row or leader `resident`; Antigravity presence lock |
-| `origin`    | vendor label (`codex-tui`, `codex_exec`, `claude-interactive`, `opencode agent build`, `headless`, ...), `agent-talk` for owned sessions | vendor metadata; the `owned` table                                                                                                                                                       |
+| `origin`    | agent label (`codex-tui`, `codex_exec`, `claude-interactive`, `opencode agent build`, `headless`, ...), `agent-talk` for owned sessions  | agent metadata; the `owned` table                                                                                                                                                        |
 
 Declared blind spot: for Codex, "not loaded" cannot distinguish a stopped thread from a live
 standalone `codex exec` or `--no-daemon` run. agent-talk proceeds through the daemon.
@@ -123,25 +123,25 @@ standalone `codex exec` or `--no-daemon` run. agent-talk proceeds through the da
 ### Types
 
 ```
-session  { handle, provider, native_id, cwd?, name?, preview?, observations, state: idle|running|waiting|unknown, owned, raw? }
+session  { handle, agent, id, cwd?, name?, preview?, observations, state: idle|running|waiting|unknown, owned, raw? }
 turn     { handle, turn_id, status: completed|failed|interrupted|unknown, final_text?, error?, duration_ms?, basis?, raw? }
 message  { turn_id, item_id, role: user|assistant, phase: final|commentary|other, text, from?, timestamp? }
 approval { handle, turn_id?, item_id?, request_id, kind, summary, outcome: pending|declined|resolved|denied, raw }
-receipt  { receipt_id, handle, client_msg_id, state, queue_id?, turn_id?, item_id?, vendor_error?, delivered_text? }
+receipt  { receipt_id, handle, client_msg_id, state, queue_id?, turn_id?, item_id?, agent_error?, delivered_text? }
 caller   { kind: agent|unknown|runtime, session?, turn? }
 outcome  { handle, receipt?, turn?, approvals[], from? }            result of new / send / wait
-sessions { sessions[], next_cursors{provider: cursor?}, errors[] }  result of ls
+sessions { sessions[], next_cursors{agent: cursor?}, errors[] }     result of ls
 read     { handle, next_cursor?, messages[] | raw[] }              result of read
 ```
 
-Handles are `<provider>:<native_id>`. `turn.basis` says how the end of a turn was established when
-it was not a vendor turn-end event on agent-talk's own connection. `caller.kind: runtime` marks
-input the vendor runtime injected (task notifications, system messages).
+Handles are `<agent>:<id>`. `turn.basis` says how the end of a turn was established when it was
+not an agent turn-end event on agent-talk's own connection. `caller.kind: runtime` marks input
+the agent runtime injected (task notifications, system messages).
 
 ### Receipts
 
-`new` and `send` write the intent, submit, and mark the receipt `accepted` with the vendor's ids.
-A vendor refusal marks it `rejected` (also later, when a run log proves the message was never
+`new` and `send` write the intent, submit, and mark the receipt `accepted` with the agent's ids.
+An agent refusal marks it `rejected` (also later, when a run log proves the message was never
 taken). When observation ends without a result (deadline, Ctrl-C, transport loss, HTTP 5xx) a
 `pending` receipt becomes `unknown`; the error carries the receipt, the approvals seen so far, and
 a `state`: `pending` (queued, not running), `running`, `waiting` (an approval is unanswered) or
@@ -152,18 +152,18 @@ that turn.
 
 ### Approvals
 
-Vendors fan approval requests out to every subscribed client, and any one answer resolves them
+Agents fan approval requests out to every subscribed client, and any one answer resolves them
 for all. agent-talk never accepts. `--approvals observe` records and surfaces pending requests and
 lets the deadline pass with `state: waiting`; it is the default on sessions agent-talk did not
 start. `--approvals deny` declines (Codex `decline`, OpenCode `reject` with a message, Claude
 `--permission-prompts none`, Grok `yoloMode: false` plus `reject_once`); it is the default on
 owned Codex and OpenCode sessions. Claude, Grok and Antigravity default to `observe` on every
 session, because their CLIs apply the user's own permission configuration. Requests answered by
-someone else become `resolved`; denials made by the vendor CLI itself are recorded as `denied`.
+someone else become `resolved`; denials made by the agent CLI itself are recorded as `denied`.
 
 ### Provenance and loops (best-effort)
 
-Each intent records `from`, `reply_to` and `depth`. Depth, computed before any vendor call:
+Each intent records `from`, `reply_to` and `depth`. Depth, computed before any agent call:
 
 - `reply_to` given: 1 + depth of the intent it names (receipt, client message, turn or item id;
   an unknown id counts as 0).
@@ -186,7 +186,7 @@ Sender identity, in priority order:
    `CLAUDE_CODE_SESSION_ID`.
 3. CLI from an agent's shell: `CODEX_THREAD_ID`, `OPENCODE_SESSION_ID`, `GROK_SESSION_ID`,
    `ANTIGRAVITY_CONVERSATION_ID`, then `CLAUDE_CODE_SESSION_ID`. The first four are set by their
-   vendor for that one session's shell; Claude's is inherited, so it goes last. A daemon or
+   agent for that one session's shell; Claude's is inherited, so it goes last. A daemon or
    service started from another agent's shell still carries that agent's variable, which the
    order cannot detect.
 4. `unknown`.
@@ -198,7 +198,7 @@ text and records the delivered one. All of this is attribution, not authenticate
 ### MCP server
 
 `agent-talk mcp [--caller H] [--max-hops N]` is an ordinary stdio MCP server that the user
-configures once, globally; agent-talk never writes vendor configuration or injects itself into
+configures once, globally; agent-talk never writes agent configuration or injects itself into
 sessions. It serves `ls / new / send / read / wait` with the JSON the CLI prints under `--json`;
 refusals are tool errors (`isError`), not protocol errors. Agents get no approval policy, sandbox
 or turn-limit knobs; approvals follow the default policy.
@@ -215,8 +215,8 @@ versions (Codex sends 2025-06-18, Grok 2025-11-25). Logging is stderr only.
 
 ```
 agent-talk caps
-agent-talk ls [--provider P] [--cwd DIR] [--all] [--limit N] [--cursor C] [--raw]
-agent-talk new P "prompt" --cwd DIR [--name N] [--model M] [--effort E] [--max-turns N]
+agent-talk ls [--agent A] [--cwd DIR] [--all] [--limit N] [--cursor C] [--raw]
+agent-talk new A "prompt" --cwd DIR [--name N] [--model M] [--effort E] [--max-turns N]
     [--approval-policy X] [--sandbox X] [--approvals observe|deny] [--wait] [--timeout S]
     [--from H] [--max-hops N] [--raw]
 agent-talk send H "text" [--mode queue|steer] [--expect-turn T] [--reply-to R] [--model M]
@@ -229,7 +229,7 @@ agent-talk mcp [--caller H] [--max-hops N]
 - `--json` on every command; default output is for humans. Exit codes: 0 ok, 2 refused with a
   stable error code, 3 unknown outcome (timeout or Ctrl-C after an accepted intent), 4 transport
   failure.
-- `send` without `--wait` promises only that the vendor accepted the message. Claude, Grok and
+- `send` without `--wait` promises only that the agent accepted the message. Claude, Grok and
   Antigravity sends still run the turn to its end, because the turn lives in the child.
 - `send --wait` subscribes, persists the intent, submits, correlates and observes on one
   connection; notifications arriving before the RPC response are buffered.
@@ -239,41 +239,41 @@ agent-talk mcp [--caller H] [--max-hops N]
   Antigravity, inside the same execution on OpenCode. `--mode steer` joins the running turn
   (Codex, OpenCode, Grok through a live leader) and is refused when the session is idle.
   `--expect-turn` is accepted only with steer, and OpenCode refuses it (no expected-turn check).
-- Vendor knobs, passed through unvalidated in vendor syntax: `--model` on `new` (all) and `send`
+- Agent knobs, passed through unvalidated in the agent's syntax: `--model` on `new` (all) and `send`
   (Claude, Antigravity); `--effort` (Codex, Grok, Antigravity); `--approval-policy` and
   `--sandbox` (Codex); `--max-turns` on `new` and `send` (Claude). Others refuse a knob with
   `E_UNSUPPORTED`.
-- `new --name N` stores a title at the vendor (Codex thread name, Claude `custom-title` line,
+- `new --name N` stores a title at the agent (Codex thread name, Claude `custom-title` line,
   OpenCode `title`, Grok `_x.ai/session/rename`; Antigravity has no interface outside the TUI and
   refuses). agent-talk keeps no copy. `ls` shows `name` and strips the provenance header from
   `preview`, so a session an agent created is recognizable without reading its history.
-- `--raw` (MCP `raw: true`) adds the vendor record under `raw` to each `ls` session and to the
-  turn of `new`, `send` and `wait`; `read --raw` prints the vendor records of the span instead of
+- `--raw` (MCP `raw: true`) adds the agent's record under `raw` to each `ls` session and to the
+  turn of `new`, `send` and `wait`; `read --raw` prints the agent's records of the span instead of
   messages. `read` shows each tool call as one `other` message (`[tool name] status input`), the
   one place normalization goes past text, because an agent reading a session must see that tools
   ran.
-- `ls` without `--provider` returns every provider's first page; a failing provider is reported
+- `ls` without `--agent` returns every agent's first page; a failing agent is reported
   in `errors` and does not hide the others.
 
-Errors carry the vendor `code`/`message`/`data` when there is one:
+Errors carry the agent's `code`/`message`/`data` under `agent_error` when there is one:
 
 ```
 E_NO_DAEMON     Codex socket absent; OpenCode registration missing, stale, or its pid gone
-E_CAP_MISSING   a required vendor capability is missing (Codex queue methods, `claude agents`)
-E_PRECONDITION  vendor rejected (stale turn id, idle steer, unknown session or receipt)
+E_CAP_MISSING   a required agent capability is missing (Codex queue methods, `claude agents`)
+E_PRECONDITION  agent rejected (stale turn id, idle steer, unknown session or receipt)
 E_LOCKED        another agent-talk command or child holds the session (Claude, direct Grok, Antigravity)
 E_FOREIGN_LIVE  held by a process agent-talk cannot talk to (Claude TUI, Grok TUI outside the
                 leader, Antigravity TUI, a Codex thread written by another app-server process)
-E_NO_STEER      provider cannot steer (Claude, Antigravity, Grok without a live leader)
+E_NO_STEER      agent cannot steer (Claude, Antigravity, Grok without a live leader)
 E_MAX_HOPS      hop depth exceeded
 E_TIMEOUT       deadline passed; outcome unknown, receipt retained
 E_INTERRUPTED   Ctrl-C while observing; outcome unknown, receipt retained
 E_TRANSPORT     connection failed or dropped, or a live service unreachable (sandbox); outcome
                 unknown if an intent was sent
-E_UNSUPPORTED   option or method absent in this provider
+E_UNSUPPORTED   option or method absent in this agent
 ```
 
-## 6. Providers
+## 6. Agents
 
 ### 6.1 Codex (codex-cli 0.160.0)
 
@@ -630,37 +630,37 @@ servers are configured globally only.
 
 - **Rust, single binary.** Agents call the CLI many times per session; startup time and one
   artifact per platform matter.
-- **No agent-talk daemon.** The vendors already run the shared processes; another daemon would add
+- **No agent-talk daemon.** The agents already run the shared processes; another daemon would add
   install, pid and version-skew problems for state that fits in SQLite. Long-lived state, if ever
   needed, goes into the per-session `agent-talk mcp` process.
 - **The user configures the MCP server globally.** agent-talk never injects itself into a session
-  or edits vendor configuration, even where the vendor API allows per-thread servers.
+  or edits agent configuration, even where the agent's API allows per-thread servers.
 - **Never approve.** `deny` is the strongest answer; `once`, `always` and `accept` are never sent,
   so agent-talk cannot widen what a model may do.
 - **Observe by default on sessions agent-talk did not start.** Declining changes a turn the user's
   TUI is also attached to; that needs an explicit flag.
-- **Delete nothing.** No session, conversation or vendor file is ever deleted, on any vendor.
-- **Vendor multi-client processes are joined, never started.** Codex daemon, OpenCode service,
-  Grok leader: agent-talk connects when they are live and takes the vendor's single-process path
+- **Delete nothing.** No session, conversation or agent file is ever deleted, on any agent.
+- **Agent multi-client processes are joined, never started.** Codex daemon, OpenCode service,
+  Grok leader: agent-talk connects when they are live and takes the agent's single-process path
   otherwise. Grok's `--leader` is passed only after the socket answered; the remaining window is
   declared and a changed leader pid reported (§6.4).
-- **Two-writer vendors get agent-talk's lock plus the vendor's liveness marker.** Claude, Grok
+- **Two-writer agents get agent-talk's lock plus the agent's liveness marker.** Claude, Grok
   without a leader and Antigravity have no lock between processes; agent-talk refuses to write
-  while the vendor's marker says another process holds the session (Claude live pid, Grok
+  while the agent's marker says another process holds the session (Claude live pid, Grok
   `active_sessions.json`, Antigravity presence lock) and locks its own children.
-- **Turn ids come from the vendor or from agent-talk's own client id**, never from matching text:
+- **Turn ids come from the agent or from agent-talk's own client id**, never from matching text:
   Codex turn id, Claude user-line uuid, OpenCode user message id, Grok `promptId`, Antigravity
   `USER_INPUT` step index (§6).
-- **History is paged to the answer.** `read --tail N` and turn attribution follow the vendor's
+- **History is paged to the answer.** `read --tail N` and turn attribution follow the agent's
   cursor until the rows are found or history ends. The only fixed caps are the 40 pages an
   OpenCode turn lookup searches (older messages report absent) and the ten Codex resume retries.
 - **Shared lifecycle, separate observe loops.** Receipt and approval handling lives once; a generic
   event-loop driver would hide genuinely different end-of-turn authorities behind mode flags.
-- **Explicit vendor knobs, not a generic option map.** Five knobs with clap help beat `--opt k=v`
-  with per-adapter parsing. Values pass through unvalidated: the vendor owns the enum (Codex
+- **Explicit agent knobs, not a generic option map.** Five knobs with clap help beat `--opt k=v`
+  with per-adapter parsing. Values pass through unvalidated: the agent owns the enum (Codex
   rejects an unknown effort in the turn, not at submission).
-- **Steer is refused when idle** on every vendor that would silently start a new turn instead.
-- **No tight polling.** Observation uses vendor event streams. The polls that exist: Claude
+- **Steer is refused when idle** on every agent that would silently start a new turn instead.
+- **No tight polling.** Observation uses the agents' event streams. The polls that exist: Claude
   foreign sessions, Grok `updates.jsonl` and Antigravity transcripts in `wait` (1 s; no event
   source exists), agent-talk's own `claude -p` and `agy -p` run logs (50 ms file tail), and Codex
   `thread/resume` while a new thread's history is unreadable (1 s, at most ten).
@@ -668,7 +668,7 @@ servers are configured globally only.
 ## 8. Known limitations and open items
 
 - Claude `control_request` approvals need an answerer (`--permission-prompt-tool stdio`);
-  agent-talk relies on the vendor's own denial.
+  agent-talk relies on the agent's own denial.
 - Connection loss mid-`wait` ends with `E_TRANSPORT` (OpenCode re-reads history once on a clean
   stream end, Codex does not); recovery is `wait --receipt`.
 - Claude `wait --receipt` needs the transcript before it consults the run log, and returns no

@@ -6,7 +6,7 @@ pub mod transport;
 use self::protocol::*;
 use self::transport::{Conn, Event, ServerRequest, decode};
 use super::{
-    ApprovalPolicy, Caps, Check, ListFilter, Mode, Operation, Provider, ReadPage, ReadRange,
+    Agent, ApprovalPolicy, Caps, Check, ListFilter, Mode, Operation, ReadPage, ReadRange,
     SendRequest, StartRequest, WaitTarget, approval_policy, bounded, cli_version, record, reject,
     resolve, settle, strip_provenance, wait_receipt,
 };
@@ -90,7 +90,7 @@ fn handle(thread_id: &str) -> String {
 /// paginated reads check that row first). Other -32603s are thread-store failures and
 /// other -32601s are really unsupported methods.
 fn history_not_ready(e: &Error) -> bool {
-    e.vendor.as_ref().is_some_and(|v| {
+    e.agent_error.as_ref().is_some_and(|v| {
         (v.code == -32603 && v.message.ends_with(" is empty"))
             || (v.code == -32601 && v.message == "list_turns is not supported yet")
     })
@@ -189,7 +189,7 @@ impl<'a> Codex<'a> {
                 .store
                 .accept(receipt_id, None, Some(&started.turn.id), None),
             Err(e)
-                if e.vendor.as_ref().is_some_and(|v| {
+                if e.agent_error.as_ref().is_some_and(|v| {
                     v.code == -32600
                         && (v.message.starts_with("queued submission not found: ")
                             || v.message == "thread already has an active or pending turn")
@@ -421,7 +421,7 @@ impl<'a> Codex<'a> {
         }
     }
 
-    /// Normalized messages of vendor turns (full items), in the given order.
+    /// Normalized messages of Codex turns (full items), in the given order.
     fn messages(&self, turns: &[Value]) -> Result<Vec<Message>> {
         let at = |turn: &Value, key: &str| {
             turn[key]
@@ -479,7 +479,7 @@ impl<'a> Codex<'a> {
     }
 }
 
-/// Build the normalized turn from a vendor turn (summary or full items), decoded as `t`
+/// Build the normalized turn from a Codex turn (summary or full items), decoded as `t`
 /// and kept as `raw`.
 fn to_turn(thread_id: &str, t: protocol::Turn, raw: Value) -> model::Turn {
     let agents: Vec<AgentMessage> = t
@@ -530,7 +530,7 @@ fn session_state(s: &ThreadStatus) -> &'static str {
     }
 }
 
-impl Provider for Codex<'_> {
+impl Agent for Codex<'_> {
     async fn caps(&self) -> Caps {
         let version = cli_version("codex").await.ok();
         let (shared, daemon, queue, steer) = match self.connect().await {
@@ -577,7 +577,7 @@ impl Provider for Codex<'_> {
             }
         };
         Caps {
-            provider: "codex",
+            agent: "codex",
             version,
             shared: Some(shared),
             operations: vec![
@@ -646,7 +646,7 @@ impl Provider for Codex<'_> {
             };
             items.push(Session {
                 handle: h,
-                provider: "codex",
+                agent: "codex",
                 cwd: t.cwd,
                 name: t.name,
                 preview: t
@@ -660,7 +660,7 @@ impl Provider for Codex<'_> {
                 },
                 state: session_state(&t.status),
                 owned,
-                native_id: t.id,
+                id: t.id,
                 raw,
             });
         }
@@ -716,7 +716,7 @@ impl Provider for Codex<'_> {
         let mut w = Watch::new(&thread_id, approval_policy(self.store, &handle, approvals)?);
         let receipt_id = uuid::Uuid::new_v4().to_string();
         let client_msg_id = uuid::Uuid::new_v4().to_string();
-        // Set once the vendor accepted the submission.
+        // Set once the agent accepted the submission.
         let mut target = None;
         let work = async {
             self.store.insert_intent(&NewIntent {
@@ -784,7 +784,7 @@ impl Provider for Codex<'_> {
         let client_msg_id = uuid::Uuid::new_v4().to_string();
         let mut w = Watch::new(thread_id, approval_policy(self.store, &handle, approvals)?);
         let mut conn = self.connect().await?;
-        // Set once the vendor accepted the submission.
+        // Set once the agent accepted the submission.
         let mut target = None;
         let work = async {
             // Always resume (subscribe) before submitting, on every path:

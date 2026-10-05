@@ -2,8 +2,8 @@
 //! request timeouts, HTTP status to error code, and the `/api/event` frames.
 
 use super::{take_data, text};
-use crate::model::{Error, ErrorCode, Result, VendorError};
-use crate::providers::pid_alive;
+use crate::agents::pid_alive;
+use crate::model::{AgentError, Error, ErrorCode, Result};
 use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::Value;
@@ -57,9 +57,9 @@ fn http_error(status: reqwest::StatusCode, body: &str) -> Error {
         400 | 404 | 409 | 422 => ErrorCode::Precondition,
         _ => ErrorCode::Transport,
     };
-    let mut e = Error::vendor(
+    let mut e = Error::from_agent(
         code,
-        VendorError {
+        AgentError {
             code: i64::from(status.as_u16()),
             message: match &tag {
                 Some(t) => format!("{t}: {message}"),

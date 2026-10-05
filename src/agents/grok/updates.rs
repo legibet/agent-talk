@@ -11,8 +11,8 @@
 //! prompt id where they carry one and by position otherwise, and the last
 //! `turn_completed` of a prompt id is its end.
 
+use crate::agents::first_line;
 use crate::model::{self, Message, Result};
-use crate::providers::first_line;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};

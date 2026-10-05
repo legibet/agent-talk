@@ -3,8 +3,8 @@
 //! the records are narrow and unknown fields and step types are tolerated.
 
 use super::io_err;
+use crate::agents::{first_line, strip_provenance};
 use crate::model::{Caller, Message, Result};
-use crate::providers::{first_line, strip_provenance};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::{HashSet, VecDeque};
@@ -142,7 +142,7 @@ fn user_text(content: &str) -> &str {
     }
 }
 
-/// A SYSTEM_MESSAGE step's message without the vendor's preamble.
+/// A SYSTEM_MESSAGE step's message without Antigravity's preamble.
 fn system_text(content: &str) -> &str {
     content
         .split_once("<SYSTEM_MESSAGE>\n")

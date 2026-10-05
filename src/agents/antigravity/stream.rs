@@ -123,7 +123,7 @@ pub fn denials(handle: &str, turn_id: &str, receipt_id: &str, result: &Value) ->
             handle: handle.into(),
             turn_id: Some(turn_id.into()),
             item_id: None,
-            // No vendor id: the receipt and the position make it unique and replayable.
+            // Antigravity gives no id: the receipt and the position make it unique and replayable.
             request_id: json!(format!("{receipt_id}/{i}")),
             kind: "denied_action".into(),
             summary: format!(

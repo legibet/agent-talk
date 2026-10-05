@@ -2,7 +2,7 @@
 //! One connection per command, owned by the command's main task.
 
 use crate::model::{
-    Approval, Caller, CallerKind, Error, ErrorCode, Receipt, ReceiptState, Result, VendorError,
+    AgentError, Approval, Caller, CallerKind, Error, ErrorCode, Receipt, ReceiptState, Result,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
@@ -17,7 +17,7 @@ CREATE TABLE IF NOT EXISTS intents (
     "from"        TEXT,                       -- JSON model::Caller
     reply_to      TEXT,
     depth         INTEGER NOT NULL DEFAULT 0, -- hop depth, see Store::hop_depth
-    delivered_text TEXT,                      -- what reached the vendor, when not `text`
+    delivered_text TEXT,                      -- what reached the agent, when not `text`
     created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 CREATE TABLE IF NOT EXISTS receipts (
@@ -26,7 +26,7 @@ CREATE TABLE IF NOT EXISTS receipts (
     queue_id     TEXT,
     turn_id      TEXT,
     item_id      TEXT,
-    vendor_error TEXT,
+    agent_error TEXT,
     updated_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 CREATE TABLE IF NOT EXISTS owned (
@@ -35,7 +35,7 @@ CREATE TABLE IF NOT EXISTS owned (
     args       TEXT NOT NULL,
     started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
--- Vendor processes agent-talk spawned for an intent (one `claude -p`, `grok agent` or
+-- Agent processes agent-talk spawned for an intent (one `claude -p`, `grok agent` or
 -- `agy -p` per mutation), so later commands can tell a run that is still alive.
 CREATE TABLE IF NOT EXISTS processes (
     receipt_id TEXT PRIMARY KEY REFERENCES intents(receipt_id),
@@ -72,7 +72,7 @@ pub struct NewIntent<'a> {
     pub from: &'a Caller,
     pub reply_to: Option<&'a str>,
     pub depth: u32,
-    /// Set when the vendor got something other than `text` (the provenance header).
+    /// Set when the agent got something other than `text` (the provenance header).
     pub delivered_text: Option<&'a str>,
 }
 
@@ -143,7 +143,7 @@ impl Store {
         Ok(())
     }
 
-    /// The vendor took the intent: `accepted`, with the correlation ids known so far.
+    /// The agent took the intent: `accepted`, with the correlation ids known so far.
     /// Called again when more become known (the turn a queued message started, the
     /// user item); a recorded id is never cleared. Also the recovery path: a receipt
     /// left `unknown` becomes `accepted` once history or the queue proves delivery.
@@ -163,7 +163,7 @@ impl Store {
         Ok(())
     }
 
-    /// The submission did not get through: `rejected` (the vendor refused it, or its run
+    /// The submission did not get through: `rejected` (the agent refused it, or its run
     /// log proves the message was never taken) or `unknown` (the outcome was lost). A
     /// receipt already `accepted` or `rejected` does not move, so a concurrent command that
     /// proved acceptance is not overwritten; an `unknown` one can still become `rejected`
@@ -172,14 +172,14 @@ impl Store {
         &self,
         receipt_id: &str,
         state: ReceiptState,
-        vendor_error: Option<&VendorError>,
+        agent_error: Option<&AgentError>,
     ) -> Result<()> {
-        let vendor_error = vendor_error.map(|v| serde_json::to_string(v).unwrap());
+        let agent_error = agent_error.map(|v| serde_json::to_string(v).unwrap());
         self.db.execute(
-            "UPDATE receipts SET state = ?2, vendor_error = COALESCE(?3, vendor_error),
+            "UPDATE receipts SET state = ?2, agent_error = COALESCE(?3, agent_error),
              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
              WHERE receipt_id = ?1 AND state IN ('pending', 'unknown')",
-            params![receipt_id, state.as_str(), vendor_error],
+            params![receipt_id, state.as_str(), agent_error],
         )?;
         Ok(())
     }
@@ -189,12 +189,12 @@ impl Store {
             .db
             .query_row(
                 "SELECT i.receipt_id, i.handle, i.client_msg_id, r.state, r.queue_id, r.turn_id,
-                        r.item_id, r.vendor_error, i.delivered_text
+                        r.item_id, r.agent_error, i.delivered_text
                  FROM intents i JOIN receipts r USING (receipt_id) WHERE i.receipt_id = ?1",
                 params![receipt_id],
                 |row| {
                     let state: String = row.get(3)?;
-                    let vendor: Option<String> = row.get(7)?;
+                    let agent_error: Option<String> = row.get(7)?;
                     Ok(Receipt {
                         receipt_id: row.get(0)?,
                         handle: row.get(1)?,
@@ -203,7 +203,7 @@ impl Store {
                         queue_id: row.get(4)?,
                         turn_id: row.get(5)?,
                         item_id: row.get(6)?,
-                        vendor_error: vendor.and_then(|v| serde_json::from_str(&v).ok()),
+                        agent_error: agent_error.and_then(|v| serde_json::from_str(&v).ok()),
                         delivered_text: row.get(8)?,
                     })
                 },
@@ -310,7 +310,7 @@ impl Store {
     }
 
     /// Caller recorded for the newest intent on `handle` that became `turn_id`, for
-    /// vendors whose turn ids are per session (Antigravity step indices).
+    /// agents whose turn ids are per session (Antigravity step indices).
     pub fn sender_by_turn(&self, handle: &str, turn_id: &str) -> Result<Option<Caller>> {
         let from: Option<String> = self
             .db

@@ -7,7 +7,7 @@
 //! one mutex-guarded sink.
 
 use super::protocol::{Incoming, InitializeResponse, classify_error};
-use crate::model::{Error, ErrorCode, Result, VendorError};
+use crate::model::{AgentError, Error, ErrorCode, Result};
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use serde::de::DeserializeOwned;
@@ -24,7 +24,7 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::{WebSocketStream, client_async};
 
 type Sink = SplitSink<WebSocketStream<UnixStream>, WsMessage>;
-type Waiter = oneshot::Sender<std::result::Result<Value, VendorError>>;
+type Waiter = oneshot::Sender<std::result::Result<Value, AgentError>>;
 
 /// Notifications retained while the command is busy elsewhere (e.g. awaiting an RPC).
 const EVENT_BUFFER: usize = 4096;
@@ -147,7 +147,7 @@ pub async fn connect(socket: &Path) -> Result<Conn> {
 }
 
 impl Conn {
-    /// Send a request and wait for its response. Vendor errors keep code/message/data.
+    /// Send a request and wait for its response. Agent errors keep code/message/data.
     pub async fn request(&self, method: &str, params: Value) -> Result<Value> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
@@ -163,7 +163,7 @@ impl Conn {
             .await?;
         match tokio::time::timeout(RPC_TIMEOUT, rx).await {
             Ok(Ok(Ok(v))) => Ok(v),
-            Ok(Ok(Err(e))) => Err(Error::vendor(classify_error(&e), e)),
+            Ok(Ok(Err(e))) => Err(Error::from_agent(classify_error(&e), e)),
             Ok(Err(_)) => {
                 let reason = self.pending.lock().unwrap().closed.clone();
                 Err(closed(reason.as_deref().unwrap_or("connection closed")))

@@ -6,12 +6,12 @@
 //! is smaller than the CLI's on purpose: agents get no approval, sandbox or turn-limit
 //! knobs.
 
+use crate::agents::{Mode, ReadRange, WaitTarget};
 use crate::model::{self, Caller, Error, ErrorCode, Outcome};
 use crate::ops::{
     self, DEFAULT_TIMEOUT, LS_LIMIT, LsArgs, NewArgs, READ_LIMIT, Read, ReadArgs, Request,
     SendArgs, Sessions, WaitArgs, caller_from_handle, env_var,
 };
-use crate::providers::{Mode, ReadRange, WaitTarget};
 use crate::store::Store;
 use rmcp::handler::server::tool::schema_for_type;
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
@@ -26,7 +26,7 @@ use serde_json::json;
 use std::path::PathBuf;
 use std::time::Duration;
 
-const INSTRUCTIONS: &str = "Tools to talk to other coding-agent sessions (Codex threads, Claude Code \
+const INSTRUCTIONS: &str = "Tools to talk to other agent sessions (Codex threads, Claude Code \
 sessions, OpenCode sessions, Grok CLI sessions, Antigravity CLI conversations) on this machine: \
 find one with ls, start one with new, ask it something with send (wait=true returns its reply), \
 read its history with read, and wait for a turn with wait. Messages you send are attributed to \
@@ -52,29 +52,29 @@ pub struct Server {
 #[derive(Deserialize, JsonSchema)]
 struct LsParams {
     /// `codex`, `claude`, `opencode`, `grok` or `antigravity`; default: all.
-    provider: Option<String>,
+    agent: Option<String>,
     /// Only sessions whose working directory is this absolute path.
     cwd: Option<String>,
     /// Page size (default 25).
     limit: Option<u32>,
-    /// `next_cursor` from a previous call with the same provider.
+    /// `next_cursor` from a previous call with the same agent.
     cursor: Option<String>,
-    /// Include the vendor record under `raw` (large; default false).
+    /// Include the agent's raw record under `raw` (large; default false).
     raw: Option<bool>,
 }
 
 #[derive(Deserialize, JsonSchema)]
 struct NewParams {
     /// `codex`, `claude`, `opencode`, `grok` or `antigravity`.
-    provider: String,
+    agent: String,
     /// Working directory of the new session (absolute path).
     cwd: String,
     /// First message for the new session.
     prompt: String,
-    /// Model name for the provider (e.g. a Codex model id, `sonnet` for Claude, `grok-4.7`
+    /// Model name for the agent (e.g. a Codex model id, `sonnet` for Claude, `grok-4.7`
     /// for Grok, `gemini-3.8-flash` for Antigravity).
     model: Option<String>,
-    /// Short title for the session, stored at the vendor and shown by ls; name it so you
+    /// Short title for the session, stored by the agent and shown by ls; name it so you
     /// can find it again (Antigravity has no title interface and refuses it).
     name: Option<String>,
     /// Reasoning effort (Codex, Grok, Antigravity; the model's values, e.g. low, medium, high).
@@ -84,7 +84,7 @@ struct NewParams {
     /// Seconds to wait with wait=true (default 600). On timeout the outcome is unknown
     /// and the receipt is kept; use `wait` with the receipt id later.
     timeout_s: Option<u64>,
-    /// Include the vendor record under `raw` (large; default false).
+    /// Include the agent's raw record under `raw` (large; default false).
     raw: Option<bool>,
 }
 
@@ -114,7 +114,7 @@ struct SendParams {
     /// Receipt, turn or message id this message answers; sets the hop depth from that
     /// message instead of from the newest message delivered to your own session.
     reply_to: Option<String>,
-    /// Include the vendor record under `raw` (large; default false).
+    /// Include the agent's raw record under `raw` (large; default false).
     raw: Option<bool>,
 }
 
@@ -141,7 +141,7 @@ struct WaitParams {
     receipt: Option<String>,
     /// Seconds to wait (default 600).
     timeout_s: Option<u64>,
-    /// Include the vendor record under `raw` (large; default false).
+    /// Include the agent's raw record under `raw` (large; default false).
     raw: Option<bool>,
 }
 
@@ -163,7 +163,7 @@ impl Server {
         }
     }
 
-    /// Sender of one call, explicit pins first, then what the vendor says:
+    /// Sender of one call, explicit pins first, then what the agent says:
     /// 1. `--caller`, else AGENT_TALK_CALLER;
     /// 2. the calling Codex thread from the request's `_meta` (`threadId`, else
     ///    `x-codex-turn-metadata.thread_id`; sent on every tools/call; DESIGN.md §4),
@@ -214,7 +214,7 @@ impl Server {
 
     /// Run one request and return what `--json` would print.
     async fn exec(&self, req: Request) -> CallToolResult {
-        // Provider futures hold the store's rusqlite connection (Send, not Sync), so they
+        // Agent futures hold the store's rusqlite connection (Send, not Sync), so they
         // are not Send; run each request on a blocking thread of the same runtime.
         let rt = tokio::runtime::Handle::current();
         let res = tokio::task::spawn_blocking(move || {
@@ -241,11 +241,11 @@ impl Server {
         title = "List sessions",
         output_schema = schema_for_type::<Sessions>(),
         annotations(read_only_hint = true, open_world_hint = false),
-        description = "List coding-agent sessions on this machine (Codex threads, Claude Code sessions, OpenCode sessions, Grok CLI sessions, Antigravity CLI conversations) that you can message: handle, provider, cwd, state, a preview of the first prompt, and observations (loaded, origin). Use it to find another coding-agent session to talk to; pass its handle to send or read."
+        description = "List agent sessions on this machine (Codex threads, Claude Code sessions, OpenCode sessions, Grok CLI sessions, Antigravity CLI conversations) that you can message: handle, agent, cwd, state, a preview of the first prompt, and observations (loaded, origin). Use it to find another agent session to talk to; pass its handle to send or read."
     )]
     async fn ls(&self, Parameters(p): Parameters<LsParams>) -> CallToolResult {
         self.exec(Request::Ls(LsArgs {
-            provider: p.provider,
+            agent: p.agent,
             cwd: p.cwd.map(PathBuf::from),
             all: false,
             limit: p.limit.unwrap_or(LS_LIMIT),
@@ -260,7 +260,7 @@ impl Server {
         title = "New session",
         output_schema = schema_for_type::<Outcome>(),
         annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = false),
-        description = "Start a new coding-agent session (provider codex, claude, opencode, grok or antigravity) in a directory with a first prompt, e.g. to hand a task to a fresh agent; give it a name to find it again in ls. Returns its handle and a receipt; with wait=true also the finished first turn, whose reply is turn.final_text. agent-talk prefixes your prompt with a one-line provenance header naming your session; do not add your own. Refused with E_MAX_HOPS when this would exceed the hop limit of agent-to-agent chains; report that instead of retrying."
+        description = "Start a new agent session (agent codex, claude, opencode, grok or antigravity) in a directory with a first prompt, e.g. to hand a task to a fresh agent; give it a name to find it again in ls. Returns its handle and a receipt; with wait=true also the finished first turn, whose reply is turn.final_text. agent-talk prefixes your prompt with a one-line provenance header naming your session; do not add your own. Refused with E_MAX_HOPS when this would exceed the hop limit of agent-to-agent chains; report that instead of retrying."
     )]
     async fn new_session(
         &self,
@@ -268,7 +268,7 @@ impl Server {
         Parameters(p): Parameters<NewParams>,
     ) -> CallToolResult {
         self.exec(Request::New(NewArgs {
-            provider: p.provider,
+            agent: p.agent,
             cwd: PathBuf::from(p.cwd),
             prompt: p.prompt,
             model: p.model,
@@ -290,7 +290,7 @@ impl Server {
         title = "Send message",
         output_schema = schema_for_type::<Outcome>(),
         annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = false),
-        description = "Send a message to another coding-agent session (handle from ls or new). To ask it a question and wait for its reply, set wait=true: the reply is turn.final_text (on OpenCode, the final reply of the execution that consumed your message; if other messages were queued to that session meanwhile it may answer them together, so check the adjacent messages with read when that matters). agent-talk prefixes your message with a one-line provenance header naming your session; do not add your own. Without wait it returns a receipt once the message is accepted (Claude, Grok and Antigravity sessions still run the turn before returning). Refusals come back as an error object with a code; do not retry them: E_MAX_HOPS when the message would exceed the hop limit of an agent-to-agent chain, E_FOREIGN_LIVE when the session is held by a live process agent-talk did not start (e.g. a Claude Code session open in a terminal), E_LOCKED when another agent-talk command is running it. E_TIMEOUT means the outcome is unknown; use wait with the receipt id."
+        description = "Send a message to another agent session (handle from ls or new). To ask it a question and wait for its reply, set wait=true: the reply is turn.final_text (on OpenCode, the final reply of the execution that consumed your message; if other messages were queued to that session meanwhile it may answer them together, so check the adjacent messages with read when that matters). agent-talk prefixes your message with a one-line provenance header naming your session; do not add your own. Without wait it returns a receipt once the message is accepted (Claude, Grok and Antigravity sessions still run the turn before returning). Refusals come back as an error object with a code; do not retry them: E_MAX_HOPS when the message would exceed the hop limit of an agent-to-agent chain, E_FOREIGN_LIVE when the session is held by a live process agent-talk did not start (e.g. a Claude Code session open in a terminal), E_LOCKED when another agent-talk command is running it. E_TIMEOUT means the outcome is unknown; use wait with the receipt id."
     )]
     async fn send(
         &self,
@@ -318,7 +318,7 @@ impl Server {
         title = "Read history",
         output_schema = schema_for_type::<Read>(),
         annotations(read_only_hint = true, open_world_hint = false),
-        description = "Read the conversation of another coding-agent session: user and assistant messages, oldest first, each with turn id and, for messages sent through agent-talk, who sent them (from). Use tail=N for the latest messages, or page forward from the start with since/limit."
+        description = "Read the conversation of another agent session: user and assistant messages, oldest first, each with turn id and, for messages sent through agent-talk, who sent them (from). Use tail=N for the latest messages, or page forward from the start with since/limit."
     )]
     async fn read(&self, Parameters(p): Parameters<ReadParams>) -> CallToolResult {
         let range = match p.tail {
@@ -343,7 +343,7 @@ impl Server {
         title = "Wait for turn",
         output_schema = schema_for_type::<Outcome>(),
         annotations(read_only_hint = true, open_world_hint = false),
-        description = "Wait for a turn of another coding-agent session to finish and return it (reply in turn.final_text): pass the receipt id from a send or new without wait (or one that timed out), or a turn id. Returns at once if the turn already finished. On OpenCode a turn is one execution, which may have answered several queued messages."
+        description = "Wait for a turn of another agent session to finish and return it (reply in turn.final_text): pass the receipt id from a send or new without wait (or one that timed out), or a turn id. Returns at once if the turn already finished. On OpenCode a turn is one execution, which may have answered several queued messages."
     )]
     async fn wait(&self, Parameters(p): Parameters<WaitParams>) -> CallToolResult {
         let target = match (p.turn, p.receipt) {
@@ -384,7 +384,7 @@ pub async fn serve(caller_arg: Option<String>, max_hops: u32) -> model::Result<(
         ("CLAUDE_CODE_SESSION_ID", "claude"),
     ]
     .into_iter()
-    .find_map(|(var, provider)| env_var(var).map(|s| Caller::agent(&format!("{provider}:{s}"))));
+    .find_map(|(var, agent)| env_var(var).map(|s| Caller::agent(&format!("{agent}:{s}"))));
     tracing::info!("agent-talk mcp: pinned {pinned:?}, env {env:?}, max hops {max_hops}");
     let server = Server::new(pinned, env, max_hops);
     let transport_err =

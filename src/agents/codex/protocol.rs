@@ -2,7 +2,7 @@
 //! narrow structs for responses and notifications (unknown fields are ignored; callers
 //! keep the raw `Value`), plus the few request pieces shared by several call sites.
 
-use crate::model::{Error, ErrorCode, VendorError};
+use crate::model::{AgentError, Error, ErrorCode};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -259,12 +259,12 @@ pub struct Incoming {
     #[serde(default)]
     pub result: Option<Value>,
     #[serde(default)]
-    pub error: Option<VendorError>,
+    pub error: Option<AgentError>,
 }
 
-/// Classify a vendor error. `-32600` is reused for several unrelated conditions
+/// Classify a Codex error. `-32600` is reused for several unrelated conditions
 /// (not initialized, missing capability, stale or idle steer), so the message decides.
-pub fn classify_error(e: &VendorError) -> ErrorCode {
+pub fn classify_error(e: &AgentError) -> ErrorCode {
     if e.message.contains("requires experimentalApi") {
         ErrorCode::CapMissing
     } else if e.code == -32601 {
@@ -278,11 +278,11 @@ pub fn classify_error(e: &VendorError) -> ErrorCode {
 
 /// `thread/resume` refused because another app-server process holds the thread's
 /// cross-process writer lock (`~/.codex/thread-writer-locks/<id>.lock`): `-32600 "thread
-/// <id> already has an active writer"`. Becomes `E_FOREIGN_LIVE`; the vendor error stays
+/// <id> already has an active writer"`. Becomes `E_FOREIGN_LIVE`; the Codex error stays
 /// attached. Every other error passes through unchanged.
 pub fn resume_error(e: Error) -> Error {
     let held = e
-        .vendor
+        .agent_error
         .as_ref()
         .is_some_and(|v| v.code == -32600 && v.message.ends_with(" already has an active writer"));
     if !held {
@@ -423,10 +423,10 @@ mod tests {
     #[test]
     fn active_writer_is_foreign_live() {
         let v = incoming(ACTIVE_WRITER).error.unwrap();
-        let e = resume_error(Error::vendor(classify_error(&v), v));
+        let e = resume_error(Error::from_agent(classify_error(&v), v));
         assert_eq!(e.code, ErrorCode::ForeignLive);
         assert!(e.message.contains("another Codex app-server process"));
-        let v = e.vendor.unwrap();
+        let v = e.agent_error.unwrap();
         assert_eq!(v.code, -32600);
         assert_eq!(
             v.message,
@@ -435,7 +435,7 @@ mod tests {
 
         // Other -32600s keep their class.
         let v = incoming(STALE_STEER).error.unwrap();
-        let e = resume_error(Error::vendor(classify_error(&v), v));
+        let e = resume_error(Error::from_agent(classify_error(&v), v));
         assert_eq!(e.code, ErrorCode::Precondition);
     }
 

@@ -7,8 +7,8 @@
 //! server-to-client requests such as `session/request_permission` (their ids overlap
 //! with ours). The reader never answers server requests; the adapter decides.
 
-use crate::model::{Error, ErrorCode, Result, VendorError};
-use crate::providers::vendor_cmd;
+use crate::agents::agent_cmd;
+use crate::model::{AgentError, Error, ErrorCode, Result};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -26,8 +26,8 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(120);
 /// Bytes of the child's stderr kept for error messages.
 const STDERR_TAIL: usize = 4096;
 
-/// A response as the reader delivers it: the result, or the vendor's error object.
-pub type Reply = std::result::Result<Value, VendorError>;
+/// A response as the reader delivers it: the result, or the agent's error object.
+pub type Reply = std::result::Result<Value, AgentError>;
 
 #[derive(Debug)]
 pub enum Event {
@@ -54,7 +54,7 @@ struct Incoming {
     #[serde(default)]
     result: Option<Value>,
     #[serde(default)]
-    error: Option<VendorError>,
+    error: Option<AgentError>,
 }
 
 #[derive(Default)]
@@ -93,7 +93,7 @@ impl Drop for Conn {
 /// Spawn the child in `cwd` and run the ACP `initialize` handshake.
 pub async fn spawn(cwd: &str, s: &Spawn<'_>) -> Result<Conn> {
     // GROK_HOME and GROK_LEADER_SOCKET are honoured by the child as by agent-talk.
-    let mut cmd = vendor_cmd("grok");
+    let mut cmd = agent_cmd("grok");
     // `grok agent` has no --no-auto-update (only `grok agent leader` does); the
     // binary's GROK_DISABLE_AUTOUPDATER is set instead (its effect on a stdio agent
     // was not observed).
@@ -187,7 +187,7 @@ impl Conn {
         Ok(rx)
     }
 
-    /// Send a request and wait for its response. Vendor errors keep code/message/data.
+    /// Send a request and wait for its response. Agent errors keep code/message/data.
     pub async fn request(&self, method: &str, params: Value) -> Result<Value> {
         let rx = self.start(method, params).await?;
         match tokio::time::timeout(RPC_TIMEOUT, rx).await {
@@ -203,7 +203,7 @@ impl Conn {
     pub fn reply(&self, r: std::result::Result<Reply, oneshot::error::RecvError>) -> Result<Value> {
         match r {
             Ok(Ok(v)) => Ok(v),
-            Ok(Err(e)) => Err(Error::vendor(
+            Ok(Err(e)) => Err(Error::from_agent(
                 if e.code == -32601 {
                     ErrorCode::Unsupported
                 } else {

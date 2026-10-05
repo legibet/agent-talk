@@ -1,11 +1,11 @@
 //! The five operations behind both front-ends (CLI and MCP): handle parsing, sender
-//! provenance header, hop limit, provider dispatch, typed output.
+//! provenance header, hop limit, agent dispatch, typed output.
 
-use crate::model::{Caller, Error, ErrorCode, Message, Outcome, Result, Session};
-use crate::providers::{
-    Adapter, ApprovalPolicy, Caps, ListFilter, Mode, Provider, ReadRange, SendRequest,
-    StartRequest, WaitTarget, delivered,
+use crate::agents::{
+    Adapter, Agent, ApprovalPolicy, Caps, ListFilter, Mode, ReadRange, SendRequest, StartRequest,
+    WaitTarget, delivered,
 };
+use crate::model::{Caller, Error, ErrorCode, Message, Outcome, Result, Session};
 use crate::store::Store;
 use futures_util::future::join_all;
 use schemars::JsonSchema;
@@ -34,24 +34,24 @@ pub enum Request {
 }
 
 pub struct LsArgs {
-    /// One provider, or every provider's first page.
-    pub provider: Option<String>,
+    /// One agent, or every agent's first page.
+    pub agent: Option<String>,
     pub cwd: Option<PathBuf>,
     /// Include sub-sessions too (`ListFilter::all`).
     pub all: bool,
     pub limit: u32,
-    /// Only with `provider`: cursors belong to one provider.
+    /// Only with `agent`: cursors belong to one agent.
     pub cursor: Option<String>,
-    /// Keep the vendor records (`raw`) in the output.
+    /// Keep the agent's raw records (`raw`) in the output.
     pub raw: bool,
 }
 
 pub struct NewArgs {
-    pub provider: String,
+    pub agent: String,
     pub cwd: PathBuf,
     pub prompt: String,
     pub model: Option<String>,
-    /// Vendor-side title of the new session.
+    /// Title the agent stores for the new session.
     pub name: Option<String>,
     pub effort: Option<String>,
     /// Claude only.
@@ -61,11 +61,11 @@ pub struct NewArgs {
     /// Codex only.
     pub sandbox: Option<String>,
     pub approvals: Option<ApprovalPolicy>,
-    /// Observe the first turn for this long; `None` returns once the vendor accepted it.
+    /// Observe the first turn for this long; `None` returns once the agent accepted it.
     pub wait: Option<Duration>,
     pub from: Caller,
     pub max_hops: u32,
-    /// Keep the vendor record of the turn (`turn.raw`) in the output.
+    /// Keep the agent's raw record of the turn (`turn.raw`) in the output.
     pub raw: bool,
 }
 
@@ -80,18 +80,18 @@ pub struct SendArgs {
     /// Claude only.
     pub max_turns: Option<u32>,
     pub approvals: Option<ApprovalPolicy>,
-    /// Observe the turn for this long; `None` returns once the vendor accepted the message.
+    /// Observe the turn for this long; `None` returns once the agent accepted the message.
     pub wait: Option<Duration>,
     pub from: Caller,
     pub max_hops: u32,
-    /// Keep the vendor record of the turn (`turn.raw`) in the output.
+    /// Keep the agent's raw record of the turn (`turn.raw`) in the output.
     pub raw: bool,
 }
 
 pub struct ReadArgs {
     pub handle: String,
     pub range: ReadRange,
-    /// Vendor records instead of normalized messages.
+    /// The agent's raw records instead of normalized messages.
     pub raw: bool,
 }
 
@@ -100,7 +100,7 @@ pub struct WaitArgs {
     pub target: WaitTarget,
     pub approvals: Option<ApprovalPolicy>,
     pub timeout: Duration,
-    /// Keep the vendor record of the turn (`turn.raw`) in the output.
+    /// Keep the agent's raw record of the turn (`turn.raw`) in the output.
     pub raw: bool,
 }
 
@@ -108,29 +108,26 @@ pub struct WaitArgs {
 #[derive(Serialize)]
 #[serde(untagged)]
 pub enum Output {
-    Caps {
-        providers: Vec<Caps>,
-        sender: Caller,
-    },
+    Caps { agents: Vec<Caps>, sender: Caller },
     Sessions(Sessions),
     Read(Read),
     Outcome(Box<Outcome>),
 }
 
-/// Result of `ls`: one page per provider asked; an unavailable provider does not hide
+/// Result of `ls`: one page per agent asked; an unavailable agent does not hide
 /// the others.
 #[derive(Serialize, JsonSchema)]
 pub struct Sessions {
     pub sessions: Vec<Session>,
-    /// Per provider, the cursor of its next page; null when there is none.
+    /// Per agent, the cursor of its next page; null when there is none.
     pub next_cursors: BTreeMap<&'static str, Option<String>>,
-    /// Providers that could not be listed.
-    pub errors: Vec<ProviderError>,
+    /// Agents that could not be listed.
+    pub errors: Vec<ListError>,
 }
 
 #[derive(Serialize, JsonSchema)]
-pub struct ProviderError {
-    pub provider: &'static str,
+pub struct ListError {
+    pub agent: &'static str,
     pub error: Error,
 }
 
@@ -143,7 +140,7 @@ pub struct Read {
     /// Normalized messages (absent with `--raw`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub messages: Option<Vec<Message>>,
-    /// The vendor records of the span (with `--raw`).
+    /// The agent's raw records of the span (with `--raw`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw: Option<Vec<Value>>,
 }
@@ -152,8 +149,8 @@ pub async fn run(store: &Store, req: Request) -> Result<Output> {
     match req {
         Request::Caps { sender } => {
             let adapters = Adapter::all(store);
-            let providers = join_all(adapters.iter().map(|p| p.caps())).await;
-            Ok(Output::Caps { providers, sender })
+            let agents = join_all(adapters.iter().map(|p| p.caps())).await;
+            Ok(Output::Caps { agents, sender })
         }
         Request::Ls(a) => ls(store, a).await,
         Request::New(a) => new(store, a).await,
@@ -169,19 +166,19 @@ async fn ls(store: &Store, a: LsArgs) -> Result<Output> {
         cwd: cwd.as_deref(),
         all: a.all,
     };
-    if let Some(name) = &a.provider {
-        let provider = Adapter::named(store, name)?;
-        let page = provider.list(&filter, a.limit, a.cursor.as_deref()).await?;
+    if let Some(name) = &a.agent {
+        let agent = Adapter::named(store, name)?;
+        let page = agent.list(&filter, a.limit, a.cursor.as_deref()).await?;
         return Ok(Output::Sessions(Sessions {
             sessions: sessions_output(page.items, a.raw),
-            next_cursors: BTreeMap::from([(provider.name(), page.next_cursor)]),
+            next_cursors: BTreeMap::from([(agent.name(), page.next_cursor)]),
             errors: Vec::new(),
         }));
     }
     if a.cursor.is_some() {
         return Err(Error::new(
             ErrorCode::Precondition,
-            "--cursor belongs to one provider; pass --provider with it",
+            "--cursor belongs to one agent; pass --agent with it",
         ));
     }
     let adapters = Adapter::all(store);
@@ -195,8 +192,8 @@ async fn ls(store: &Store, a: LsArgs) -> Result<Output> {
                 sessions.extend(page.items);
                 next_cursors.insert(p.name(), page.next_cursor);
             }
-            Err(error) => errors.push(ProviderError {
-                provider: p.name(),
+            Err(error) => errors.push(ListError {
+                agent: p.name(),
                 error,
             }),
         }
@@ -208,7 +205,7 @@ async fn ls(store: &Store, a: LsArgs) -> Result<Output> {
     }))
 }
 
-/// Vendor records are large and rarely needed; they stay only on request.
+/// Raw agent records are large and rarely needed; they stay only on request.
 fn sessions_output(mut sessions: Vec<Session>, raw: bool) -> Vec<Session> {
     if !raw {
         for s in &mut sessions {
@@ -226,7 +223,7 @@ fn outcome(mut o: Outcome, raw: bool) -> Output {
 }
 
 async fn new(store: &Store, a: NewArgs) -> Result<Output> {
-    let provider = Adapter::named(store, &a.provider)?;
+    let agent = Adapter::named(store, &a.agent)?;
     let cwd = absolute(&a.cwd)?;
     let delivered = delivered(&a.from, &a.prompt);
     let req = StartRequest {
@@ -242,16 +239,14 @@ async fn new(store: &Store, a: NewArgs) -> Result<Output> {
         from: &a.from,
         max_turns: a.max_turns,
     };
-    let mut o = provider
-        .start(&req, a.approvals, a.wait.map(deadline))
-        .await?;
+    let mut o = agent.start(&req, a.approvals, a.wait.map(deadline)).await?;
     o.from = Some(a.from);
     Ok(outcome(o, a.raw))
 }
 
 async fn send(store: &Store, a: SendArgs) -> Result<Output> {
     let (name, id) = split_handle(&a.handle)?;
-    let provider = Adapter::named(store, name)?;
+    let agent = Adapter::named(store, name)?;
     if a.expect_turn.is_some() && a.mode != Mode::Steer {
         return Err(Error::new(
             ErrorCode::Precondition,
@@ -270,7 +265,7 @@ async fn send(store: &Store, a: SendArgs) -> Result<Output> {
         model: a.model.as_deref(),
         max_turns: a.max_turns,
     };
-    let mut o = provider
+    let mut o = agent
         .send(id, &req, a.approvals, a.wait.map(deadline))
         .await?;
     o.from = Some(a.from);
@@ -296,13 +291,13 @@ async fn wait(store: &Store, a: WaitArgs) -> Result<Output> {
     Ok(outcome(o, a.raw))
 }
 
-/// Split `<provider>:<id>`.
+/// Split `<agent>:<id>`.
 fn split_handle(handle: &str) -> Result<(&str, &str)> {
     match handle.split_once(':') {
         Some((p, id)) if !id.is_empty() => Ok((p, id)),
         _ => Err(Error::new(
             ErrorCode::Precondition,
-            format!("invalid handle {handle}; expected <provider>:<id>"),
+            format!("invalid handle {handle}; expected <agent>:<id>"),
         )),
     }
 }

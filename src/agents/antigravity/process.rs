@@ -3,8 +3,8 @@
 
 use super::io_err;
 use super::stream::Run;
-use crate::model::{Error, ErrorCode, Result, VendorError};
-use crate::providers::vendor_cmd;
+use crate::agents::agent_cmd;
+use crate::model::{AgentError, Error, ErrorCode, Result};
 use std::fs::File;
 use std::path::Path;
 use std::process::Stdio;
@@ -45,7 +45,7 @@ pub fn spawn(cwd: &str, args: &[String], log: &Path) -> Result<Child> {
     let out = File::create(log).map_err(|e| io_err(&log.display().to_string(), e))?;
     let err = File::create(log.with_extension("stderr"))
         .map_err(|e| io_err(&log.display().to_string(), e))?;
-    vendor_cmd("agy")
+    agent_cmd("agy")
         .args(args)
         .current_dir(cwd)
         .stdin(Stdio::piped())
@@ -57,7 +57,7 @@ pub fn spawn(cwd: &str, args: &[String], log: &Path) -> Result<Child> {
 }
 
 /// Why a run ended without taking the message: the `result` error or stderr.
-pub fn vendor_error(log: &Path, run: &Run, status: Option<i32>) -> VendorError {
+pub fn agent_error(log: &Path, run: &Run, status: Option<i32>) -> AgentError {
     let stderr = std::fs::read_to_string(log.with_extension("stderr"))
         .unwrap_or_default()
         .trim()
@@ -67,7 +67,7 @@ pub fn vendor_error(log: &Path, run: &Run, status: Option<i32>) -> VendorError {
         _ if !stderr.is_empty() => stderr,
         _ => format!("agy exited ({status:?}) before taking the message"),
     };
-    VendorError {
+    AgentError {
         code: status.unwrap_or(-1).into(),
         message,
         data: run.result.clone(),
@@ -84,9 +84,9 @@ pub async fn wait_init(child: &mut Child, log: &Path) -> Result<String> {
             return Ok(id);
         }
         if let Some(status) = exited {
-            return Err(Error::vendor(
+            return Err(Error::from_agent(
                 ErrorCode::Precondition,
-                vendor_error(log, &run, status.code()),
+                agent_error(log, &run, status.code()),
             ));
         }
         tokio::time::sleep(Duration::from_millis(50)).await;

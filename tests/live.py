@@ -4,7 +4,7 @@
 # ///
 """Live regression harness for agent-talk.
 
-Runs the real `agent-talk` binary against the installed vendors (Codex daemon, `claude -p`,
+Runs the real `agent-talk` binary against the installed agents (Codex daemon, `claude -p`,
 OpenCode service, `grok agent stdio`, `agy -p`) on cheap models (Grok and Antigravity have no
 cheaper model than grok-4.7 / gemini-3.8-flash) and checks the behavior documented in DESIGN.md.
 
@@ -70,7 +70,7 @@ created = {
     "claude_sessions": [],
     "grok": [],
     "antigravity": [],
-    # receipts whose run logs under ~/.agent-talk/<provider>-runs the run created
+    # receipts whose run logs under ~/.agent-talk/<agent>-runs the run created
     "claude_receipts": [],
     "antigravity_receipts": [],
 }
@@ -137,9 +137,9 @@ def cli(*args, env=None, expect_exit=0) -> dict:
     )
     # remember the run logs the harness created
     for r in (out.get("receipt"), (out.get("error") or {}).get("receipt")):
-        provider = str(r.get("handle", "")).split(":", 1)[0] if r else ""
-        if provider in ("claude", "antigravity") and args and args[0] in ("new", "send"):
-            created[f"{provider}_receipts"].append(r["receipt_id"])
+        agent = str(r.get("handle", "")).split(":", 1)[0] if r else ""
+        if agent in ("claude", "antigravity") and args and args[0] in ("new", "send"):
+            created[f"{agent}_receipts"].append(r["receipt_id"])
     allowed = expect_exit if isinstance(expect_exit, tuple) else (expect_exit,)
     if p.returncode not in allowed:
         raise Fail(f"exit {p.returncode}, expected {expect_exit}")
@@ -158,8 +158,8 @@ def native(handle: str) -> str:
     return handle.split(":", 1)[1]
 
 
-def check(provider: str, name: str, fn):
-    label = f"{provider}/{name}"
+def check(agent: str, name: str, fn):
+    label = f"{agent}/{name}"
     t0 = time.monotonic()
     LAST.clear()
     try:
@@ -266,22 +266,22 @@ class Mcp:
 
 def offline():
     def o1():
-        out = cli("ls", "--provider", "codex", env={"HOME": T}, expect_exit=2)
+        out = cli("ls", "--agent", "codex", env={"HOME": T}, expect_exit=2)
         expect(err(out).get("code") == "E_NO_DAEMON", "E_NO_DAEMON")
 
     def o2():
-        # All providers unreachable: the unavailable ones are reported per provider, the others still answer.
+        # All agents unreachable: the unavailable ones are reported per agent, the others still answer.
         out = cli("ls", "--limit", "1", env={"HOME": T, "XDG_STATE_HOME": T})
         expect(out.get("sessions") == [], "no sessions")
-        errors = {e["provider"]: e["error"]["code"] for e in out.get("errors") or []}
+        errors = {e["agent"]: e["error"]["code"] for e in out.get("errors") or []}
         expect(
             errors == {"codex": "E_NO_DAEMON", "opencode": "E_NO_DAEMON"},
             f"errors == codex+opencode E_NO_DAEMON, got {errors}",
         )
 
     def o3():
-        out = cli("ls", "--provider", "bogus", expect_exit=2)
-        expect(err(out).get("code") == "E_UNSUPPORTED", "ls --provider bogus: E_UNSUPPORTED")
+        out = cli("ls", "--agent", "bogus", expect_exit=2)
+        expect(err(out).get("code") == "E_UNSUPPORTED", "ls --agent bogus: E_UNSUPPORTED")
         out = cli("read", "nohandle", expect_exit=2)
         expect(err(out).get("code") == "E_PRECONDITION", "read nohandle: E_PRECONDITION")
         out = cli("ls", "--cursor", "x", expect_exit=2)
@@ -507,7 +507,7 @@ def codex_main():
         need("B", "T0")
         out = cli("send", st["B"], "x", "--mode", "steer", "--expect-turn", st["T0"], expect_exit=2)
         expect(err(out).get("code") == "E_PRECONDITION", "E_PRECONDITION")
-        expect((err(out).get("vendor") or {}).get("code") == -32600, "vendor.code == -32600")
+        expect((err(out).get("agent_error") or {}).get("code") == -32600, "agent_error.code == -32600")
 
     def c3h():
         need("B")
@@ -592,13 +592,13 @@ def codex_main():
 
     def c7():
         need("A")
-        p1 = cli("ls", "--provider", "codex", "--limit", "2")
+        p1 = cli("ls", "--agent", "codex", "--limit", "2")
         expect(p1["next_cursors"].get("codex"), "first page has a codex cursor")
-        p2 = cli("ls", "--provider", "codex", "--limit", "2", "--cursor", p1["next_cursors"]["codex"])
+        p2 = cli("ls", "--agent", "codex", "--limit", "2", "--cursor", p1["next_cursors"]["codex"])
         h1 = {s["handle"] for s in p1["sessions"]}
         h2 = {s["handle"] for s in p2["sessions"]}
         expect(h2 and not (h1 & h2), f"pages disjoint: {h1} / {h2}")
-        out = cli("ls", "--provider", "codex", "--cwd", str(DIR), "--limit", "50")
+        out = cli("ls", "--agent", "codex", "--cwd", str(DIR), "--limit", "50")
         a = next((s for s in out["sessions"] if s["handle"] == st["A"]), None)
         expect(a is not None, "A listed under --cwd")
         expect(a["owned"] is True and a["observations"]["origin"] == "agent-talk", "A owned, origin agent-talk")
@@ -632,7 +632,7 @@ def codex_c6():
         if (delay := ready - time.monotonic()) > 0:
             print(f"  (sleeping {delay:.0f}s so thread A is idle > 60 s)", flush=True)
             time.sleep(delay)
-        out = cli("ls", "--provider", "codex", "--cwd", str(DIR), "--limit", "50")
+        out = cli("ls", "--agent", "codex", "--cwd", str(DIR), "--limit", "50")
         a = next((s for s in out["sessions"] if s["handle"] == st["A"]), None)
         expect(a is not None, "A listed under --cwd")
         if a["observations"]["loaded"] != "no":
@@ -647,7 +647,7 @@ def codex_c6():
         # A thread held by another app-server process (here a standalone stdio `codex
         # app-server`; in practice the desktop app or VS Code) is refused with E_FOREIGN_LIVE.
         need("W")
-        out = cli("ls", "--provider", "codex", "--cwd", str(DIR), "--limit", "50")
+        out = cli("ls", "--agent", "codex", "--cwd", str(DIR), "--limit", "50")
         w = next((s for s in out["sessions"] if s["handle"] == st["W"]), None)
         expect(w is not None, "W listed under --cwd")
         if w["observations"]["loaded"] != "no":
@@ -683,10 +683,11 @@ def codex_c6():
         expect("error" not in resp, "standalone app-server resumed W")
         out = cli("send", st["W"], "x", expect_exit=2)
         expect(err(out).get("code") == "E_FOREIGN_LIVE", "E_FOREIGN_LIVE")
-        vendor = err(out).get("vendor") or {}
+        agent_error = err(out).get("agent_error") or {}
         expect(
-            vendor.get("code") == -32600 and vendor.get("message", "").endswith("already has an active writer"),
-            "vendor error kept",
+            agent_error.get("code") == -32600
+            and agent_error.get("message", "").endswith("already has an active writer"),
+            "agent error kept",
         )
         expect(not err(out).get("receipt"), "no receipt (refused before the intent)")
         os.killpg(proc.pid, signal.SIGKILL)
@@ -795,7 +796,7 @@ def claude_tier():
         else:
             raise Fail("foreign claude -p wrote no result within 60 s")
         handle = f"claude:{f}"
-        out = cli("ls", "--provider", "claude", "--cwd", str(DIR))
+        out = cli("ls", "--agent", "claude", "--cwd", str(DIR))
         s = next((x for x in out["sessions"] if x["handle"] == handle), None)
         expect(s is not None, "F listed")
         expect(s["observations"]["loaded"] == "yes" and s["owned"] is False, "F loaded yes, owned false")
@@ -878,7 +879,7 @@ def opencode_tier():
         need("O")
         out = cli("send", st["O"], "run `sleep 8` with your shell tool, then reply done")
         r1 = out["receipt"]["receipt_id"]
-        out = cli("ls", "--provider", "opencode", "--cwd", str(DIR))
+        out = cli("ls", "--agent", "opencode", "--cwd", str(DIR))
         o = next((s for s in out["sessions"] if s["handle"] == st["O"]), None)
         expect(o is not None, "O listed")
         running = o["state"] == "running"
@@ -1006,7 +1007,7 @@ def grok_tier():
         )
         expect(t["status"] == "completed", "completed")
         expect("kumquat" in final(out), "final ~ kumquat")
-        out = cli("ls", "--provider", "grok", "--cwd", str(DIR))
+        out = cli("ls", "--agent", "grok", "--cwd", str(DIR))
         s = next((x for x in out["sessions"] if x["handle"] == st["G"]), None)
         expect(s is not None, "G listed with --cwd")
         expect(s["name"] == "agent-talk-live-g1", f"name == agent-talk-live-g1, got {s['name']}")
@@ -1106,7 +1107,7 @@ def grok_tier():
                 raise Fail("the background send wrote no user line within 30 s")
             out = cli("send", st["G"], "x", expect_exit=2)
             expect(err(out).get("code") == "E_LOCKED", "E_LOCKED while an agent-talk child runs the session")
-            out = cli("ls", "--provider", "grok", "--cwd", str(DIR))
+            out = cli("ls", "--agent", "grok", "--cwd", str(DIR))
             s = next((x for x in out["sessions"] if x["handle"] == st["G"]), {})
             expect(s.get("state") == "running" and s["observations"]["loaded"] == "yes", "ls: running, loaded yes")
             stdout, _ = proc.communicate(timeout=120)
@@ -1138,8 +1139,8 @@ def grok_tier():
             out = cli("send", out["handle"], "x", env=env, expect_exit=2)
             expect(err(out).get("code") == "E_FOREIGN_LIVE", "live TUI row: E_FOREIGN_LIVE")
             expect(grok_updates(sid, home).read_text() == before, "updates.jsonl unchanged")
-            s = cli("ls", "--provider", "grok", env=env)["sessions"][0]
-            expect(s["native_id"] == sid and s["observations"]["loaded"] == "yes", "ls: loaded yes")
+            s = cli("ls", "--agent", "grok", env=env)["sessions"][0]
+            expect(s["id"] == sid and s["observations"]["loaded"] == "yes", "ls: loaded yes")
         finally:
             sleeper.kill()
             sleeper.wait()
@@ -1309,7 +1310,7 @@ def antigravity_tier():
         expect(t.get("status") != "completed", f"a killed turn is not completed, got {t.get('status')}")
         expect(t.get("basis") or err(out).get("state") in ("running", "unknown"), "basis or running/unknown state")
         expect(not agy_lock_held(conv), "presence lock released by the kill")
-        rows = cli("ls", "--provider", "antigravity", "--cwd", str(DIR), "--raw")["sessions"]
+        rows = cli("ls", "--agent", "antigravity", "--cwd", str(DIR), "--raw")["sessions"]
         row = next((s for s in rows if s["handle"] == st["AG"]), {})
         if (row.get("raw") or {}).get("status") != "CASCADE_RUN_STATUS_RUNNING":
             raise Inconclusive("the kill landed before agy marked the run RUNNING; the summary status stayed IDLE")
@@ -1365,7 +1366,7 @@ def antigravity_tier():
         out = cli("send", st["AG"], "x", expect_exit=2)
         expect(err(out).get("code") == "E_FOREIGN_LIVE", "E_FOREIGN_LIVE")
         expect(len(agy_steps(conv)) == before, "transcript unchanged")
-        rows = cli("ls", "--provider", "antigravity", "--cwd", str(DIR))["sessions"]
+        rows = cli("ls", "--agent", "antigravity", "--cwd", str(DIR))["sessions"]
         row = next((s for s in rows if s["handle"] == st["AG"]), {})
         expect(row.get("observations", {}).get("loaded") == "yes", "ls: loaded yes")
         # A turn agent-talk did not run, then the process idles with the lock held.
@@ -1419,16 +1420,16 @@ def antigravity_tier():
 
 
 def preconditions() -> dict[str, str | None]:
-    """provider -> None when new and send can run, else the reasons from caps."""
+    """agent -> None when new and send can run, else the reasons from caps."""
     out = json.loads(subprocess.run([B, "caps", "--json"], capture_output=True, text=True, env=BASE_ENV).stdout)
     reasons = {}
-    for p in out["providers"]:
+    for p in out["agents"]:
         blocked = [
             f"{o['name']}: {o['reason']}"
             for o in p["operations"]
             if o["name"] in ("new", "send") and not o["available"]
         ]
-        reasons[p["provider"]] = "; ".join(blocked) or None
+        reasons[p["agent"]] = "; ".join(blocked) or None
     return reasons
 
 
@@ -1449,14 +1450,14 @@ def cleanup():
         if (path := claude_transcript(sid)) is not None:
             path.unlink()
             print(f"cleanup: deleted {path}")
-    for provider in ("claude", "antigravity"):
-        runs = Path.home() / f".agent-talk/{provider}-runs"
-        receipts = set(created[f"{provider}_receipts"])
+    for agent in ("claude", "antigravity"):
+        runs = Path.home() / f".agent-talk/{agent}-runs"
+        receipts = set(created[f"{agent}_receipts"])
         for rid in receipts:
             for suffix in (".ndjson", ".stderr"):
                 (runs / f"{rid}{suffix}").unlink(missing_ok=True)
         if receipts:
-            print(f"cleanup: deleted {len(receipts)} {provider} run logs")
+            print(f"cleanup: deleted {len(receipts)} {agent} run logs")
     # agy has no delete command: the run's conversations stay (cwd target/live-work).
     for cid in created["antigravity"]:
         print(f"cleanup: antigravity conversation {cid} stays (agy has no delete command)")
