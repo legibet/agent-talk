@@ -1,0 +1,1441 @@
+//! Grok CLI adapter (DESIGN.md §6.4).
+//!
+//! Every mutation runs one `grok agent … stdio` child speaking ACP. When the leader
+//! socket (`$GROK_LEADER_SOCKET`, default `<GROK_HOME>/leader.sock`) answers a connect,
+//! the child is `grok agent --leader stdio`, a proxy into the user's shared leader,
+//! where sessions behave like Codex threads in the daemon; otherwise it is `grok agent
+//! --no-leader stdio`, an in-process agent that holds the session only while the
+//! command runs (closing its stdin ends it within about two seconds, and a running
+//! turn dies with it). `--leader` is never passed without a live socket: it spawns a
+//! persistent leader when none listens.
+//!
+//! agent-talk's `promptId` (the intent's client message id) becomes the persisted
+//! `turn_completed.prompt_id`, so it is the turn id. History, turn ends after the
+//! command and listings come from the store `<GROK_HOME>/sessions/<urlencoded
+//! cwd>/<id>/` (`updates.jsonl`, `summary.json`) and `<GROK_HOME>/active_sessions.json`.
+
+mod acp;
+mod updates;
+
+use self::acp::{Conn, Event, Reply, ServerRequest, Spawn};
+use self::updates::{History, first_prompt};
+use super::{
+    ApprovalPolicy, ListFilter, Mode, Provider, ReadPage, ReadRange, SendRequest, StartRequest,
+    WaitTarget, bounded, first_line, lock, pid_alive, record, reject, settle, strip_provenance,
+    vendor_cmd, wait_receipt,
+};
+use crate::model::{
+    self, Approval, Error, ErrorCode, Observations, Outcome, Page, ReceiptState, Result, Session,
+};
+use crate::store::{NewIntent, Store};
+use serde::Deserialize;
+use serde_json::{Value, json};
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::Duration;
+use tokio::sync::oneshot;
+use tokio::time::Instant;
+
+/// Why agent-talk refuses a second writer (DESIGN.md §6.4).
+const SECOND_WRITER: &str = "Grok has no lock between processes: a second writer marks the running turn interrupted and the two processes' memories of the session diverge";
+/// How long a command whose deadline passed keeps the direct-mode child to end the
+/// turn cleanly (wait for it to start, `session/cancel`, wait for its response).
+const WIND_DOWN: Duration = Duration::from_secs(10);
+
+pub struct Grok<'a> {
+    store: &'a Store,
+    /// `$GROK_HOME`, default `~/.grok`.
+    home: PathBuf,
+    /// `$GROK_LEADER_SOCKET`, default `<home>/leader.sock`.
+    socket: PathBuf,
+    /// The socket came from `GROK_LEADER_SOCKET`; only then is `--leader-socket` passed.
+    socket_override: bool,
+}
+
+fn handle(id: &str) -> String {
+    format!("grok:{id}")
+}
+
+/// Session ids are UUIDs; anything else is refused before it reaches a path.
+fn check_id(id: &str) -> Result<()> {
+    uuid::Uuid::parse_str(id).map(|_| ()).map_err(|_| {
+        Error::new(
+            ErrorCode::Precondition,
+            format!("invalid Grok session id {id}; expected a UUID"),
+        )
+    })
+}
+
+fn io_err(what: &str, e: impl std::fmt::Display) -> Error {
+    Error::new(ErrorCode::Transport, format!("{what}: {e}"))
+}
+
+#[derive(Debug, Deserialize)]
+struct Summary {
+    info: SummaryInfo,
+    /// Set by `_x.ai/session/rename` (with `title_is_manual: true`) or generated.
+    #[serde(default)]
+    generated_title: Option<String>,
+    /// `headless` for `-p`; null for the TUI and ACP.
+    #[serde(default)]
+    session_kind: Option<String>,
+    #[serde(default)]
+    updated_at: Option<String>,
+}
+
+impl Summary {
+    /// `updated_at`, empty when absent: the `ls` order and cursor.
+    fn at(&self) -> &str {
+        self.updated_at.as_deref().unwrap_or("")
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SummaryInfo {
+    id: String,
+    #[serde(default)]
+    cwd: Option<String>,
+}
+
+/// One row of `active_sessions.json`: a live TUI (DESIGN.md §6.4).
+#[derive(Debug, Deserialize)]
+struct Active {
+    session_id: String,
+    pid: u32,
+}
+
+/// A session as `_x.ai/sessions/list` describes it, through the leader.
+struct Listed {
+    resident: bool,
+    activity: String,
+    raw: Value,
+}
+
+/// The leader as seen at the start of this command: its socket answered a connect.
+struct Leader {
+    /// The pid in `leader.lock` at the probe, to report a leader Grok spawned since.
+    pid: Option<u32>,
+}
+
+/// What this command observes of one prompt: its own `session/prompt`, or, for a
+/// steer message, the turn it joined.
+struct TurnWatch {
+    id: String,
+    receipt_id: String,
+    /// agent-talk's promptId; for steer, the turn the interjection joined, once known.
+    prompt_id: Option<String>,
+    /// Steer: the delivered text, matched against `_x.ai/session/interjection`.
+    interjection: Option<String>,
+    policy: ApprovalPolicy,
+    /// Attached through a leader, where other clients' permission requests arrive too.
+    shared: bool,
+    accepted: bool,
+    running: bool,
+    /// The prompt the session runs now (`runningPromptId`).
+    running_prompt: Option<String>,
+    /// Agent text of the prompt since its last tool call.
+    text: String,
+    tools: HashSet<String>,
+    approvals: Vec<Approval>,
+    response: Option<oneshot::Receiver<Reply>>,
+    /// `{stopReason, …}`: the `session/prompt` result, or for steer the
+    /// `_x.ai/session/prompt_complete` of the joined turn.
+    result: Option<Result<Value>>,
+}
+
+impl TurnWatch {
+    /// This command's own `session/prompt`, submitted with `prompt_id`.
+    fn prompt(
+        id: &str,
+        receipt_id: &str,
+        prompt_id: &str,
+        policy: ApprovalPolicy,
+        shared: bool,
+    ) -> Self {
+        TurnWatch {
+            prompt_id: Some(prompt_id.to_string()),
+            ..TurnWatch::new(id, receipt_id, policy, shared)
+        }
+    }
+
+    /// A steer message `text` through the leader, sent while the session runs the
+    /// prompt `running` (`runningPromptId` at load); the joined turn is learned later.
+    fn steer(
+        id: &str,
+        receipt_id: &str,
+        running: Option<String>,
+        text: &str,
+        policy: ApprovalPolicy,
+    ) -> Self {
+        TurnWatch {
+            interjection: Some(text.to_string()),
+            running_prompt: running,
+            ..TurnWatch::new(id, receipt_id, policy, true)
+        }
+    }
+
+    /// What both kinds start from: nothing seen yet.
+    fn new(id: &str, receipt_id: &str, policy: ApprovalPolicy, shared: bool) -> Self {
+        TurnWatch {
+            id: id.to_string(),
+            receipt_id: receipt_id.to_string(),
+            prompt_id: None,
+            interjection: None,
+            policy,
+            shared,
+            accepted: false,
+            running: false,
+            running_prompt: None,
+            text: String::new(),
+            tools: HashSet::new(),
+            approvals: Vec::new(),
+            response: None,
+            result: None,
+        }
+    }
+
+    fn accept(&mut self, store: &Store) -> Result<()> {
+        if !self.accepted {
+            let p = self.prompt_id.as_deref();
+            store.accept(&self.receipt_id, p, p, None)?;
+            self.accepted = true;
+        }
+        Ok(())
+    }
+
+    /// Events until the turn's result arrives (or, with `until_running`, until the
+    /// prompt runs).
+    async fn observe(&mut self, store: &Store, conn: &mut Conn, until_running: bool) -> Result<()> {
+        loop {
+            if self.result.is_some() || (until_running && self.running) {
+                return Ok(());
+            }
+            let ev = match self.response.as_mut() {
+                Some(rx) => tokio::select! {
+                    biased;
+                    r = rx => Err(r),
+                    ev = conn.next_event() => Ok(ev),
+                },
+                None => Ok(conn.next_event().await),
+            };
+            match ev {
+                Err(r) => {
+                    self.response = None;
+                    let r = conn.reply(r);
+                    if r.is_ok() {
+                        self.accept(store)?;
+                    }
+                    self.result = Some(r);
+                }
+                Ok(Some(Event::Request(r))) => self.on_request(store, conn, r).await?,
+                Ok(Some(Event::Notification { method, params })) => {
+                    self.on_notification(store, &method, &params)?
+                }
+                // Never reached with a response pending: the reader drops the waiters
+                // before the event channels close, so the biased select above has
+                // already taken the response (or its loss).
+                Ok(None) => {
+                    return Err(Error::new(
+                        ErrorCode::Transport,
+                        "grok agent exited while agent-talk was observing; outcome unknown",
+                    ));
+                }
+            }
+        }
+    }
+
+    fn on_notification(&mut self, store: &Store, method: &str, params: &Value) -> Result<()> {
+        if params["sessionId"] != self.id.as_str() {
+            return Ok(());
+        }
+        let mine = |p: &Value, id: &Option<String>| id.is_some() && p.as_str() == id.as_deref();
+        match method {
+            // The queue lists the prompt (its id is the promptId) and then names it
+            // running; the first is the earliest proof of acceptance (direct mode:
+            // about 20 ms after the request).
+            "_x.ai/queue/changed" => {
+                let listed = params["entries"]
+                    .as_array()
+                    .is_some_and(|es| es.iter().any(|e| mine(&e["id"], &self.prompt_id)));
+                let running = mine(&params["runningPromptId"], &self.prompt_id);
+                self.running_prompt = params["runningPromptId"].as_str().map(String::from);
+                if listed || running {
+                    self.accept(store)?;
+                }
+                if running {
+                    self.running = true;
+                }
+            }
+            "_x.ai/session/interjection" => {
+                if self.interjection.is_some()
+                    && params["text"].as_str() == self.interjection.as_deref()
+                {
+                    self.interjection = None;
+                    // Joined the running turn; with none running, Grok starts a
+                    // fallback turn, named by its first update.
+                    if let Some(p) = self.running_prompt.clone() {
+                        self.prompt_id = Some(p);
+                        self.running = true;
+                        store.accept(&self.receipt_id, None, self.prompt_id.as_deref(), None)?;
+                    }
+                }
+            }
+            "session/update" => {
+                let p = &params["_meta"]["promptId"];
+                if self.prompt_id.is_none()
+                    && self.accepted
+                    && p.as_str()
+                        .is_some_and(|p| p.starts_with("interject-fallback-"))
+                {
+                    self.prompt_id = p.as_str().map(String::from);
+                    store.accept(&self.receipt_id, None, self.prompt_id.as_deref(), None)?;
+                }
+                if !mine(p, &self.prompt_id) {
+                    return Ok(());
+                }
+                self.running = true;
+                self.accept(store)?;
+                let u = &params["update"];
+                match u["sessionUpdate"].as_str() {
+                    Some("agent_message_chunk") => self
+                        .text
+                        .push_str(u["content"]["text"].as_str().unwrap_or("")),
+                    Some("tool_call") => {
+                        self.text.clear();
+                        if let Some(id) = u["toolCallId"].as_str() {
+                            self.tools.insert(id.to_string());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            "_x.ai/session/prompt_complete"
+                if self.response.is_none() && mine(&params["promptId"], &self.prompt_id) =>
+            {
+                self.result = Some(Ok(params.clone()));
+            }
+            "_x.ai/session_notification" => {
+                let u = &params["update"];
+                if u["sessionUpdate"] == "interaction_resolved" {
+                    // Someone answered (or agent-talk's own answer took effect).
+                    for a in self.approvals.iter_mut().filter(|a| {
+                        a.outcome == "pending" && a.item_id.as_deref() == u["tool_call_id"].as_str()
+                    }) {
+                        a.outcome = "resolved";
+                        record(store, a);
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// A request from the agent. Permission requests are recorded; under `deny` the
+    /// ones for this prompt's tool calls (matched by `toolCallId`; through a leader,
+    /// other clients' turns raise them too) get the `reject_once` option. Anything
+    /// else is answered "method not found": agent-talk offers no client capabilities.
+    async fn on_request(&mut self, store: &Store, conn: &Conn, r: ServerRequest) -> Result<()> {
+        let ServerRequest { id, method, params } = r;
+        if method != "session/request_permission" {
+            return conn
+                .respond_error(&id, -32601, "not supported by agent-talk")
+                .await;
+        }
+        let call = &params["toolCall"];
+        let call_id = call["toolCallId"].as_str().map(String::from);
+        // A request already recorded is not answered again. Unverified whether Grok
+        // ever sends the same request twice to one client.
+        if self
+            .approvals
+            .iter()
+            .any(|a| a.request_id == id && a.item_id == call_id)
+        {
+            return Ok(());
+        }
+        let ours = !self.shared || call_id.as_ref().is_some_and(|c| self.tools.contains(c));
+        let reject = params["options"]
+            .as_array()
+            .and_then(|os| os.iter().find(|o| o["kind"] == "reject_once"))
+            .and_then(|o| o["optionId"].as_str());
+        let outcome = match (self.policy, ours, reject) {
+            (ApprovalPolicy::Deny, true, Some(option)) => {
+                conn.respond(
+                    &id,
+                    json!({"outcome": {"outcome": "selected", "optionId": option}}),
+                )
+                .await?;
+                "declined"
+            }
+            _ => "pending",
+        };
+        let summary = call["title"]
+            .as_str()
+            .or(call["_meta"]["x.ai/tool"]["name"].as_str())
+            .map(|t| first_line(t, 160))
+            .unwrap_or_else(|| "permission request".into());
+        let a = Approval {
+            handle: handle(&self.id),
+            turn_id: if ours { self.prompt_id.clone() } else { None },
+            item_id: call_id,
+            request_id: id,
+            kind: method,
+            summary,
+            outcome,
+            raw: params,
+        };
+        record(store, &a);
+        self.approvals.push(a);
+        Ok(())
+    }
+
+    /// The turn as its result reports it; `final_text` is the agent text after the
+    /// last tool call, from the live updates. `note` is appended to the basis.
+    fn turn(&self, handle: String, result: &Value, basis: &str, note: Option<&str>) -> model::Turn {
+        let (status, error) = updates::status(
+            result["stopReason"].as_str().unwrap_or(""),
+            &result["_meta"],
+        );
+        model::Turn {
+            handle,
+            turn_id: self.prompt_id.clone().unwrap_or_default(),
+            status,
+            error,
+            final_text: (!self.text.is_empty()).then(|| self.text.clone()),
+            duration_ms: None,
+            basis: Some(match note {
+                Some(n) => format!("{basis}; {n}"),
+                None => basis.into(),
+            }),
+            raw: result.clone(),
+        }
+    }
+}
+
+impl<'a> Grok<'a> {
+    pub fn new(store: &'a Store) -> Self {
+        let home_dir = std::env::home_dir().unwrap_or_default();
+        let home = std::env::var_os("GROK_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home_dir.join(".grok"));
+        let (socket, socket_override) = match std::env::var_os("GROK_LEADER_SOCKET") {
+            Some(s) => (PathBuf::from(s), true),
+            None => (home.join("leader.sock"), false),
+        };
+        Grok {
+            store,
+            home,
+            socket,
+            socket_override,
+        }
+    }
+
+    fn sessions(&self) -> PathBuf {
+        self.home.join("sessions")
+    }
+
+    /// The session directory, found by id across the cwd groups.
+    fn find(&self, id: &str) -> Option<PathBuf> {
+        std::fs::read_dir(self.sessions())
+            .ok()?
+            .flatten()
+            .map(|d| d.path().join(id))
+            .find(|p| p.is_dir())
+    }
+
+    fn require(&self, id: &str) -> Result<PathBuf> {
+        self.find(id).ok_or_else(|| {
+            Error::new(
+                ErrorCode::Precondition,
+                format!("no Grok session {id} under {}", self.sessions().display()),
+            )
+        })
+    }
+
+    /// The pid in the leader's lock file, which sits next to its socket (`leader.sock`,
+    /// `leader.lock`; a custom socket `x.sock` has `x.lock`).
+    fn leader_pid(&self) -> Option<u32> {
+        std::fs::read_to_string(self.socket.with_extension("lock"))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    }
+
+    /// Connect to the leader socket. Only a missing socket, a refused connection (a
+    /// stale socket file, e.g. after the leader died) or a path too long for a Unix
+    /// socket (macOS: 104 bytes; Grok cannot listen there either, DESIGN.md §6.4)
+    /// means "no leader".
+    fn leader(&self) -> Result<Option<Leader>> {
+        let pid = self.leader_pid();
+        match std::os::unix::net::UnixStream::connect(&self.socket) {
+            Ok(_) => Ok(Some(Leader { pid })),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound
+                        | std::io::ErrorKind::ConnectionRefused
+                        | std::io::ErrorKind::InvalidInput
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(e) => Err(Error::new(
+                ErrorCode::Transport,
+                format!(
+                    "cannot probe the Grok leader socket {}: {e}. A sandbox that blocks local network access fails this way; agent-talk needs to reach the socket to tell whether a leader runs",
+                    self.socket.display()
+                ),
+            )),
+        }
+    }
+
+    /// A note when `leader.lock` names another pid than at the probe: the leader that
+    /// answered exited in between and the `--leader` child spawned a new one.
+    fn leader_change(&self, leader: &Option<Leader>) -> Option<String> {
+        let before = leader.as_ref()?.pid;
+        let after = self.leader_pid();
+        (before != after).then(|| {
+            let note = format!(
+                "the Grok leader pid changed during this command ({before:?} -> {after:?}): the leader that answered the probe exited and grok agent --leader spawned a new one, which keeps running"
+            );
+            tracing::warn!("{note}");
+            note
+        })
+    }
+
+    /// A `grok agent` child in `cwd`, initialized: `--leader` (only after `leader()`
+    /// found a live socket) or `--no-leader`.
+    async fn connect(
+        &self,
+        cwd: &str,
+        leader: bool,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> Result<Conn> {
+        let opts = Spawn {
+            leader,
+            leader_socket: self.socket_override.then_some(self.socket.as_path()),
+            model,
+            effort,
+        };
+        acp::spawn(cwd, &opts).await
+    }
+
+    /// `_x.ai/sessions/list` through the leader: the entry for `id` if it is listed,
+    /// or with `None` every listed session.
+    async fn listed(&self, conn: &Conn, id: Option<&str>) -> Result<Vec<(String, Listed)>> {
+        let v = conn.request("_x.ai/sessions/list", json!({})).await?;
+        // The sessions sit under a nested `result` (verified in direct and leader mode).
+        Ok(v["result"]["sessions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|s| {
+                let sid = s["sessionId"].as_str()?;
+                (id.is_none() || id == Some(sid)).then(|| {
+                    (
+                        sid.to_string(),
+                        Listed {
+                            resident: s["resident"].as_bool() == Some(true),
+                            activity: s["activity"].as_str().unwrap_or("unknown").to_string(),
+                            raw: s.clone(),
+                        },
+                    )
+                })
+            })
+            .collect())
+    }
+
+    /// Rows of `active_sessions.json` (absent: none).
+    fn active(&self) -> Result<Vec<Active>> {
+        let path = self.home.join("active_sessions.json");
+        match std::fs::read_to_string(&path) {
+            Ok(t) => serde_json::from_str(&t).map_err(|e| {
+                Error::new(
+                    ErrorCode::CapMissing,
+                    format!(
+                        "cannot check whether a Grok TUI holds the session: {}: {e}",
+                        path.display()
+                    ),
+                )
+            }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(io_err(&path.display().to_string(), e)),
+        }
+    }
+
+    /// A recorded child of the session that is still alive and whose turn has
+    /// no `turn_completed` yet in the session directory `dir` (a pid alone may have been
+    /// reused).
+    fn own_run(&self, id: &str, dir: &Path) -> Result<Option<u32>> {
+        let alive: Vec<_> = self
+            .store
+            .processes(&handle(id))?
+            .into_iter()
+            .filter(|(_, pid)| pid_alive(*pid))
+            .collect();
+        if alive.is_empty() {
+            return Ok(None);
+        }
+        let history = History::new(updates::load(&dir.join("updates.jsonl"))?);
+        for (receipt_id, pid) in alive {
+            let ended = self.store.receipt(&receipt_id)?.is_some_and(|r| {
+                history
+                    .find(&r.client_msg_id)
+                    .is_some_and(|s| history.spans[s].end.is_some())
+            });
+            if !ended {
+                return Ok(Some(pid));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Refuse a direct-mode write while another process holds the session: a TUI
+    /// listed in `active_sessions.json` (no leader lists the session resident, or the
+    /// leader path would have been taken), or a grok agent another agent-talk command
+    /// started.
+    fn refuse_live(&self, id: &str, dir: &Path) -> Result<()> {
+        if let Some(a) = self
+            .active()?
+            .into_iter()
+            .find(|a| a.session_id == id && pid_alive(a.pid))
+        {
+            return Err(Error::new(
+                ErrorCode::ForeignLive,
+                format!(
+                    "{} is open in a Grok TUI (pid {}, active_sessions.json) that runs it in process, outside any leader; {SECOND_WRITER}, so agent-talk only reads this session. Exit the TUI, or run it with --leader so agent-talk can join it through the leader",
+                    handle(id),
+                    a.pid
+                ),
+            ));
+        }
+        if let Some(pid) = self.own_run(id, dir)? {
+            return Err(Error::new(
+                ErrorCode::Locked,
+                format!(
+                    "a grok agent started by another agent-talk command (pid {pid}) is still running {}; {SECOND_WRITER}",
+                    handle(id)
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Record the intent, submit its text as a prompt on the loaded session and observe
+    /// it (until the deadline, or to the end of the turn without one), then settle the
+    /// receipt. The caller closes `conn`.
+    async fn run(
+        &self,
+        conn: &mut Conn,
+        id: &str,
+        intent: &NewIntent<'_>,
+        policy: ApprovalPolicy,
+        deadline: Option<Instant>,
+        leader: &Option<Leader>,
+    ) -> Result<Outcome> {
+        self.store.insert_intent(intent)?;
+        // Direct mode: the child is the session's writer until it exits; later commands
+        // tell it from a foreign writer by its pid.
+        if leader.is_none()
+            && let Some(pid) = conn.pid()
+        {
+            self.store
+                .insert_process(intent.receipt_id, intent.handle, pid)?;
+        }
+        let mut w = TurnWatch::prompt(
+            id,
+            intent.receipt_id,
+            intent.client_msg_id,
+            policy,
+            leader.is_some(),
+        );
+        let text = intent.delivered_text.unwrap_or(intent.text);
+        let rx = conn
+            .start(
+                "session/prompt",
+                json!({
+                    "sessionId": id,
+                    "prompt": [{"type": "text", "text": text}],
+                    "_meta": {"promptId": intent.client_msg_id},
+                }),
+            )
+            .await;
+        match rx {
+            Ok(rx) => w.response = Some(rx),
+            Err(e) => return Err(reject(self.store, &w.receipt_id, e)),
+        }
+        // Without --wait the turn still runs to its end: no process outlives the
+        // command in direct mode. Only Ctrl-C stops observing early.
+        let mut res = bounded(deadline, w.observe(self.store, conn, false)).await;
+        if let Err(e) = &mut res
+            && matches!(e.code, ErrorCode::Timeout | ErrorCode::Interrupted)
+        {
+            if leader.is_some() {
+                e.message
+                    .push_str("; the turn continues in the Grok leader");
+            } else {
+                // The child dies with this command and would take the turn down
+                // mid-step; end it the vendor's way instead, so updates.jsonl records
+                // turn_completed (stop_reason cancelled). A cancel sent before the
+                // prompt runs is ignored, hence the wait for it to start.
+                let _ = tokio::time::timeout(WIND_DOWN, w.observe(self.store, conn, true)).await;
+                if w.result.is_none() {
+                    let _ = conn
+                        .notify("session/cancel", json!({"sessionId": id}))
+                        .await;
+                    let _ =
+                        tokio::time::timeout(WIND_DOWN, w.observe(self.store, conn, false)).await;
+                }
+                e.message.push_str("; in direct mode no process outlives the command, so agent-talk ended the turn with session/cancel unless it finished first; wait --receipt reads how it ended from updates.jsonl");
+            }
+        }
+        let h = handle(id);
+        let note = self.leader_change(leader);
+        let res = res.and_then(|()| {
+            // observe(false) returns Ok only once the result is in.
+            match w.result.take().expect("observe ended without a result") {
+                Ok(v) => Ok(w.turn(h.clone(), &v, "session/prompt response", note.as_deref())),
+                // A refusal of the prompt itself; an error after acceptance is a failed turn.
+                Err(e) if !w.accepted => Err(reject(self.store, &w.receipt_id, e)),
+                Err(e) => Ok(model::Turn {
+                    handle: h.clone(),
+                    turn_id: intent.client_msg_id.to_string(),
+                    status: "failed",
+                    error: Some(json!({"message": e.message, "vendor": e.vendor})),
+                    final_text: (!w.text.is_empty()).then(|| w.text.clone()),
+                    duration_ms: None,
+                    basis: Some("session/prompt error response".into()),
+                    raw: Value::Null,
+                }),
+            }
+        });
+        let progress = if w.running {
+            "running"
+        } else if w.accepted {
+            "pending"
+        } else {
+            "unknown"
+        };
+        settle(
+            self.store,
+            h,
+            res.map(|t| deadline.is_some().then_some(t)),
+            Some(&w.receipt_id),
+            w.approvals,
+            progress,
+        )
+    }
+
+    /// `session/load` (replays the history as notifications before its response;
+    /// they are discarded) and the load result.
+    async fn session_load(
+        &self,
+        conn: &mut Conn,
+        id: &str,
+        cwd: &str,
+        deny: bool,
+    ) -> Result<Value> {
+        let mut params = json!({"sessionId": id, "cwd": cwd, "mcpServers": []});
+        if deny {
+            // Turns the user's always-approve off for this process's session, as on
+            // session/new (verified: `_x.ai/sessions/list` then shows `yolo: false`;
+            // without it the loaded session is `yolo: true` under permission_mode
+            // always-approve; DESIGN.md §6.4).
+            params["_meta"] = json!({"yoloMode": false});
+        }
+        let r = conn.request("session/load", params).await?;
+        conn.discard_notifications();
+        Ok(r)
+    }
+
+    /// `send --mode steer`: `_x.ai/interject` on a session working in the leader.
+    async fn steer(
+        &self,
+        id: &str,
+        cwd: &str,
+        req: &SendRequest<'_>,
+        policy: ApprovalPolicy,
+        deadline: Option<Instant>,
+    ) -> Result<Outcome> {
+        let h = handle(id);
+        let Some(leader) = self.leader()? else {
+            return Err(Error::new(
+                ErrorCode::NoSteer,
+                format!(
+                    "Grok steers only through a live leader ({} does not answer), and in direct mode no process of an earlier command survives to steer; send with --mode queue",
+                    self.socket.display()
+                ),
+            ));
+        };
+        let mut conn = self.connect(cwd, true, None, None).await?;
+        let res = async {
+            let listed = self.listed(&conn, Some(id)).await?;
+            match listed.first() {
+                Some((_, l)) if l.resident && l.activity == "working" => {}
+                Some((_, l)) if l.resident => {
+                    return Err(Error::new(
+                        ErrorCode::Precondition,
+                        format!(
+                            "{h} is {} in the leader; steer needs a running turn (Grok would start a fallback turn instead); send with --mode queue",
+                            l.activity
+                        ),
+                    ));
+                }
+                _ => {
+                    return Err(Error::new(
+                        ErrorCode::NoSteer,
+                        format!(
+                            "{h} is not resident in the Grok leader, so no running turn can be joined; send with --mode queue"
+                        ),
+                    ));
+                }
+            }
+            let loaded = self.session_load(&mut conn, id, cwd, false).await?;
+            let running = loaded["_meta"]["x.ai/runningPromptId"]
+                .as_str()
+                .map(String::from);
+            // Grok has no expected-turn check; agent-talk compares before the call.
+            if let Some(t) = req.expect_turn
+                && running.as_deref() != Some(t)
+            {
+                return Err(Error::new(
+                    ErrorCode::Precondition,
+                    format!("the running turn of {h} is {running:?}, not {t}"),
+                ));
+            }
+            let receipt_id = uuid::Uuid::new_v4().to_string();
+            let client_msg_id = uuid::Uuid::new_v4().to_string();
+            self.store.insert_intent(&NewIntent {
+                receipt_id: &receipt_id,
+                handle: &h,
+                client_msg_id: &client_msg_id,
+                text: req.text,
+                delivered_text: (req.delivered != req.text).then_some(req.delivered),
+                from: req.from,
+                reply_to: req.reply_to,
+                depth: req.depth,
+            })?;
+            let mut w = TurnWatch::steer(id, &receipt_id, running, req.delivered, policy);
+            let ack = conn
+                .request(
+                    "_x.ai/interject",
+                    json!({"sessionId": id, "text": req.delivered}),
+                )
+                .await;
+            match ack {
+                // The ack (`status: queued`) is the acceptance; the turn it joined comes
+                // with `_x.ai/session/interjection`.
+                Ok(_) => w.accept(self.store)?,
+                Err(e) => return Err(reject(self.store, &w.receipt_id, e)),
+            }
+            let res = match deadline {
+                Some(d) => bounded(Some(d), w.observe(self.store, &mut conn, false)).await,
+                None => {
+                    // Without --wait: only until the joined turn is known (`running` is
+                    // set exactly when the watch learns its prompt id).
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        w.observe(self.store, &mut conn, true),
+                    )
+                    .await;
+                    Ok(())
+                }
+            };
+            let note = self.leader_change(&Some(leader));
+            // Steer sets no `session/prompt` response, so a result is the joined turn's
+            // `_x.ai/session/prompt_complete`, never an error.
+            let res = res.map(|()| {
+                w.result.take().and_then(Result::ok).map(|v| {
+                    w.turn(
+                        h.clone(),
+                        &v,
+                        "_x.ai/session/prompt_complete of the joined turn",
+                        note.as_deref(),
+                    )
+                })
+            });
+            settle(
+                self.store,
+                h.clone(),
+                res,
+                Some(&w.receipt_id),
+                w.approvals,
+                "running",
+            )
+        }
+        .await;
+        conn.close().await;
+        res
+    }
+}
+
+impl Provider for Grok<'_> {
+    async fn caps(&self) -> Value {
+        let cli = match vendor_cmd("grok")
+            .arg("--version")
+            .stdin(Stdio::null())
+            .output()
+            .await
+        {
+            Ok(o) if o.status.success() => {
+                Ok(String::from_utf8_lossy(&o.stdout).trim().to_string())
+            }
+            Ok(o) => Err(String::from_utf8_lossy(&o.stderr).trim().to_string()),
+            Err(e) => Err(e.to_string()),
+        };
+        let cli_ok = cli.is_ok();
+        let leader = match self.leader() {
+            Ok(l) => json!({
+                "socket": self.socket,
+                "present": self.socket.exists(),
+                "answering": l.is_some(),
+                "lock_pid": self.leader_pid(),
+            }),
+            Err(e) => {
+                json!({"socket": self.socket, "present": self.socket.exists(), "error": e.message})
+            }
+        };
+        let store = self.sessions();
+        json!({
+            "provider": "grok",
+            "cli": match cli {
+                Ok(v) => json!({"version": v}),
+                Err(e) => json!({"version": null, "error": e}),
+            },
+            "leader": leader,
+            "store": {"dir": store, "present": store.is_dir()},
+            "methods": {
+                "new (grok agent stdio: session/new, _x.ai/session/rename, session/prompt)": {"available": cli_ok},
+                "send --mode queue (session/load + session/prompt; runs to the turn end even without --wait)": {"available": cli_ok},
+                "send --mode steer (_x.ai/interject through a live leader)": {"available": cli_ok, "detail": "E_NO_STEER without a live leader"},
+                "read (updates.jsonl)": {"available": store.is_dir()},
+                "wait (session/prompt response, else updates.jsonl turn_completed)": {"available": true},
+            },
+            "blind_spots": [
+                "No vendor lock between writers: a second process on a session marks its running turn interrupted and the two processes' memories diverge. agent-talk refuses a direct-mode write while active_sessions.json lists a live TUI pid for the session that no leader lists resident (E_FOREIGN_LIVE) or while a grok agent it started still runs it (E_LOCKED), and holds its own lock per session. Foreign `grok -p` and direct ACP writers are listed nowhere and are not detected.",
+                "Leader detection: agent-talk passes --leader only after the leader socket answered a connect, since --leader spawns a persistent leader when none listens. A leader that exits between that probe and the child's connect is replaced by one Grok spawns; agent-talk reports a changed leader.lock pid but cannot prevent it.",
+                "Steer (_x.ai/interject) works only through a live leader on a session working there. Grok takes no client id and no expected turn: the ack is the acceptance, the joined turn comes from _x.ai/session/interjection, --expect-turn is compared by agent-talk before the call, and a turn that ended in between makes Grok start a fallback turn (prompt id interject-fallback-…), which the receipt then names.",
+                "Every Grok session loads the user's MCP servers from ~/.claude.json, so each session agent-talk starts runs an `agent-talk mcp` of its own.",
+                "Direct mode keeps no process after the command: send and new run until the turn ends even without --wait (only the receipt is printed then), and when a --wait deadline or Ctrl-C ends the command first, agent-talk cancels the turn (session/cancel) so that updates.jsonl records its end; through a leader the turn continues.",
+                "Approvals: the user's permission_mode applies (always-approve makes ACP sessions yolo); --approvals deny sends yoloMode: false on session/new and session/load in direct mode and answers this prompt's session/request_permission with reject_once, which ends the turn cancelled. Under observe a request stays pending, and the command waits until its deadline (without --wait: until Ctrl-C).",
+                "Turns not run by this command (TUI, other clients, a receipt whose command ended) are read from updates.jsonl: wait polls it every second for turn_completed.",
+            ],
+        })
+    }
+
+    async fn list(
+        &self,
+        filter: &ListFilter<'_>,
+        limit: u32,
+        cursor: Option<&str>,
+    ) -> Result<Page<Session>> {
+        // (dir, summary, raw), newest first, ties by id.
+        let mut rows: Vec<(PathBuf, Summary, Value)> = Vec::new();
+        for group in std::fs::read_dir(self.sessions())
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            for dir in std::fs::read_dir(group.path())
+                .into_iter()
+                .flatten()
+                .flatten()
+            {
+                let path = dir.path().join("summary.json");
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                let Ok(raw) = serde_json::from_str::<Value>(&text) else {
+                    tracing::warn!("undecodable {}", path.display());
+                    continue;
+                };
+                let Ok(s) = Summary::deserialize(&raw) else {
+                    tracing::warn!("unexpected {}", path.display());
+                    continue;
+                };
+                if filter.cwd.is_some() && s.info.cwd.as_deref() != filter.cwd {
+                    continue;
+                }
+                rows.push((dir.path(), s, raw));
+            }
+        }
+        rows.sort_by(|(_, a, _), (_, b, _)| b.at().cmp(a.at()).then(a.info.id.cmp(&b.info.id)));
+        let skip = match cursor {
+            Some(c) => {
+                let (at, id) = c.split_once('|').ok_or_else(|| {
+                    Error::new(ErrorCode::Precondition, format!("invalid cursor {c}"))
+                })?;
+                rows.iter()
+                    .position(|(_, s, _)| s.at() < at || (s.at() == at && s.info.id.as_str() > id))
+                    .unwrap_or(rows.len())
+            }
+            None => 0,
+        };
+        let end = (skip + limit as usize).min(rows.len());
+        let next_cursor = (end < rows.len() && end > 0).then(|| {
+            let s = &rows[end - 1].1;
+            format!("{}|{}", s.at(), s.info.id)
+        });
+        let page: Vec<_> = rows.into_iter().take(end).skip(skip).collect();
+        if page.is_empty() {
+            return Ok(Page {
+                items: Vec::new(),
+                next_cursor,
+            });
+        }
+        let active = self.active().unwrap_or_else(|e| {
+            tracing::warn!("{e}");
+            Vec::new()
+        });
+        // The leader's own view, when one runs.
+        let mut listed = Vec::new();
+        match self.leader() {
+            Ok(Some(_)) => {
+                // The client process needs some cwd; `_x.ai/sessions/list` covers all.
+                let cwd = std::env::temp_dir().to_string_lossy().into_owned();
+                match self.connect(&cwd, true, None, None).await {
+                    Ok(conn) => {
+                        match self.listed(&conn, None).await {
+                            Ok(l) => listed = l,
+                            Err(e) => tracing::warn!("leader sessions/list: {e}"),
+                        }
+                        conn.close().await;
+                    }
+                    Err(e) => tracing::warn!("leader client: {e}"),
+                }
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!("{e}"),
+        }
+        let mut items = Vec::new();
+        for (dir, s, raw) in page {
+            let id = s.info.id.as_str();
+            let h = handle(id);
+            let owned = self.store.is_owned(&h)?;
+            let tui = active
+                .iter()
+                .find(|a| a.session_id == id && pid_alive(a.pid));
+            let lead = listed.iter().find(|(sid, _)| sid == id).map(|(_, l)| l);
+            let updates_path = dir.join("updates.jsonl");
+            let own_pid = self.own_run(id, &dir)?;
+            let state = match (own_pid, lead) {
+                (Some(_), _) => "running",
+                (None, Some(l)) if l.resident && l.activity == "working" => "running",
+                (None, Some(l)) if l.resident && l.activity == "idle" => "idle",
+                _ => "unknown",
+            };
+            let loaded = own_pid.is_some() || tui.is_some() || lead.is_some_and(|l| l.resident);
+            items.push(Session {
+                handle: h,
+                provider: "grok",
+                cwd: s.info.cwd.clone(),
+                name: s.generated_title.clone(),
+                preview: first_prompt(&updates_path).map(|p| first_line(strip_provenance(&p), 200)),
+                observations: Observations {
+                    history: if updates_path.is_file() {
+                        "visible"
+                    } else {
+                        "none"
+                    },
+                    loaded: if loaded { "yes" } else { "no" },
+                    origin: if owned {
+                        "agent-talk".into()
+                    } else if s.session_kind.as_deref() == Some("headless") {
+                        "headless".into()
+                    } else {
+                        "grok".into()
+                    },
+                },
+                state,
+                owned,
+                raw: json!({
+                    "summary": raw,
+                    "active_session": tui.map(|a| json!({"pid": a.pid})),
+                    "leader": lead.map(|l| &l.raw),
+                    "dir": dir,
+                }),
+                native_id: id.to_string(),
+            });
+        }
+        Ok(Page { items, next_cursor })
+    }
+
+    async fn start(
+        &self,
+        req: &StartRequest<'_>,
+        approvals: Option<ApprovalPolicy>,
+        deadline: Option<Instant>,
+    ) -> Result<Outcome> {
+        if req.approval_policy.is_some() || req.sandbox.is_some() || req.max_turns.is_some() {
+            return Err(Error::new(
+                ErrorCode::Unsupported,
+                "--approval-policy, --sandbox and --max-turns are Codex and Claude options; Grok uses its own permission configuration",
+            ));
+        }
+        let policy = approvals.unwrap_or(ApprovalPolicy::Observe);
+        let leader = self.leader()?;
+        let mut conn = self
+            .connect(req.cwd, leader.is_some(), req.model, req.effort)
+            .await?;
+        let res = async {
+            let mut params = json!({"cwd": req.cwd, "mcpServers": []});
+            if policy == ApprovalPolicy::Deny {
+                params["_meta"] = json!({"yoloMode": false});
+            }
+            let created = conn.request("session/new", params).await?;
+            let id = created["sessionId"].as_str().ok_or_else(|| {
+                Error::new(
+                    ErrorCode::Transport,
+                    format!("session/new returned no sessionId: {created}"),
+                )
+            })?;
+            let h = handle(id);
+            // Direct mode only: clients of one leader do not exclude each other.
+            let _lock = match leader {
+                None => Some(lock(&h, SECOND_WRITER)?),
+                Some(_) => None,
+            };
+            let stored_args = json!({
+                "model": req.model,
+                "effort": req.effort,
+                "approvals": format!("{policy:?}").to_lowercase(),
+                "leader": leader.is_some(),
+            });
+            self.store.insert_owned(&h, req.cwd, &stored_args)?;
+            if let Some(n) = req.name {
+                conn.request("_x.ai/session/rename", json!({"sessionId": id, "title": n}))
+                    .await?;
+            }
+            let receipt_id = uuid::Uuid::new_v4().to_string();
+            // The promptId: becomes turn_completed.prompt_id, i.e. the turn id.
+            let prompt_id = uuid::Uuid::new_v4().to_string();
+            let intent = NewIntent {
+                receipt_id: &receipt_id,
+                handle: &h,
+                client_msg_id: &prompt_id,
+                text: req.prompt,
+                delivered_text: (req.delivered != req.prompt).then_some(req.delivered),
+                from: req.from,
+                reply_to: None,
+                depth: req.depth,
+            };
+            self.run(&mut conn, id, &intent, policy, deadline, &leader)
+                .await
+        }
+        .await;
+        conn.close().await;
+        res
+    }
+
+    async fn send(
+        &self,
+        id: &str,
+        req: &SendRequest<'_>,
+        approvals: Option<ApprovalPolicy>,
+        deadline: Option<Instant>,
+    ) -> Result<Outcome> {
+        check_id(id)?;
+        if req.model.is_some() || req.max_turns.is_some() {
+            return Err(Error::new(
+                ErrorCode::Unsupported,
+                "Grok takes the model per session (agent-talk new --model); --max-turns is a Claude option",
+            ));
+        }
+        let h = handle(id);
+        let dir = self.require(id)?;
+        let path = dir.join("summary.json");
+        let summary: Summary = std::fs::read_to_string(&path)
+            .map_err(|e| io_err(&path.display().to_string(), e))
+            .and_then(|t| {
+                serde_json::from_str(&t).map_err(|e| {
+                    Error::new(ErrorCode::Precondition, format!("{}: {e}", path.display()))
+                })
+            })?;
+        let cwd = match summary.info.cwd {
+            Some(c) if Path::new(&c).is_dir() => c,
+            Some(c) => {
+                return Err(Error::new(
+                    ErrorCode::Precondition,
+                    format!(
+                        "the session's directory {c} no longer exists; session/load would run it elsewhere"
+                    ),
+                ));
+            }
+            None => {
+                return Err(Error::new(
+                    ErrorCode::Precondition,
+                    "summary.json records no working directory for this session",
+                ));
+            }
+        };
+        let policy = approvals.unwrap_or(ApprovalPolicy::Observe);
+        if req.mode == Mode::Steer {
+            return self.steer(id, &cwd, req, policy, deadline).await;
+        }
+        // Through the leader only when the session is resident there: a listed but
+        // dormant session may be held in process by a TUI.
+        let resident = match self.leader()? {
+            Some(leader) => {
+                let conn = self.connect(&cwd, true, None, None).await?;
+                match self.listed(&conn, Some(id)).await {
+                    Ok(l) if l.first().is_some_and(|(_, l)| l.resident) => Some((leader, conn)),
+                    Ok(_) => {
+                        conn.close().await;
+                        None
+                    }
+                    Err(e) => {
+                        conn.close().await;
+                        return Err(e);
+                    }
+                }
+            }
+            None => None,
+        };
+        let (leader, mut conn, _lock) = match resident {
+            Some((leader, conn)) => (Some(leader), conn, None),
+            None => {
+                let lock = lock(&h, SECOND_WRITER)?;
+                self.refuse_live(id, &dir)?;
+                let conn = self.connect(&cwd, false, None, None).await?;
+                (None, conn, Some(lock))
+            }
+        };
+        let res = async {
+            // Deny through the leader: yoloMode is not sent; on a resident session it has
+            // no effect (verified: `yolo` stayed true for every client after such a load),
+            // and the shared session is not agent-talk's to reconfigure. reject_once
+            // answers still apply to this prompt's requests.
+            let deny = policy == ApprovalPolicy::Deny && leader.is_none();
+            self.session_load(&mut conn, id, &cwd, deny).await?;
+            let receipt_id = uuid::Uuid::new_v4().to_string();
+            let prompt_id = uuid::Uuid::new_v4().to_string();
+            let intent = NewIntent {
+                receipt_id: &receipt_id,
+                handle: &h,
+                client_msg_id: &prompt_id,
+                text: req.text,
+                delivered_text: (req.delivered != req.text).then_some(req.delivered),
+                from: req.from,
+                reply_to: req.reply_to,
+                depth: req.depth,
+            };
+            self.run(&mut conn, id, &intent, policy, deadline, &leader)
+                .await
+        }
+        .await;
+        conn.close().await;
+        res
+    }
+
+    async fn read(&self, id: &str, range: ReadRange) -> Result<ReadPage> {
+        check_id(id)?;
+        let dir = self.require(id)?;
+        let history = History::new(updates::load(&dir.join("updates.jsonl"))?);
+        let mut messages = history.messages();
+        for m in &mut messages {
+            if m.prompt
+                && let Some(s) = m.span
+                && let Some(p) = &history.spans[s].id
+            {
+                m.message.from = self.store.sender_of(p)?;
+            }
+        }
+        let (start, end) = match range {
+            ReadRange::Tail(n) => (messages.len().saturating_sub(n as usize), messages.len()),
+            ReadRange::Forward { since, limit } => {
+                let after: usize = match since {
+                    Some(c) => c.parse().map_err(|_| {
+                        Error::new(ErrorCode::Precondition, format!("invalid cursor {c}"))
+                    })?,
+                    None => 0,
+                };
+                let s = messages.partition_point(|m| m.no <= after);
+                (s, (s + limit as usize).min(messages.len()))
+            }
+        };
+        let more = end < messages.len();
+        let page: Vec<_> = messages.drain(start..end).collect();
+        let next_cursor = if more {
+            page.last().map(|m| m.no.to_string())
+        } else {
+            None
+        };
+        // Every line in the span (thoughts, tool updates, hooks included).
+        let first = page.first().map_or(usize::MAX, |m| m.no);
+        let last = if more {
+            page.last().map_or(0, |m| m.no)
+        } else {
+            usize::MAX
+        };
+        let raw = history
+            .lines
+            .iter()
+            .filter(|l| l.no >= first && l.no <= last)
+            .map(|l| l.raw.clone())
+            .collect();
+        Ok(ReadPage {
+            messages: Page {
+                items: page.into_iter().map(|m| m.message).collect(),
+                next_cursor,
+            },
+            raw,
+        })
+    }
+
+    async fn wait(
+        &self,
+        id: &str,
+        target: &WaitTarget,
+        _approvals: Option<ApprovalPolicy>,
+        deadline: Instant,
+    ) -> Result<Outcome> {
+        check_id(id)?;
+        let h = handle(id);
+        let (turn_id, receipt) = match target {
+            WaitTarget::Turn(t) => (t.clone(), self.store.receipt_by_turn(&h, t)?),
+            WaitTarget::Receipt(r) => {
+                let rec = wait_receipt(self.store, &h, r)?;
+                // The promptId, recorded as the client message id before submission.
+                (
+                    rec.turn_id.clone().unwrap_or(rec.client_msg_id.clone()),
+                    Some(rec),
+                )
+            }
+        };
+        let dir = self.require(id)?;
+        let path = dir.join("updates.jsonl");
+        let mut unaccepted = receipt
+            .as_ref()
+            .is_some_and(|r| matches!(r.state, ReceiptState::Pending | ReceiptState::Unknown));
+        // The direct-mode child that ran the receipt's prompt; once it is gone nothing
+        // will write the turn's end.
+        let child = match &receipt {
+            Some(r) => self
+                .store
+                .processes(&h)?
+                .into_iter()
+                .find(|(rid, _)| *rid == r.receipt_id)
+                .map(|(_, pid)| pid),
+            None => None,
+        };
+        let work = async {
+            loop {
+                let history = History::new(updates::load(&path)?);
+                let span = history.find(&turn_id);
+                if let (Some(_), Some(r)) = (span, &receipt)
+                    && unaccepted
+                {
+                    self.store
+                        .accept(&r.receipt_id, Some(&turn_id), Some(&turn_id), None)?;
+                    unaccepted = false;
+                }
+                if let Some(s) = span
+                    && let Some(t) = history.turn(h.clone(), s, &history.messages())
+                {
+                    return Ok(t);
+                }
+                if span.is_none() && receipt.is_none() {
+                    return Err(Error::new(
+                        ErrorCode::Precondition,
+                        format!("turn {turn_id} is not in {}", path.display()),
+                    ));
+                }
+                if let Some(pid) = child
+                    && !pid_alive(pid)
+                {
+                    let (status, message) = match span {
+                        Some(_) => (
+                            "interrupted",
+                            "the turn started but has no turn_completed; Grok marks it interrupted when the session is next loaded",
+                        ),
+                        None => ("unknown", "updates.jsonl names no turn for this prompt"),
+                    };
+                    return Ok(model::Turn {
+                        handle: h.clone(),
+                        turn_id: turn_id.clone(),
+                        status,
+                        error: Some(json!({"message": message})),
+                        final_text: None,
+                        duration_ms: None,
+                        basis: Some(format!(
+                            "updates.jsonl; the grok agent agent-talk started for this prompt (pid {pid}) has exited, and in direct mode nothing else continues it"
+                        )),
+                        raw: Value::Null,
+                    });
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        };
+        let res = bounded(Some(deadline), work).await.map(Some).map_err(|mut e| {
+            if matches!(e.code, ErrorCode::Timeout | ErrorCode::Interrupted) {
+                e.message.push_str(&format!(
+                    "; waiting for turn_completed of {turn_id} in updates.jsonl (polled every second)"
+                ));
+            }
+            e
+        });
+        let receipt_id = receipt.map(|r| r.receipt_id);
+        settle(
+            self.store,
+            h,
+            res,
+            receipt_id.as_deref(),
+            Vec::new(),
+            "running",
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener;
+
+    fn grok<'a>(store: &'a Store, socket: PathBuf) -> Grok<'a> {
+        Grok {
+            store,
+            home: socket.parent().unwrap().to_path_buf(),
+            socket,
+            socket_override: true,
+        }
+    }
+
+    /// Direct mode only on a missing socket or a refused connect (a stale socket file
+    /// such as one a dead leader left); a socket agent-talk may not reach is an error,
+    /// never "no leader" (that would start a second writer beside a live leader).
+    #[test]
+    fn leader_probe_classification() {
+        let store = Store::memory();
+        let dir = std::env::temp_dir().join(format!("bgl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("l.sock");
+        assert!(
+            grok(&store, sock.clone()).leader().unwrap().is_none(),
+            "ENOENT"
+        );
+        let listener = UnixListener::bind(&sock).unwrap();
+        assert!(
+            grok(&store, sock.clone()).leader().unwrap().is_some(),
+            "answering"
+        );
+        drop(listener);
+        assert!(sock.exists());
+        assert!(
+            grok(&store, sock.clone()).leader().unwrap().is_none(),
+            "ECONNREFUSED"
+        );
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let denied = grok(&store, sock.clone()).leader();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            denied.err().map(|e| e.code),
+            Some(ErrorCode::Transport),
+            "EACCES"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}

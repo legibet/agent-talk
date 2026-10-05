@@ -1,0 +1,4 @@
+/target
+/.claude/
+/.agents/
+__pycache__/
