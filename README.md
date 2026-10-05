@@ -10,11 +10,18 @@ operation and exits. The session it reaches is the agent's own session, with its
 
 ## Install
 
+On macOS and Linux, install the prebuilt binary with:
+
 ```sh
-cargo install --git https://github.com/legibet/agent-talk
+curl -LsSf https://github.com/legibet/agent-talk/releases/latest/download/agent-talk-installer.sh | sh
 ```
 
-Requires Rust 1.89 or later.
+The script installs `agent-talk` into `~/.local/bin`. To build it from source instead, which
+requires Rust 1.89 or later, run:
+
+```sh
+cargo install agent-talk
+```
 
 ## Agents
 

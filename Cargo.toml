@@ -9,7 +9,7 @@ repository = "https://github.com/legibet/agent-talk"
 readme = "README.md"
 keywords = ["agents", "mcp", "codex", "claude-code", "opencode"]
 categories = ["command-line-utilities", "development-tools"]
-exclude = [".github/", "tests/", "AGENTS.md", "CLAUDE.md"]
+exclude = [".github/", "tests/", "AGENTS.md", "CLAUDE.md", "dist-workspace.toml"]
 
 [dependencies]
 bytes = "1.12.1"
@@ -34,3 +34,8 @@ uuid = { version = "1.27.0", features = ["v4"] }
 [[bin]]
 name = "agent-talk"
 path = "src/main.rs"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
