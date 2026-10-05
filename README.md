@@ -42,14 +42,20 @@ agent-talk caps
 
 Each session is identified by a handle such as `codex:<thread id>`, which `ls` and `new` print.
 Every command accepts `--json` for machine-readable output. By default, `send` queues the message
-to run after the current reply. `--mode steer` adds the message to the running turn instead, and
-is refused when the session is idle.
+to run after the current reply. `--mode steer` adds the message to the running turn instead.
+Steering works on Codex, on OpenCode and on Grok CLI through the leader, and it is refused when the
+session is idle.
 
 When an agent sends a message to another agent, agent-talk adds the first line
 `[from <handle> via agent-talk]` so that the receiving agent can see who sent it. The handle is
 not verified. To prevent agents from forwarding messages to each other indefinitely, agent-talk
 refuses a send whose reply chain is longer than `--max-hops` (3 by default) with the error
 `E_MAX_HOPS`.
+
+agent-talk never approves tool calls. With `--approvals observe` it reports pending approval
+requests, and with `--approvals deny` it declines them. `agent-talk caps` prints what the
+installed CLIs and running daemons support, and [DESIGN.md](DESIGN.md) describes how each vendor
+is handled.
 
 The exit code is one of:
 
@@ -59,6 +65,27 @@ The exit code is one of:
   because of a timeout or Ctrl-C. agent-talk does not resend the message, and `wait --receipt`
   reports what happened to it.
 - 4: transport failure.
+
+## Sessions open in a TUI or app
+
+agent-talk can read any session. Whether it can send a message to a session that is open in the
+vendor's own TUI or app depends on the vendor.
+
+- Codex: yes, if the TUI runs inside the shared app-server daemon. This is the case when
+  `codex app-server daemon start` ran before the TUI started and the TUI was not started with
+  `--no-daemon`. The TUI then shows the message and the reply as they arrive. The ChatGPT desktop
+  app and the VS Code extension each run their own app-server, so agent-talk cannot write to a
+  thread that is open in either of them and refuses with `E_FOREIGN_LIVE` until that app exits.
+- Claude Code: no. While a Claude Code TUI has the session open, agent-talk refuses with
+  `E_FOREIGN_LIVE`, because a second writer would split the conversation. After the TUI exits,
+  agent-talk can send, and the new messages appear when the session is resumed.
+- OpenCode: yes. The TUI is a client of the same background service that agent-talk uses.
+- Grok CLI: yes, if the TUI runs through the leader, which is off by default and is enabled with
+  `--leader`. Otherwise agent-talk refuses with `E_FOREIGN_LIVE`.
+- Antigravity CLI: no. While the TUI has the conversation open, agent-talk refuses with
+  `E_FOREIGN_LIVE`. After the TUI switches to another conversation with `/new`, agent-talk can
+  send, but the TUI still holds the old conversation in memory. If the user returns to it with
+  `/resume`, the TUI overwrites the messages that agent-talk added.
 
 ## MCP
 
@@ -89,18 +116,6 @@ For OpenCode, add it to `~/.config/opencode/opencode.json`:
 ```json
 { "mcp": { "servers": { "talk": { "type": "local", "command": ["/abs/path/agent-talk", "mcp"] } } } }
 ```
-
-## Limits
-
-|                                      | Codex | Claude Code | OpenCode | Grok CLI                | Antigravity |
-| ------------------------------------ | ----- | ----------- | -------- | ----------------------- | ----------- |
-| send to a session open in a terminal | yes   | refused     | yes      | only through the leader | refused     |
-| steer a running turn                 | yes   | no          | yes      | only through the leader | no          |
-
-Sessions that agent-talk refuses to write to can still be read. agent-talk never approves tool
-calls. With `--approvals observe` it reports pending approval requests, and with
-`--approvals deny` it declines them. `agent-talk caps` prints what the installed CLIs and running
-daemons support, and [DESIGN.md](DESIGN.md) describes how each vendor is handled.
 
 ## License
 
