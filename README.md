@@ -1,13 +1,12 @@
 # agent-talk
 
-agent-talk lets coding agents talk to each other. From a shell, a script or an MCP tool call, you
-can list the agent sessions on your machine, start a new one, send a message to one and get its
-reply. It supports Codex, Claude Code, OpenCode, Grok CLI and Antigravity CLI.
+agent-talk lets an agent send a message to another agent's session and read the reply, across
+vendors, using only each vendor's official non-interactive interfaces. It works as a command-line
+tool and as an MCP server, and it supports Codex, Claude Code, OpenCode, Grok CLI and Antigravity
+CLI.
 
-It reaches each session through the vendor's own interface (the Codex app-server, `claude -p`,
-the OpenCode service, Grok's ACP agent, `agy -p`), so you talk to the same session you see in
-your terminal, with its full history. There is no agent-talk daemon: each command connects, does
-its job and exits.
+agent-talk does not run a daemon of its own. Each command connects to the vendor, performs one
+operation and exits. The session it reaches is the vendor's own session, with its full history.
 
 ## Install
 
@@ -15,20 +14,22 @@ its job and exits.
 cargo install --git https://github.com/legibet/agent-talk
 ```
 
-Requires Rust 1.89 or later. agent-talk runs on macOS; it builds on Linux, but has not been
-tested there against the vendors. It uses the vendor CLIs and logins you already have.
+Requires Rust 1.89 or later.
 
 ## Vendors
 
-| vendor          | reached through                                      | needs                                                   |
-| --------------- | ---------------------------------------------------- | ------------------------------------------------------- |
-| Codex           | the app-server daemon                                | `codex app-server daemon start` before you open the TUI |
-| Claude Code     | `claude -p`                                          | nothing                                                 |
-| OpenCode        | the OpenCode background service                      | an open `opencode` client, or `opencode service start`  |
-| Grok CLI        | `grok agent stdio`, through the leader when one runs | nothing                                                 |
-| Antigravity CLI | `agy -p`                                             | nothing                                                 |
+| vendor          | interface                                                          | prerequisite                                           |
+| --------------- | ------------------------------------------------------------------ | ------------------------------------------------------ |
+| Codex           | shared app-server daemon                                           | `codex app-server daemon start` before the TUI opens   |
+| Claude Code     | `claude -p`                                                        | none                                                   |
+| OpenCode        | shared background service                                          | an open `opencode` client, or `opencode service start` |
+| Grok CLI        | ACP to `grok agent stdio`, through the shared leader when one runs | none                                                   |
+| Antigravity CLI | `agy -p`                                                           | none                                                   |
 
-## Use
+agent-talk connects to the shared daemon, service or leader when it is running, but never starts
+one itself.
+
+## Usage
 
 ```sh
 agent-talk ls --cwd .
@@ -39,31 +40,42 @@ agent-talk wait codex:<thread id> --receipt <receipt id>
 agent-talk caps
 ```
 
-Sessions are named by handles such as `codex:<thread id>`, as `ls` and `new` print them. Every
-command takes `--json`. `send` queues the message after the current reply; `--mode steer` adds it
-to the running turn where the vendor supports that.
+Each session is identified by a handle such as `codex:<thread id>`, which `ls` and `new` print.
+Every command accepts `--json` for machine-readable output. By default, `send` queues the message
+to run after the current reply. `--mode steer` adds the message to the running turn instead, and
+is refused when the session is idle.
 
-Exit codes: 0 ok, 2 refused (with a stable `E_*` code), 3 outcome unknown, 4 transport failure.
-Exit 3 means the message was accepted but the command stopped waiting (timeout or Ctrl-C); the
-message is not sent again, and `wait --receipt` tells you what happened to it.
+When an agent sends a message to another agent, agent-talk adds the first line
+`[from <handle> via agent-talk]` so that the receiving agent can see who sent it. The handle is
+not verified. To prevent agents from forwarding messages to each other indefinitely, agent-talk
+refuses a send whose reply chain is longer than `--max-hops` (3 by default) with the error
+`E_MAX_HOPS`.
+
+The exit code is one of:
+
+- 0: success.
+- 2: the request was refused, with a stable `E_*` error code.
+- 3: the outcome is unknown. The vendor accepted the message, but the command stopped waiting
+  because of a timeout or Ctrl-C. agent-talk does not resend the message, and `wait --receipt`
+  reports what happened to it.
+- 4: transport failure.
 
 ## MCP
 
-`agent-talk mcp` provides `ls`, `new`, `send`, `read` and `wait` as MCP tools, returning the same
-JSON as `--json`. Register it once with the binary's absolute path (`which agent-talk`).
+`agent-talk mcp` runs agent-talk as an MCP server. It provides the tools `ls`, `new`, `send`,
+`read` and `wait`, which correspond to the CLI commands of the same name and return the same JSON
+as `--json`. Register it with the absolute path of the binary.
 
-Claude Code:
+For Claude Code, run:
 
 ```sh
 claude mcp add --scope user talk -- /abs/path/agent-talk mcp
 ```
 
-Claude asks before running MCP tools; `claude -p` needs an allow rule such as
-`--allowedTools "mcp__talk__*"`. Grok reads the MCP servers in `~/.claude.json`, so this also
-covers Grok.
+Grok CLI reads MCP servers from `~/.claude.json`, so this registration also applies to Grok.
 
-Codex, in `~/.codex/config.toml` (without the approval mode, MCP calls fail under approval policy
-`never`):
+For Codex, add the server to `~/.codex/config.toml`. The `default_tools_approval_mode` line is
+required, because without it MCP calls fail under the approval policy `never`.
 
 ```toml
 [mcp_servers.talk]
@@ -72,22 +84,11 @@ args = ["mcp"]
 default_tools_approval_mode = "approve"
 ```
 
-OpenCode, in `~/.config/opencode/opencode.json`:
+For OpenCode, add it to `~/.config/opencode/opencode.json`:
 
 ```json
 { "mcp": { "servers": { "talk": { "type": "local", "command": ["/abs/path/agent-talk", "mcp"] } } } }
 ```
-
-## Who is talking
-
-agent-talk records who sent each message: the session the command runs in, read from the
-vendor's environment variable or MCP request metadata, or the handle given by `--from` or
-`AGENT_TALK_CALLER`. When the sender is an agent, the message arrives prefixed with
-`[from <handle> via agent-talk]`, so the receiving agent knows who is asking. This is
-attribution, not authentication.
-
-To keep agents from forwarding messages in circles, a reply chain deeper than `--max-hops`
-(default 3) is refused with `E_MAX_HOPS`.
 
 ## Limits
 
@@ -96,9 +97,10 @@ To keep agents from forwarding messages in circles, a reply chain deeper than `-
 | send to a session open in a terminal | yes   | refused     | yes      | only through the leader | refused     |
 | steer a running turn                 | yes   | no          | yes      | only through the leader | no          |
 
-A session agent-talk refuses to write to can still be read. agent-talk never approves a tool
-call; `--approvals deny` declines the requests it sees. `agent-talk caps` shows what the
-installed versions support, and [DESIGN.md](DESIGN.md) explains how each vendor is handled.
+Sessions that agent-talk refuses to write to can still be read. agent-talk never approves tool
+calls. With `--approvals observe` it reports pending approval requests, and with
+`--approvals deny` it declines them. `agent-talk caps` prints what the installed CLIs and running
+daemons support, and [DESIGN.md](DESIGN.md) describes how each vendor is handled.
 
 ## License
 
