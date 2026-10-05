@@ -20,13 +20,13 @@ tested there against the vendors. It uses the vendor CLIs and logins you already
 
 ## Vendors
 
-| vendor | reached through | needs |
-|---|---|---|
-| Codex | the app-server daemon | `codex app-server daemon start` before you open the TUI |
-| Claude Code | `claude -p` | nothing |
-| OpenCode | the OpenCode background service | an open `opencode` client, or `opencode service start` |
-| Grok CLI | `grok agent stdio`, through the leader when one runs | nothing |
-| Antigravity CLI | `agy -p` | nothing |
+| vendor          | reached through                                      | needs                                                   |
+| --------------- | ---------------------------------------------------- | ------------------------------------------------------- |
+| Codex           | the app-server daemon                                | `codex app-server daemon start` before you open the TUI |
+| Claude Code     | `claude -p`                                          | nothing                                                 |
+| OpenCode        | the OpenCode background service                      | an open `opencode` client, or `opencode service start`  |
+| Grok CLI        | `grok agent stdio`, through the leader when one runs | nothing                                                 |
+| Antigravity CLI | `agy -p`                                             | nothing                                                 |
 
 ## Use
 
@@ -91,10 +91,10 @@ To keep agents from forwarding messages in circles, a reply chain deeper than `-
 
 ## Limits
 
-| | Codex | Claude Code | OpenCode | Grok CLI | Antigravity |
-|---|---|---|---|---|---|
-| send to a session open in a terminal | yes | refused | yes | only through the leader | refused |
-| steer a running turn | yes | no | yes | only through the leader | no |
+|                                      | Codex | Claude Code | OpenCode | Grok CLI                | Antigravity |
+| ------------------------------------ | ----- | ----------- | -------- | ----------------------- | ----------- |
+| send to a session open in a terminal | yes   | refused     | yes      | only through the leader | refused     |
+| steer a running turn                 | yes   | no          | yes      | only through the leader | no          |
 
 A session agent-talk refuses to write to can still be read. agent-talk never approves a tool
 call; `--approvals deny` declines the requests it sees. `agent-talk caps` shows what the

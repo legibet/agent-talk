@@ -36,13 +36,13 @@ behalf, deleting sessions.
 
 State lives where the vendor already keeps it:
 
-| provider | who holds the live session | agent-talk's connection |
-|---|---|---|
-| Codex | shared app-server daemon | per command: connect, subscribe, act, observe, disconnect |
-| OpenCode | `opencode serve --service` | per command: HTTP, plus SSE while observing |
-| Grok, leader live | shared leader process | per command: a `grok agent --leader stdio` child (ACP) |
-| Claude, Grok without leader, Antigravity (owned) | nobody between turns; files on disk | one vendor child per mutation |
-| Claude, Grok, Antigravity TUI (foreign) | the user's terminal process | read-only |
+| provider                                         | who holds the live session          | agent-talk's connection                                   |
+| ------------------------------------------------ | ----------------------------------- | --------------------------------------------------------- |
+| Codex                                            | shared app-server daemon            | per command: connect, subscribe, act, observe, disconnect |
+| OpenCode                                         | `opencode serve --service`          | per command: HTTP, plus SSE while observing               |
+| Grok, leader live                                | shared leader process               | per command: a `grok agent --leader stdio` child (ACP)    |
+| Claude, Grok without leader, Antigravity (owned) | nobody between turns; files on disk | one vendor child per mutation                             |
+| Claude, Grok, Antigravity TUI (foreign)          | the user's terminal process         | read-only                                                 |
 
 "Owned" means agent-talk started the session; the `owned` table records creation, not current
 exclusivity. The CLI process is short-lived, but within one command it owns a live connection
@@ -111,11 +111,11 @@ through stays untyped JSON.
 
 ### Observations
 
-| observation | values | learned from |
-|---|---|---|
-| `history` | `visible` / `none` / `unknown` | the vendor's history listing or files |
-| `loaded` | `yes` / `no` / `unknown` | Codex `thread/loaded/list`; Claude `claude agents` (pid present); OpenCode `yes` while the service answers; Grok own child, live TUI row or leader `resident`; Antigravity presence lock |
-| `origin` | vendor label (`codex-tui`, `codex_exec`, `claude-interactive`, `opencode agent build`, `headless`, ...), `agent-talk` for owned sessions | vendor metadata; the `owned` table |
+| observation | values                                                                                                                                   | learned from                                                                                                                                                                             |
+| ----------- | ---------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `history`   | `visible` / `none` / `unknown`                                                                                                           | the vendor's history listing or files                                                                                                                                                    |
+| `loaded`    | `yes` / `no` / `unknown`                                                                                                                 | Codex `thread/loaded/list`; Claude `claude agents` (pid present); OpenCode `yes` while the service answers; Grok own child, live TUI row or leader `resident`; Antigravity presence lock |
+| `origin`    | vendor label (`codex-tui`, `codex_exec`, `claude-interactive`, `opencode agent build`, `headless`, ...), `agent-talk` for owned sessions | vendor metadata; the `owned` table                                                                                                                                                       |
 
 Declared blind spot: for Codex, "not loaded" cannot distinguish a stopped thread from a live
 standalone `codex exec` or `--no-daemon` run. agent-talk proceeds through the daemon and says so.
@@ -192,7 +192,7 @@ Sender identity, in priority order:
 4. `unknown`.
 
 An agent sender's message is delivered with a first line `[from <handle> via agent-talk]` and a
-blank line (not doubled when the text already starts with `[from `). The intent keeps the original
+blank line (not doubled when the text already starts with `[from`). The intent keeps the original
 text and records the delivered one. All of this is attribution, not authenticated identity.
 
 ### MCP server
