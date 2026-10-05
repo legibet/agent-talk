@@ -9,6 +9,7 @@ use crate::model::{
     Result, Session, Turn,
 };
 use crate::store::Store;
+use serde::Serialize;
 use serde_json::Value;
 use std::fs::{File, OpenOptions, TryLockError};
 use std::future::Future;
@@ -77,6 +78,26 @@ pub fn vendor_cmd(program: &str) -> Command {
         cmd.env_remove(var);
     }
     cmd
+}
+
+/// `<program> --version`, or why it cannot run.
+pub async fn cli_version(program: &str) -> std::result::Result<String, String> {
+    match vendor_cmd(program)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+    {
+        Ok(o) if o.status.success() => Ok(String::from_utf8_lossy(&o.stdout).trim().into()),
+        Ok(o) => Err(format!(
+            "`{program} --version` failed: {}",
+            String::from_utf8_lossy(&o.stderr).trim()
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(format!("`{program}` is not on PATH"))
+        }
+        Err(e) => Err(format!("cannot run `{program}`: {e}")),
+    }
 }
 
 /// Non-blocking exclusive OS lock on a session, held for the duration of the command so
@@ -232,7 +253,7 @@ impl<'a> Adapter<'a> {
 }
 
 impl Provider for Adapter<'_> {
-    async fn caps(&self) -> Value {
+    async fn caps(&self) -> Caps {
         match self {
             Adapter::Codex(p) => p.caps().await,
             Adapter::Claude(p) => p.caps().await,
@@ -395,11 +416,46 @@ pub struct ReadPage {
     pub raw: Vec<Value>,
 }
 
+/// One provider's entry in `caps`: the installed version, the state of the shared process
+/// agent-talk joins, and which operations can run now (DESIGN.md §2).
+#[derive(Serialize)]
+pub struct Caps {
+    pub provider: &'static str,
+    /// The vendor CLI's `--version` output (OpenCode: the running service's version).
+    pub version: Option<String>,
+    /// The shared daemon, service or leader, for the vendors that have one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shared: Option<String>,
+    pub operations: Vec<Operation>,
+}
+
+/// Whether one operation can run, and why not.
+#[derive(Serialize)]
+pub struct Operation {
+    pub name: &'static str,
+    pub available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// What an operation depends on: `Err` carries the reason it cannot run.
+pub type Check = std::result::Result<(), String>;
+
+impl Operation {
+    pub fn new(name: &'static str, check: &Check) -> Self {
+        Operation {
+            name,
+            available: check.is_ok(),
+            reason: check.clone().err(),
+        }
+    }
+}
+
 /// One adapter per vendor. Mutations persist their intent before submitting and
 /// return a receipt; a `deadline` makes them observe the resulting turn on the
 /// same connection.
 pub trait Provider {
-    async fn caps(&self) -> Value;
+    async fn caps(&self) -> Caps;
     async fn list(
         &self,
         filter: &ListFilter<'_>,

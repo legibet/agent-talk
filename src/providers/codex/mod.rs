@@ -6,9 +6,9 @@ pub mod transport;
 use self::protocol::*;
 use self::transport::{Conn, Event, ServerRequest, decode};
 use super::{
-    ApprovalPolicy, ListFilter, Mode, Provider, ReadPage, ReadRange, SendRequest, StartRequest,
-    WaitTarget, approval_policy, bounded, record, reject, resolve, settle, strip_provenance,
-    wait_receipt,
+    ApprovalPolicy, Caps, Check, ListFilter, Mode, Operation, Provider, ReadPage, ReadRange,
+    SendRequest, StartRequest, WaitTarget, approval_policy, bounded, cli_version, record, reject,
+    resolve, settle, strip_provenance, wait_receipt,
 };
 use crate::model::{
     self, Approval, Error, ErrorCode, Message, Observations, Outcome, Page, Result, Session,
@@ -467,18 +467,14 @@ impl<'a> Codex<'a> {
         Ok(messages)
     }
 
-    async fn probe(&self, conn: &Conn, method: &str, params: Value) -> Value {
+    /// Whether the daemon knows `method`, probed on a dummy thread: only a missing
+    /// capability makes it unavailable; any other refusal means the method exists.
+    async fn probe(&self, conn: &Conn, method: &str, params: Value) -> Check {
         match conn.request(method, params).await {
-            Ok(_) => json!({"available": true}),
-            Err(e) => match e.code {
-                ErrorCode::CapMissing | ErrorCode::Unsupported => {
-                    json!({"available": false, "detail": e.message, "vendor": e.vendor})
-                }
-                // Any other refusal means the method exists (the dummy thread does not).
-                _ => {
-                    json!({"available": true, "detail": format!("probe on dummy thread: {}", e.message)})
-                }
-            },
+            Err(e) if matches!(e.code, ErrorCode::CapMissing | ErrorCode::Unsupported) => {
+                Err(e.message)
+            }
+            _ => Ok(()),
         }
     }
 }
@@ -535,66 +531,65 @@ fn session_state(s: &ThreadStatus) -> &'static str {
 }
 
 impl Provider for Codex<'_> {
-    async fn caps(&self) -> Value {
-        let cli = run("codex", &["--version"]).await;
-        let daemon_info = match run("codex", &["app-server", "daemon", "version"]).await {
-            Ok(out) => serde_json::from_str::<Value>(&out).unwrap_or(json!({"output": out})),
-            Err(e) => json!({"error": e}),
-        };
-        let present = self.socket.exists();
-        let mut daemon = json!({
-            "socket": self.socket,
-            "present": present,
-            "version": daemon_info["appServerVersion"],
-            "status": daemon_info["status"],
-            "info": daemon_info,
-        });
-        let mut methods = json!({});
-        if present {
-            match self.connect().await {
-                Ok(conn) => {
-                    daemon["connected"] = json!(true);
-                    daemon["user_agent"] = json!(conn.user_agent);
-                    methods = json!({
-                        "queue (thread/queue/*, probed with thread/queue/list)": self
-                            .probe(&conn, "thread/queue/list", json!({"threadId": DUMMY_THREAD}))
-                            .await,
-                        "steer (turn/steer)": self
-                            .probe(
-                                &conn,
-                                "turn/steer",
-                                json!({
-                                    "threadId": DUMMY_THREAD,
-                                    "expectedTurnId": DUMMY_THREAD,
-                                    "input": text_input(""),
-                                    "clientUserMessageId": DUMMY_THREAD,
-                                }),
-                            )
-                            .await,
-                    });
-                    conn.close().await;
-                }
-                Err(e) => {
-                    daemon["connected"] = json!(false);
-                    daemon["error"] = json!(e);
-                }
+    async fn caps(&self) -> Caps {
+        let version = cli_version("codex").await.ok();
+        let (shared, daemon, queue, steer) = match self.connect().await {
+            Ok(conn) => {
+                let queue = self
+                    .probe(
+                        &conn,
+                        "thread/queue/list",
+                        json!({"threadId": DUMMY_THREAD}),
+                    )
+                    .await;
+                let steer = self
+                    .probe(
+                        &conn,
+                        "turn/steer",
+                        json!({
+                            "threadId": DUMMY_THREAD,
+                            "expectedTurnId": DUMMY_THREAD,
+                            "input": text_input(""),
+                            "clientUserMessageId": DUMMY_THREAD,
+                        }),
+                    )
+                    .await;
+                conn.close().await;
+                // The daemon can be older than the CLI until it is restarted.
+                let server = run("codex", &["app-server", "daemon", "version"])
+                    .await
+                    .ok()
+                    .and_then(|out| serde_json::from_str::<Value>(&out).ok())
+                    .and_then(|v| v["appServerVersion"].as_str().map(String::from));
+                let shared = match server {
+                    Some(v) => format!("daemon running (app-server {v})"),
+                    None => "daemon running".into(),
+                };
+                (shared, Ok(()), queue, steer)
             }
-        }
-        json!({
-            "provider": "codex",
-            "cli": match cli {
-                Ok(v) => json!({"version": v}),
-                Err(e) => json!({"version": null, "error": e}),
-            },
-            "daemon": daemon,
-            "methods": methods,
-            "blind_spots": [
-                "A thread that is not loaded in the daemon may be stopped or may be running in a standalone `codex exec` / `--no-daemon` process; agent-talk cannot tell these apart and sends through the daemon.",
-                "A thread open in the ChatGPT desktop app or the VS Code extension (each runs its own app-server) is listed like any other; `send` and `wait` are refused with E_FOREIGN_LIVE at `thread/resume`.",
-                "Approval requests fan out to every subscribed client with the same request id, and any answer resolves them for all. agent-talk observes by default and answers `decline` only under `--approvals deny` (the default on sessions it started); how a terminal TUI renders a decline from agent-talk is unverified.",
-                "Declined command items are absent from turn history; approval state comes only from live or replayed requests.",
+            Err(e) => {
+                let shared = match e.code {
+                    ErrorCode::NoDaemon => "daemon not running",
+                    _ => "daemon not reachable",
+                };
+                let daemon: Check = Err(e.message);
+                (shared.into(), daemon.clone(), daemon.clone(), daemon)
+            }
+        };
+        Caps {
+            provider: "codex",
+            version,
+            shared: Some(shared),
+            operations: vec![
+                Operation::new("ls", &daemon),
+                Operation::new("new", &daemon),
+                Operation::new("send", &queue),
+                Operation::new("read", &daemon),
+                Operation::new("wait", &daemon),
+                Operation::new("steer", &steer),
+                Operation::new("name", &daemon),
             ],
-        })
+        }
     }
 
     async fn list(

@@ -3,8 +3,8 @@
 
 use crate::model::{Caller, Error, ErrorCode, Message, Outcome, Result, Session};
 use crate::providers::{
-    Adapter, ApprovalPolicy, ListFilter, Mode, Provider, ReadRange, SendRequest, StartRequest,
-    WaitTarget, delivered,
+    Adapter, ApprovalPolicy, Caps, ListFilter, Mode, Provider, ReadRange, SendRequest,
+    StartRequest, WaitTarget, delivered,
 };
 use crate::store::Store;
 use futures_util::future::join_all;
@@ -21,11 +21,11 @@ pub const DEFAULT_MAX_HOPS: u32 = 3;
 pub const LS_LIMIT: u32 = 25;
 pub const READ_LIMIT: u32 = 20;
 
-/// How senders are determined, printed by `caps`.
-pub const SENDER_RULE: &str = "CLI new/send record a sender (from): --from <handle>; else AGENT_TALK_CALLER; else derived from the shell's environment: CODEX_THREAD_ID -> codex:<id>, then OPENCODE_SESSION_ID -> opencode:<id>, then GROK_SESSION_ID -> grok:<id>, then ANTIGRAVITY_CONVERSATION_ID -> antigravity:<id>, then CLAUDE_CODE_SESSION_ID -> claude:<id>. Codex, OpenCode, Grok and Antigravity set their variable on every shell call, Claude's is inherited, so the inherited one goes last; a daemon or service started from another agent's shell still carries that agent's variable, which the order cannot detect. Else kind unknown. agent-talk mcp, per call: --caller; else AGENT_TALK_CALLER; else the call's _meta.threadId (Codex) -> codex:<id>; else the call's _meta['ai.opencode/sessionID'] -> opencode:<id>; else the call's _meta['antigravity.google/conversation_id'] -> antigravity:<id>; else GROK_SESSION_ID, then CLAUDE_CODE_SESSION_ID from the server's own environment, which Grok and Claude Code set to the calling session for each MCP server they start -> grok:<id> / claude:<id>; else unknown. Messages from an agent sender reach the session prefixed with one line, '[from <handle> via agent-talk]', and a blank line (skipped when the text already starts with '[from '); the intent keeps the original text and records the delivered one. All of these are attribution, not authenticated identity; environment variables are inherited by child processes and can be set by anyone.";
-
 pub enum Request {
-    Caps,
+    /// `sender` is who this shell's `new` and `send` would be attributed to.
+    Caps {
+        sender: Caller,
+    },
     Ls(LsArgs),
     New(NewArgs),
     Send(SendArgs),
@@ -109,8 +109,8 @@ pub struct WaitArgs {
 #[serde(untagged)]
 pub enum Output {
     Caps {
-        providers: Vec<Value>,
-        sender: &'static str,
+        providers: Vec<Caps>,
+        sender: Caller,
     },
     Sessions(Sessions),
     Read(Read),
@@ -150,13 +150,10 @@ pub struct Read {
 
 pub async fn run(store: &Store, req: Request) -> Result<Output> {
     match req {
-        Request::Caps => {
+        Request::Caps { sender } => {
             let adapters = Adapter::all(store);
             let providers = join_all(adapters.iter().map(|p| p.caps())).await;
-            Ok(Output::Caps {
-                providers,
-                sender: SENDER_RULE,
-            })
+            Ok(Output::Caps { providers, sender })
         }
         Request::Ls(a) => ls(store, a).await,
         Request::New(a) => new(store, a).await,

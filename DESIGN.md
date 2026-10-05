@@ -118,7 +118,7 @@ through stays untyped JSON.
 | `origin`    | vendor label (`codex-tui`, `codex_exec`, `claude-interactive`, `opencode agent build`, `headless`, ...), `agent-talk` for owned sessions | vendor metadata; the `owned` table                                                                                                                                                       |
 
 Declared blind spot: for Codex, "not loaded" cannot distinguish a stopped thread from a live
-standalone `codex exec` or `--no-daemon` run. agent-talk proceeds through the daemon and says so.
+standalone `codex exec` or `--no-daemon` run. agent-talk proceeds through the daemon.
 
 ### Types
 
@@ -373,7 +373,7 @@ so `send` is synchronous. `--verbose` is mandatory for stream-json in print mode
 - Turns group by `promptId`; user lines that only carry `tool_result`, and lines the runtime
   injects, are not turn starts. The live branch is the `parentUuid` chain from the newest
   `last-prompt.leafUuid` (`logicalParentUuid` crosses a compaction); `read --raw` adds orphan
-  branches.
+  branches. Sub-agent transcripts are not read.
 - End markers: the TUI writes `system/turn_duration`, or a `[Request interrupted by user]` line
   after Esc; `-p` writes none. So `wait` ends an owned turn at its run log's `result` or pid exit.
   Other turns end at a marker, a later prompt on the live branch, or once no live process holds
@@ -402,7 +402,8 @@ is not used.
 id. Claude sets `CLAUDE_CODE_SESSION_ID` in each MCP server's environment to the spawning process's
 session, overriding an inherited value (verified with `--mcp-config` only, not with a global
 `~/.claude.json` registration); one server per `claude` process. Shell commands inherit the
-variable unchanged.
+variable unchanged. When a TUI switches session (`/clear`, `/resume`) while its MCP server keeps
+running, attribution through that server may name the old session (unverified).
 
 ### 6.3 OpenCode (2.0.22)
 
@@ -445,7 +446,8 @@ before submitting and filters on `data.sessionID`.
 sets it. Steer joins the running execution at the next step boundary with every other pending
 steer item, possibly answered in one reply; queue runs after the current reply in the same
 execution; on an idle session either starts an execution at once. Idle steer is refused
-(`E_PRECONDITION`). Queue items pending at a user interrupt stay dormant until another execution;
+(`E_PRECONDITION`) after a check of `/api/session/active`, which can race an execution that is
+just starting. Queue items pending at a user interrupt stay dormant until another execution;
 after a `shutdown` interrupt they run at once in a successor. One reply can cover several messages.
 
 **Approvals.** `permission.asked` goes to every subscriber and is not replayed, so agent-talk also
@@ -603,7 +605,8 @@ no way to join a conversation another process holds.
 - `read` groups the transcript by `USER_INPUT`; `SYSTEM_MESSAGE` steps come `from` the runtime. The
   cursor is the line position, `step_index` only attribution. In `ls`, `state` is `running` while
   an agent-talk child runs or the lock is held with status `RUNNING`, `unknown` when the lock is
-  free but the status is `RUNNING`, else `idle`.
+  free but the status is `RUNNING`, else `idle`. `ls --all` lists nothing more, since no
+  sub-conversation rows were observed.
 
 **Writers.** agy ignores its own presence lock. A second `-p --conversation X` runs while another
 process holds X; both write by step index, the database keeps one process's rows and the
@@ -611,8 +614,7 @@ transcript both. A TUI's next prompt overwrites steps a headless run appended, a
 switched away with `/new` keeps X in memory and overwrites on `/resume`; nothing on disk reveals
 that cache. agent-talk takes its own lock, then refuses `E_FOREIGN_LIVE` while the presence lock is
 held by anything but a recorded live agent-talk child and `E_LOCKED` for such a child; a lock
-error other than contention is an error, not "held". `caps` declares the
-cached-copy overwrite.
+error other than contention is an error, not "held".
 
 **Approvals.** Headless agy denies every tool not allow-listed in the user's `settings.json` and
 ends the turn (`denied_actions` in `result`, naming only the action; exit 0). Nothing pends, so the
@@ -684,11 +686,12 @@ servers are configured globally only.
 - Codex: `wait --turn` on a steered turn attaches the newest receipt on that turn (steered
   messages share the turn id). A thread written by another app-server process is refused only at
   `thread/resume`, and `ls` does not show which process holds it. Only `send` starts a dormant
-  queued item; `wait --receipt` on one left dormant earlier reports it `pending`.
+  queued item; `wait --receipt` on one left dormant earlier reports it `pending`. How a terminal TUI
+  renders a decline from agent-talk is unverified.
 - `agent-talk mcp` ignores rmcp's cancellation; a cancelled call keeps observing until its
   deadline, and server shutdown waits for it.
-- `caps` reports a method `available` from the installed version alone; probe failures and
-  transport errors are not turned into `unavailable`.
+- `caps` marks a Codex method unavailable only when the daemon reports it missing; any other
+  refusal of the probe on a dummy thread counts as available.
 - Sender attribution cannot detect a daemon or service started from another agent's shell.
 - Grok: `--approvals deny`, an unanswered request under `observe` and the `session/cancel` at the
   deadline rest on captured frames, not re-verified; whether a TUI renders live a turn another

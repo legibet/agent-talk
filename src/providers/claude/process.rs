@@ -122,11 +122,3 @@ pub async fn agents() -> std::result::Result<Vec<(Agent, Value)>, String> {
         })
         .collect()
 }
-
-pub fn run_ok(out: std::io::Result<std::process::Output>) -> std::result::Result<String, String> {
-    match out {
-        Ok(o) if o.status.success() => Ok(String::from_utf8_lossy(&o.stdout).trim().into()),
-        Ok(o) => Err(String::from_utf8_lossy(&o.stderr).trim().into()),
-        Err(e) => Err(e.to_string()),
-    }
-}

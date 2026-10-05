@@ -27,8 +27,9 @@ use self::transcript::{
     ends_with_reply, load, messages, preview, span_reply, turn_span, user_input,
 };
 use super::{
-    ApprovalPolicy, ListFilter, Mode, Provider, ReadPage, ReadRange, SendRequest, StartRequest,
-    WaitTarget, bounded, lock, pid_alive, record, settle, tail, vendor_cmd, wait_receipt,
+    ApprovalPolicy, Caps, Check, ListFilter, Mode, Operation, Provider, ReadPage, ReadRange,
+    SendRequest, StartRequest, WaitTarget, bounded, cli_version, lock, pid_alive, record, settle,
+    tail, wait_receipt,
 };
 use crate::model::{
     self, Approval, Error, ErrorCode, Observations, Outcome, Page, ReceiptState, Result, Session,
@@ -38,7 +39,6 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde_json::{Value, json};
 use std::fs::{File, TryLockError};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Child;
@@ -511,50 +511,34 @@ impl<'a> Antigravity<'a> {
 }
 
 impl Provider for Antigravity<'_> {
-    async fn caps(&self) -> Value {
-        let cli = match vendor_cmd("agy")
-            .arg("--version")
-            .stdin(Stdio::null())
-            .output()
-            .await
-        {
-            Ok(o) if o.status.success() => {
-                Ok(String::from_utf8_lossy(&o.stdout).trim().to_string())
-            }
-            Ok(o) => Err(String::from_utf8_lossy(&o.stderr).trim().to_string()),
-            Err(e) => Err(e.to_string()),
+    async fn caps(&self) -> Caps {
+        let version = cli_version("agy").await;
+        let cli: Check = version.as_ref().map(|_| ()).map_err(String::clone);
+        let store: Check = if self.dir.is_dir() {
+            Ok(())
+        } else {
+            Err(format!("{} does not exist", self.dir.display()))
         };
-        let cli_ok = cli.is_ok();
-        let store_ok = self.dir.is_dir();
-        json!({
-            "provider": "antigravity",
-            "cli": match cli {
-                Ok(v) => json!({"version": v}),
-                Err(e) => json!({"version": null, "error": e}),
-            },
-            "store": {"dir": self.dir, "present": store_ok},
-            "methods": {
-                "new (agy -p stream-json, synchronous)": {"available": cli_ok},
-                "send --mode queue (agy -p stream-json --conversation, synchronous)": {"available": cli_ok},
-                "send --mode steer": {"available": false, "detail": "refused with E_NO_STEER"},
-                "new --name": {"available": false, "detail": "agy has no title interface outside the TUI; refused with E_UNSUPPORTED"},
-                "read (transcript.jsonl, lossy)": {"available": store_ok},
-                "wait (result event of its own run, or transcript-derived)": {"available": true},
-                "ls (conversation_summaries.db, read-only)": {"available": store_ok},
-            },
-            "blind_spots": [
-                "No lock between writers: agy ignores its own presence lock, so a second process on the same conversation overwrites steps by index. agent-talk refuses to write while presence/<id>.lock is flocked by anyone: E_LOCKED when an agy process agent-talk started is still running, E_FOREIGN_LIVE otherwise (flock does not name the holder). Writers that start after this check are not excluded.",
-                "A TUI that switched away from a conversation (/new) keeps it in memory: the lock is released, a send from agent-talk succeeds, and the TUI overwrites the appended steps when it resumes the conversation (/resume). Nothing on disk reveals that cache.",
-                format!("The transcript (read, foreign wait) is lossy: {TRANSCRIPT_LOSSES}. The cursor is the transcript line position; step indices are attribution only."),
-                "Turn end of a turn agent-talk ran is its agy -p result event. Other turns are transcript-derived: bounded by the next USER_INPUT, or by a final reply without tool calls once no process holds the presence lock and the summary status is not RUNNING. A killed agy -p releases the lock and leaves the status RUNNING for good or IDLE (both seen), so the status is no evidence of liveness; Esc in the TUI stores a partial reply as DONE; background tasks continue after IDLE. Session IDLE alone is never taken as completion.",
-                "An unknown --conversation id makes agy silently start a new conversation; send requires the conversation's database or summary row and refuses a run whose init names another conversation.",
-                "No title: new --name is refused (E_UNSUPPORTED). No steer: a line written during a turn becomes the next turn (E_NO_STEER). No client message id: the turn id is the USER_INPUT step index, known after submission from the run log.",
-                "Approvals: headless agy denies every tool not allow-listed in the user's settings.json (permissions.allow) and ends the turn; nothing pends and there is nothing to answer, so --approvals deny changes nothing. Denials are surfaced as approvals with outcome denied (result.denied_actions). agent-talk never passes --dangerously-skip-permissions.",
-                "Sends are synchronous: new and send run agy -p to its result even without --wait, then print the receipt. send reuses the model and effort recorded by new for a conversation agent-talk started (agy needs both for its model aliases); --model on send overrides the model for that run.",
-                "result.duration_seconds, num_turns and usage are conversation totals on a resumed conversation, so turns carry no duration.",
-                "ls ignores --all (no sub-conversation rows were observed); state is running while an agy process agent-talk started runs or the presence lock is held with summary status RUNNING, idle otherwise, unknown when the lock is free but the status is RUNNING (a killed run).",
+        Caps {
+            provider: "antigravity",
+            version: version.ok(),
+            shared: None,
+            operations: vec![
+                Operation::new("ls", &store),
+                Operation::new("new", &cli),
+                Operation::new("send", &cli),
+                Operation::new("read", &store),
+                Operation::new("wait", &Ok(())),
+                Operation::new(
+                    "steer",
+                    &Err("Antigravity CLI cannot add a message to a running turn".into()),
+                ),
+                Operation::new(
+                    "name",
+                    &Err("Antigravity CLI can name a conversation only in its TUI".into()),
+                ),
             ],
-        })
+        }
     }
 
     async fn list(

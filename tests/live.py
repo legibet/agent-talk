@@ -1271,7 +1271,9 @@ def antigravity_tier():
             f"paged {len(paged)} items == full {len(full)} items",
         )
         raw = cli("read", st["AG"], "--raw", "--limit", "1000")
-        expect(len(raw.get("raw") or []) == len(agy_steps(native(st["AG"]))), "read --raw returns every transcript line")
+        expect(
+            len(raw.get("raw") or []) == len(agy_steps(native(st["AG"]))), "read --raw returns every transcript line"
+        )
 
     def a5():
         # Kill agent-talk's agy child mid-generation.
@@ -1417,39 +1419,16 @@ def antigravity_tier():
 
 
 def preconditions() -> dict[str, str | None]:
-    """provider -> None when usable, else the reason from caps."""
+    """provider -> None when new and send can run, else the reasons from caps."""
     out = json.loads(subprocess.run([B, "caps", "--json"], capture_output=True, text=True, env=BASE_ENV).stdout)
-    caps = {p["provider"]: p for p in out["providers"]}
     reasons = {}
-
-    c = caps["codex"]
-    d = c.get("daemon") or {}
-    queue = next((v for k, v in (c.get("methods") or {}).items() if k.startswith("queue")), {})
-    if not (d.get("present") and d.get("connected")):
-        reasons["codex"] = (
-            f"daemon present={d.get('present')} connected={d.get('connected')} {d.get('error') or ''}".strip()
-        )
-    elif not queue.get("available"):
-        reasons["codex"] = f"queue method unavailable: {queue.get('detail')}"
-    else:
-        reasons["codex"] = None
-
-    c = caps["claude"]
-    if not (c.get("cli") or {}).get("version"):
-        reasons["claude"] = f"claude cli: {(c.get('cli') or {}).get('error')}"
-    elif not (c.get("agents_json") or {}).get("available"):
-        reasons["claude"] = f"claude agents --json: {(c.get('agents_json') or {}).get('error')}"
-    else:
-        reasons["claude"] = None
-
-    s = caps["opencode"].get("service") or {}
-    reasons["opencode"] = (
-        None if s.get("connected") else f"service connected={s.get('connected')} {s.get('error') or ''}".strip()
-    )
-
-    for p in ("grok", "antigravity"):
-        cli = caps[p].get("cli") or {}
-        reasons[p] = None if cli.get("version") else f"{p} cli: {cli.get('error')}"
+    for p in out["providers"]:
+        blocked = [
+            f"{o['name']}: {o['reason']}"
+            for o in p["operations"]
+            if o["name"] in ("new", "send") and not o["available"]
+        ]
+        reasons[p["provider"]] = "; ".join(blocked) or None
     return reasons
 
 

@@ -16,11 +16,10 @@ with `LIVE_CODEX_MODEL`, `LIVE_CLAUDE_MODEL`, `LIVE_OPENCODE_MODEL`, `LIVE_GROK_
 wait before C6.
 
 The script builds `target/release/agent-talk` first and reads preconditions from
-`agent-talk caps --json` (Codex daemon connected with the queue method, `claude agents --json`,
-OpenCode service connected, `grok` and `agy` installed); a provider whose preconditions fail
-prints `SKIP <provider>: <reason>`. The Grok tier runs direct mode only; leader cases need an
-isolated `GROK_HOME` and a short socket path and are run by hand, never against the user's
-`~/.grok/leader.sock`.
+`agent-talk caps --json`: a provider runs only when `caps` reports `new` and `send` available, and
+otherwise prints `SKIP <provider>: <reason>`. The Grok tier runs direct mode only; leader cases
+need an isolated `GROK_HOME` and a short socket path and are run by hand, never against the
+user's `~/.grok/leader.sock`.
 
 All sessions use `target/live-work`. Cleanup deletes only what the run created: its OpenCode
 session, its Claude transcripts, its Grok sessions (`grok sessions delete`) and its

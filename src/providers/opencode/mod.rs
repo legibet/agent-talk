@@ -13,8 +13,9 @@ mod transport;
 
 use self::transport::{Events, Service};
 use super::{
-    ApprovalPolicy, ListFilter, Mode, Provider, ReadPage, ReadRange, SendRequest, StartRequest,
-    WaitTarget, approval_policy, bounded, record, reject, resolve, settle, wait_receipt,
+    ApprovalPolicy, Caps, Check, ListFilter, Mode, Operation, Provider, ReadPage, ReadRange,
+    SendRequest, StartRequest, WaitTarget, approval_policy, bounded, record, reject, resolve,
+    settle, wait_receipt,
 };
 use crate::model::{
     self, Approval, Error, ErrorCode, Message, Observations, Outcome, Page, ReceiptState, Result,
@@ -682,48 +683,31 @@ impl<'a> OpenCode<'a> {
 }
 
 impl Provider for OpenCode<'_> {
-    async fn caps(&self) -> Value {
-        let registered = self.registration.is_file();
-        let (ok, service) = match self.connect().await {
+    async fn caps(&self) -> Caps {
+        let (version, shared, service): (Option<String>, String, Check) = match self.connect().await
+        {
             Ok(s) => (
-                true,
-                json!({
-                    "registered": registered,
-                    "connected": true,
-                    "url": s.url,
-                    "pid": s.pid,
-                    "version": s.version,
-                }),
+                Some(s.version),
+                format!("service running at {} (pid {})", s.url, s.pid),
+                Ok(()),
             ),
-            Err(e) => (
-                false,
-                json!({"registered": registered, "connected": false, "error": e}),
-            ),
+            Err(e) => {
+                let shared = match e.code {
+                    ErrorCode::NoDaemon => "service not running",
+                    _ => "service not reachable",
+                };
+                (None, shared.into(), Err(e.message))
+            }
         };
-        json!({
-            "provider": "opencode",
-            "registration": self.registration,
-            "service": service,
-            "methods": {
-                "ls (GET /api/session + /api/session/active)": {"available": ok},
-                "new (POST /api/session, then prompt)": {"available": ok},
-                "send --mode queue (POST …/prompt delivery=queue)": {"available": ok},
-                "send --mode steer (POST …/prompt delivery=steer; refused when the session is idle)": {"available": ok},
-                "read (GET …/message, cursor paging)": {"available": ok},
-                "wait (SSE /api/event + history)": {"available": ok},
-                "approvals (permission.asked observed; --approvals deny → reject with message)": {"available": ok},
-            },
-            "blind_spots": [
-                "OpenCode has no turn id. agent-talk's turn id is the user message id it chose (session.prompt.id); the turn ends at the first idle message after it in history, or at its interrupted step when a new user message followed without one or nothing runs any more (an interrupt with reason shutdown writes no idle). One execution can serve several user messages: steered messages are folded into the running execution at the next step boundary and may be answered together, queued ones run after the current reply but still inside the same execution. A receipt therefore does not promise a dedicated answer.",
-                "The event stream (GET /api/event) is global, unfiltered and replays nothing; each observing command subscribes once and re-reads history right after subscribing and after each execution end. Pending permission requests are not replayed either: they are read from GET /api/session/{id}/permission right after subscribing.",
-                "A queued message left pending when a user interrupt ends the execution stays dormant until a later execution runs; after an interrupt with reason shutdown (message-less permission reject, service going down) it runs at once in a new execution. wait reports it as pending until then.",
-                "Sessions agent-talk creates run under the user's own agent permission rules (here: shell commands run without asking by default). --approvals deny only answers requests that reach agent-talk while it is observing, with reject plus a message; a message-less reject would interrupt the execution and leave no turn-end record, so it is never sent. once and always are never sent.",
-                "Any request that names a directory makes the service load that location and keep it; agent-talk only sends directories it was given (new --cwd, ls --cwd).",
-                "session.get's outcome and time.idle describe the last finished execution, not the current state; state comes from /api/session/active.",
-                "steer on an idle session would silently start a new execution, so agent-talk refuses it (E_PRECONDITION) after checking /api/session/active; the check is racy by nature.",
-                "Caller attribution: agent-talk mcp reads _meta['ai.opencode/sessionID'] (sent on every tools/call); the CLI reads OPENCODE_SESSION_ID (set on every shell call). Both are attribution, not identity.",
-            ],
-        })
+        Caps {
+            provider: "opencode",
+            version,
+            shared: Some(shared),
+            operations: ["ls", "new", "send", "read", "wait", "steer", "name"]
+                .into_iter()
+                .map(|name| Operation::new(name, &service))
+                .collect(),
+        }
     }
 
     async fn list(

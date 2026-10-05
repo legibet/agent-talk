@@ -11,7 +11,7 @@ use ops::{
     Sessions, WaitArgs, caller_from_handle, env_var,
 };
 use providers::{ApprovalPolicy, Mode, ReadRange, WaitTarget};
-use serde_json::{Value, json};
+use serde_json::json;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -285,7 +285,7 @@ fn main() -> ExitCode {
     }
 }
 
-/// Sender of a CLI mutation (`ops::SENDER_RULE`).
+/// Sender of a CLI mutation (DESIGN.md §4).
 fn cli_caller(explicit: Option<&str>) -> model::Result<Caller> {
     if let Some(h) = explicit
         .map(String::from)
@@ -303,7 +303,9 @@ fn cli_caller(explicit: Option<&str>) -> model::Result<Caller> {
 
 fn request(cmd: Cmd) -> model::Result<Request> {
     Ok(match cmd {
-        Cmd::Caps => Request::Caps,
+        Cmd::Caps => Request::Caps {
+            sender: cli_caller(None)?,
+        },
         Cmd::Mcp { .. } => unreachable!("handled in main"),
         Cmd::Ls {
             provider,
@@ -411,10 +413,6 @@ fn request(cmd: Cmd) -> model::Result<Request> {
     })
 }
 
-fn s(v: &Value) -> &str {
-    v.as_str().unwrap_or("-")
-}
-
 fn or_dash(v: Option<&str>) -> &str {
     v.unwrap_or("-")
 }
@@ -437,41 +435,41 @@ fn print_human(out: &Output) {
     match out {
         Output::Caps { providers, sender } => {
             for p in providers {
-                println!("provider  {}", s(&p["provider"]));
-                println!("cli       {}", s(&p["cli"]["version"]));
-                let d = &p["daemon"];
-                if d.is_object() {
-                    println!(
-                        "daemon    present={} version={} socket={}",
-                        d["present"],
-                        s(&d["version"]),
-                        s(&d["socket"])
-                    );
+                println!(
+                    "{:<12} {}",
+                    p.provider,
+                    p.version.as_deref().unwrap_or("version unknown")
+                );
+                if let Some(shared) = &p.shared {
+                    println!("{:<12} {shared}", "");
                 }
-                let svc = &p["service"];
-                if svc.is_object() {
-                    println!(
-                        "service   connected={} version={} url={}",
-                        svc["connected"],
-                        s(&svc["version"]),
-                        s(&svc["url"])
-                    );
+                let available: Vec<&str> = p
+                    .operations
+                    .iter()
+                    .filter(|o| o.available)
+                    .map(|o| o.name)
+                    .collect();
+                if !available.is_empty() {
+                    println!("{:<12} available: {}", "", available.join(" "));
                 }
-                let a = &p["agents_json"];
-                if a.is_object() {
-                    println!(
-                        "agents    claude agents --json: available={}",
-                        a["available"]
-                    );
+                // Operations blocked for the same reason share one line.
+                let mut blocked: Vec<(&str, Vec<&str>)> = Vec::new();
+                for o in p.operations.iter().filter(|o| !o.available) {
+                    let reason = o.reason.as_deref().unwrap_or("unavailable");
+                    match blocked.iter_mut().find(|(r, _)| *r == reason) {
+                        Some((_, names)) => names.push(o.name),
+                        None => blocked.push((reason, vec![o.name])),
+                    }
                 }
-                for (method, probe) in p["methods"].as_object().into_iter().flatten() {
-                    println!("method    {method}: available={}", probe["available"]);
-                }
-                for b in p["blind_spots"].as_array().into_iter().flatten() {
-                    println!("limit     {}", s(b));
+                for (reason, names) in blocked {
+                    println!("{:<12} {}: {reason}", "", names.join(", "));
                 }
             }
-            println!("sender    {sender}");
+            println!(
+                "{:<12} {}",
+                "sender",
+                sender.session.as_deref().unwrap_or("unknown")
+            );
         }
         Output::Sessions(Sessions {
             sessions,

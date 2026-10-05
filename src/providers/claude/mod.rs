@@ -17,13 +17,13 @@ mod process;
 mod stream;
 mod transcript;
 
-use self::process::{Agent, agents, run_ok};
+use self::process::{Agent, agents};
 use self::stream::{Run, StreamEvent, System, denial, result_turn};
 use self::transcript::{TurnEnd, head, live_branch, load, slug, transcript_turn, turn_end};
 use super::{
-    ApprovalPolicy, ListFilter, Mode, Provider, ReadPage, ReadRange, SendRequest, StartRequest,
-    WaitTarget, bounded, first_line, lock, pid_alive, record, settle, tail, vendor_cmd,
-    wait_receipt,
+    ApprovalPolicy, Caps, Check, ListFilter, Mode, Operation, Provider, ReadPage, ReadRange,
+    SendRequest, StartRequest, WaitTarget, bounded, cli_version, first_line, lock, pid_alive,
+    record, settle, tail, wait_receipt,
 };
 use crate::model::{
     self, Approval, Error, ErrorCode, Observations, Outcome, Page, ReceiptState, Result, Session,
@@ -34,7 +34,6 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::{Duration, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
 use tokio::time::Instant;
@@ -360,44 +359,36 @@ impl<'a> Claude<'a> {
 }
 
 impl Provider for Claude<'_> {
-    async fn caps(&self) -> Value {
-        let cli = run_ok(
-            vendor_cmd("claude")
-                .arg("--version")
-                .stdin(Stdio::null())
-                .output()
-                .await,
-        );
-        let agents = match agents().await {
-            Ok(a) => json!({"available": true, "sessions": a.len()}),
-            Err(e) => json!({"available": false, "error": e}),
+    async fn caps(&self) -> Caps {
+        let version = cli_version("claude").await;
+        let cli: Check = version.as_ref().map(|_| ()).map_err(String::clone);
+        // `send` refuses unless `claude agents` can tell whether the session is open elsewhere.
+        let agents: Check = match agents().await {
+            Ok(_) => Ok(()),
+            Err(e) => Err(format!("cannot check whether the session is live: {e}")),
         };
-        let cli_ok = cli.is_ok();
-        json!({
-            "provider": "claude",
-            "cli": match cli {
-                Ok(v) => json!({"version": v}),
-                Err(e) => json!({"version": null, "error": e}),
-            },
-            "agents_json": agents,
-            "transcripts": {"dir": self.projects, "present": self.projects.is_dir()},
-            "methods": {
-                "new (claude -p stream-json --session-id)": {"available": cli_ok},
-                "send --mode queue (claude -p stream-json --resume, synchronous)": {"available": cli_ok},
-                "send --mode steer": {"available": false, "detail": "refused with E_NO_STEER"},
-                "read (transcript, live branch)": {"available": self.projects.is_dir()},
-                "wait (result event, or transcript-derived)": {"available": true},
-            },
-            "blind_spots": [
-                "No vendor lock: a second claude --resume on a session that is mid-turn neither errors nor waits; it forks the transcript and one branch silently drops out of the conversation. agent-talk's only protection is its own OS lock per session plus a refusal when `claude agents --json --all` lists a live pid for the session: E_LOCKED when the pid is a claude process agent-talk started, E_FOREIGN_LIVE otherwise (a running foreign claude -p is listed as kind interactive, so kind is not used). Writers outside agent-talk that start after this check are not excluded.",
-                "No steer: steering needs a long-lived claude process that agent-talk keeps across commands, and v0 runs one claude -p per command. Even then, Claude itself decides whether a line written mid-turn is folded into the running turn (at a tool boundary) or runs as the next turn; the caller cannot choose. --mode steer is refused (E_NO_STEER).",
-                "Turn end of a turn agent-talk ran comes from its claude -p `result` event. Other turns are transcript-derived and best effort, from markers interactive sessions write after the prompt: `system/turn_duration` (normal completion) or a `[Request interrupted by user]` user line (Esc; no turn_duration is written), or else a later user message. Only Esc interrupts and normal completions are covered; turns that end in failures (e.g. API errors mid-turn) are unverified. `claude agents` may still say busy while background agents are pending. Foreign claude -p sessions write no marker; wait reports running until the deadline.",
-                "Sends are synchronous: send runs claude -p --resume to completion even without --wait, then prints the receipt.",
-                "Claude -p has no pending-approval state; the vendor denies and the model is told; use --approvals deny to also stop retries. Denials are surfaced as approvals with outcome denied (system/permission_denied, result.permission_denials).",
-                "Sender attribution through agent-talk mcp: the Claude session id is read from the MCP server's environment (CLAUDE_CODE_SESSION_ID) at startup; if a TUI switches session while the server stays alive (/clear, /resume), attribution may go stale (unverified).",
-                "read follows the live branch (newest last-prompt leaf back through parentUuid); lines on orphaned branches appear only with --raw. Sub-agent transcripts are not read.",
+        let transcripts: Check = if self.projects.is_dir() {
+            Ok(())
+        } else {
+            Err(format!("{} does not exist", self.projects.display()))
+        };
+        Caps {
+            provider: "claude",
+            version: version.ok(),
+            shared: None,
+            operations: vec![
+                Operation::new("ls", &transcripts),
+                Operation::new("new", &cli),
+                Operation::new("send", &cli.clone().and(agents)),
+                Operation::new("read", &transcripts),
+                Operation::new("wait", &Ok(())),
+                Operation::new(
+                    "steer",
+                    &Err("Claude Code cannot add a message to a running turn".into()),
+                ),
+                Operation::new("name", &cli),
             ],
-        })
+        }
     }
 
     async fn list(

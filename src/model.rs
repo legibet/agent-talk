@@ -257,7 +257,7 @@ pub struct Turn {
 
 /// Who sent a message. Attribution, not authenticated identity.
 // Configured or derived: `--caller`, `--from`, `AGENT_TALK_CALLER`, the MCP call's `_meta`
-// (Codex, OpenCode, Antigravity), the vendors' session variables (`ops::SENDER_RULE`).
+// (Codex, OpenCode, Antigravity), the vendors' session variables (DESIGN.md §4).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Caller {
     pub kind: CallerKind,

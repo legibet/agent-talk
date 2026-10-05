@@ -20,9 +20,9 @@ mod updates;
 use self::acp::{Conn, Event, Reply, ServerRequest, Spawn};
 use self::updates::{History, first_prompt};
 use super::{
-    ApprovalPolicy, ListFilter, Mode, Provider, ReadPage, ReadRange, SendRequest, StartRequest,
-    WaitTarget, bounded, first_line, lock, pid_alive, record, reject, settle, strip_provenance,
-    vendor_cmd, wait_receipt,
+    ApprovalPolicy, Caps, Check, ListFilter, Mode, Operation, Provider, ReadPage, ReadRange,
+    SendRequest, StartRequest, WaitTarget, bounded, cli_version, first_line, lock, pid_alive,
+    record, reject, settle, strip_provenance, wait_receipt,
 };
 use crate::model::{
     self, Approval, Error, ErrorCode, Observations, Outcome, Page, ReceiptState, Result, Session,
@@ -32,7 +32,6 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio::time::Instant;
@@ -873,57 +872,37 @@ impl<'a> Grok<'a> {
 }
 
 impl Provider for Grok<'_> {
-    async fn caps(&self) -> Value {
-        let cli = match vendor_cmd("grok")
-            .arg("--version")
-            .stdin(Stdio::null())
-            .output()
-            .await
-        {
-            Ok(o) if o.status.success() => {
-                Ok(String::from_utf8_lossy(&o.stdout).trim().to_string())
-            }
-            Ok(o) => Err(String::from_utf8_lossy(&o.stderr).trim().to_string()),
-            Err(e) => Err(e.to_string()),
+    async fn caps(&self) -> Caps {
+        let version = cli_version("grok").await;
+        let cli: Check = version.as_ref().map(|_| ()).map_err(String::clone);
+        let (shared, leader): (&str, Check) = match self.leader() {
+            Ok(Some(_)) => ("leader running", Ok(())),
+            Ok(None) => (
+                "no leader running",
+                Err("needs a running Grok leader".into()),
+            ),
+            Err(e) => ("leader not reachable", Err(e.message)),
         };
-        let cli_ok = cli.is_ok();
-        let leader = match self.leader() {
-            Ok(l) => json!({
-                "socket": self.socket,
-                "present": self.socket.exists(),
-                "answering": l.is_some(),
-                "lock_pid": self.leader_pid(),
-            }),
-            Err(e) => {
-                json!({"socket": self.socket, "present": self.socket.exists(), "error": e.message})
-            }
+        let dir = self.sessions();
+        let store: Check = if dir.is_dir() {
+            Ok(())
+        } else {
+            Err(format!("{} does not exist", dir.display()))
         };
-        let store = self.sessions();
-        json!({
-            "provider": "grok",
-            "cli": match cli {
-                Ok(v) => json!({"version": v}),
-                Err(e) => json!({"version": null, "error": e}),
-            },
-            "leader": leader,
-            "store": {"dir": store, "present": store.is_dir()},
-            "methods": {
-                "new (grok agent stdio: session/new, _x.ai/session/rename, session/prompt)": {"available": cli_ok},
-                "send --mode queue (session/load + session/prompt; runs to the turn end even without --wait)": {"available": cli_ok},
-                "send --mode steer (_x.ai/interject through a live leader)": {"available": cli_ok, "detail": "E_NO_STEER without a live leader"},
-                "read (updates.jsonl)": {"available": store.is_dir()},
-                "wait (session/prompt response, else updates.jsonl turn_completed)": {"available": true},
-            },
-            "blind_spots": [
-                "No vendor lock between writers: a second process on a session marks its running turn interrupted and the two processes' memories diverge. agent-talk refuses a direct-mode write while active_sessions.json lists a live TUI pid for the session that no leader lists resident (E_FOREIGN_LIVE) or while a grok agent it started still runs it (E_LOCKED), and holds its own lock per session. Foreign `grok -p` and direct ACP writers are listed nowhere and are not detected.",
-                "Leader detection: agent-talk passes --leader only after the leader socket answered a connect, since --leader spawns a persistent leader when none listens. A leader that exits between that probe and the child's connect is replaced by one Grok spawns; agent-talk reports a changed leader.lock pid but cannot prevent it.",
-                "Steer (_x.ai/interject) works only through a live leader on a session working there. Grok takes no client id and no expected turn: the ack is the acceptance, the joined turn comes from _x.ai/session/interjection, --expect-turn is compared by agent-talk before the call, and a turn that ended in between makes Grok start a fallback turn (prompt id interject-fallback-…), which the receipt then names.",
-                "Every Grok session loads the user's MCP servers from ~/.claude.json, so each session agent-talk starts runs an `agent-talk mcp` of its own.",
-                "Direct mode keeps no process after the command: send and new run until the turn ends even without --wait (only the receipt is printed then), and when a --wait deadline or Ctrl-C ends the command first, agent-talk cancels the turn (session/cancel) so that updates.jsonl records its end; through a leader the turn continues.",
-                "Approvals: the user's permission_mode applies (always-approve makes ACP sessions yolo); --approvals deny sends yoloMode: false on session/new and session/load in direct mode and answers this prompt's session/request_permission with reject_once, which ends the turn cancelled. Under observe a request stays pending, and the command waits until its deadline (without --wait: until Ctrl-C).",
-                "Turns not run by this command (TUI, other clients, a receipt whose command ended) are read from updates.jsonl: wait polls it every second for turn_completed.",
+        Caps {
+            provider: "grok",
+            version: version.ok(),
+            shared: Some(shared.into()),
+            operations: vec![
+                Operation::new("ls", &store),
+                Operation::new("new", &cli),
+                Operation::new("send", &cli),
+                Operation::new("read", &store),
+                Operation::new("wait", &Ok(())),
+                Operation::new("steer", &cli.clone().and(leader)),
+                Operation::new("name", &cli),
             ],
-        })
+        }
     }
 
     async fn list(
