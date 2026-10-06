@@ -24,13 +24,10 @@ use serde_json::json;
 use std::path::PathBuf;
 use std::time::Duration;
 
-const INSTRUCTIONS: &str = "Tools to talk to other agent sessions (Codex threads, Claude Code \
-sessions, OpenCode sessions, Grok CLI sessions, Antigravity CLI conversations) on this machine: \
-find one with ls, start one with new, ask it something with send (wait=true returns its reply), \
-read its history with read, and wait for a turn with wait. Messages you send are attributed to \
-your own session (this server's --caller or AGENT_TALK_CALLER, else the calling Codex thread, \
-OpenCode session, Antigravity conversation, Grok session or Claude session), which is \
-attribution, not authentication.";
+const INSTRUCTIONS: &str = "Tools to talk to other agent sessions on this machine (Codex, \
+Claude Code, OpenCode, Grok CLI, Antigravity CLI): ls finds one, new starts one, send messages \
+it (wait=true returns the reply), read shows its conversation, wait waits for a turn. Messages \
+carry your own session as the sender.";
 
 #[derive(Clone)]
 pub struct Server {
@@ -47,13 +44,13 @@ pub struct Server {
 
 #[derive(Deserialize, JsonSchema)]
 struct LsParams {
-    /// `codex`, `claude`, `opencode`, `grok` or `antigravity`; default: all.
+    /// Only this agent: `codex`, `claude`, `opencode`, `grok` or `antigravity`.
     agent: Option<String>,
-    /// Only sessions whose working directory is this absolute path.
+    /// Only sessions in this working directory (absolute path).
     cwd: Option<String>,
-    /// Page size (default 25).
+    /// Sessions per page (default 25).
     limit: Option<u32>,
-    /// `next_cursor` from a previous call with the same agent.
+    /// `next_cursor` of a previous page; needs agent.
     cursor: Option<String>,
 }
 
@@ -65,19 +62,16 @@ struct NewParams {
     cwd: String,
     /// First message for the new session.
     prompt: String,
-    /// Model name for the agent (e.g. a Codex model id, `sonnet` for Claude,
-    /// `provider/model` for OpenCode, `grok-4.7` for Grok, `gemini-3.8-flash` for Antigravity).
+    /// Model, in the agent's own naming (default: the agent's).
     model: Option<String>,
-    /// Short title for the session, stored by the agent and shown by ls; name it so you
-    /// can find it again (Antigravity has no title interface and refuses it).
+    /// Title shown by ls, to find the session again; Antigravity has none.
     name: Option<String>,
-    /// Reasoning effort for the session; the values depend on the agent and model (default:
-    /// the agent's).
+    /// Reasoning effort, in the agent's own values (default: the agent's).
     effort: Option<String>,
-    /// Give the session every permission, with no sandbox and no approval prompts (default
-    /// false: the agent's own configuration).
+    /// Let the session act without asking for permission (default false: the agent's own
+    /// permissions).
     full_access: Option<bool>,
-    /// Wait for the first turn to finish and return it (reply in `turn.final_text`).
+    /// Wait for the first turn to finish and return it; the reply is `turn.final_text`.
     wait: Option<bool>,
     /// Seconds to wait with wait=true (default 600). On timeout the outcome is unknown
     /// and the receipt is kept; use `wait` with the receipt id later.
@@ -91,19 +85,17 @@ fn wait_for(wait: Option<bool>, timeout_s: Option<u64>) -> Option<Duration> {
 
 #[derive(Deserialize, JsonSchema)]
 struct SendParams {
-    /// Session handle from ls or new, e.g. `codex:<thread id>`, `claude:<uuid>`,
-    /// `opencode:<ses_…>`, `grok:<uuid>` or `antigravity:<uuid>`.
+    /// Session handle from ls or new.
     handle: String,
     /// The message.
     text: String,
-    /// Add the message to the running turn instead of queueing it (Codex, OpenCode, Grok
-    /// through a live leader); refused when the session is idle (default false).
+    /// Deliver into the running turn instead of after it; refused when the session is idle
+    /// (default false).
     steer: Option<bool>,
-    /// Wait for the turn that consumes the message and return it (reply in
-    /// `turn.final_text`; on OpenCode the final reply of the execution that consumed it,
-    /// which may also have answered other messages queued meanwhile).
+    /// Wait for the reply and return the finished turn; the reply is `turn.final_text`.
     wait: Option<bool>,
-    /// Seconds to wait with wait=true (default 600).
+    /// Seconds to wait with wait=true (default 600). On timeout the outcome is unknown and
+    /// the receipt is kept; use `wait` with the receipt id later.
     timeout_s: Option<u64>,
 }
 
@@ -227,7 +219,7 @@ impl Server {
         title = "List sessions",
         output_schema = schema_for_type::<Sessions>(),
         annotations(read_only_hint = true, open_world_hint = false),
-        description = "List agent sessions on this machine (Codex threads, Claude Code sessions, OpenCode sessions, Grok CLI sessions, Antigravity CLI conversations) that you can message: handle, agent, cwd, state, a preview of the first prompt, and observations (loaded, origin). Use it to find another agent session to talk to; pass its handle to send or read."
+        description = "List agent sessions on this machine: handle, agent, cwd, state and a preview of the first prompt. Pass a handle to send or read."
     )]
     async fn ls(&self, Parameters(p): Parameters<LsParams>) -> CallToolResult {
         self.exec(Request::Ls(LsArgs {
@@ -245,7 +237,7 @@ impl Server {
         title = "New session",
         output_schema = schema_for_type::<Outcome>(),
         annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = false),
-        description = "Start a new agent session (agent codex, claude, opencode, grok or antigravity) in a directory with a first prompt, e.g. to hand a task to a fresh agent; give it a name to find it again in ls. Returns its handle and a receipt; with wait=true also the finished first turn, whose reply is turn.final_text. agent-talk prefixes your prompt with a one-line provenance header naming your session; do not add your own."
+        description = "Start an agent session in a directory with a first prompt, e.g. to hand a task to a fresh agent; give it a name to find it again. Returns its handle and a receipt; with wait=true also the finished first turn, whose reply is turn.final_text. The prompt is delivered with a header naming your session."
     )]
     async fn new_session(
         &self,
@@ -270,7 +262,7 @@ impl Server {
         title = "Send message",
         output_schema = schema_for_type::<Outcome>(),
         annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = false),
-        description = "Send a message to another agent session (handle from ls or new). To ask it a question and wait for its reply, set wait=true: the reply is turn.final_text (on OpenCode, the final reply of the execution that consumed your message; if other messages were queued to that session meanwhile it may answer them together, so check the adjacent messages with read when that matters). agent-talk prefixes your message with a one-line provenance header naming your session; do not add your own. Without wait it returns a receipt once the message is accepted (Claude, Grok and Antigravity sessions still run the turn before returning). Refusals come back as an error object with a code; do not retry them: E_FOREIGN_LIVE when the session is held by a live process agent-talk did not start (e.g. a Claude Code session open in a terminal), E_LOCKED when another agent-talk command is running it. E_TIMEOUT means the outcome is unknown; use wait with the receipt id."
+        description = "Send a message to an agent session. With wait=true, returns the reply as turn.final_text (on OpenCode the reply of the run that took the message, which may also cover other queued messages; read shows them). Without wait, returns a receipt once the message is accepted; Claude, Grok and Antigravity run the whole turn before returning either way. The message is delivered with a header naming your session. A refusal is an error with a code and is final: E_FOREIGN_LIVE (the session is open in a process agent-talk did not start), E_LOCKED (another agent-talk command is running it); E_TIMEOUT means the outcome is unknown, use wait with the receipt id."
     )]
     async fn send(
         &self,
@@ -310,7 +302,7 @@ impl Server {
         title = "Wait for turn",
         output_schema = schema_for_type::<Outcome>(),
         annotations(read_only_hint = true, open_world_hint = false),
-        description = "Wait for a turn of another agent session to finish and return it (reply in turn.final_text): pass the receipt id from a send or new without wait (or one that timed out), or a turn id. Returns at once if the turn already finished. On OpenCode a turn is one execution, which may have answered several queued messages."
+        description = "Wait for a turn to finish and return it, the reply in turn.final_text: pass the receipt from a send or new, or a turn id. Returns at once if the turn already finished."
     )]
     async fn wait(&self, Parameters(p): Parameters<WaitParams>) -> CallToolResult {
         let target = match (p.turn, p.receipt) {

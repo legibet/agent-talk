@@ -24,7 +24,7 @@ use store::Store;
     about = "Send messages to agent sessions and read the replies"
 )]
 struct Cli {
-    /// Print machine-readable JSON on stdout.
+    /// Print JSON instead of text.
     #[arg(long, global = true)]
     json: bool,
     #[command(subcommand)]
@@ -34,19 +34,18 @@ struct Cli {
 /// Who is sending.
 #[derive(Args)]
 struct SenderOpts {
-    /// Handle of the session issuing this command. Default: AGENT_TALK_CALLER, else the
-    /// session the shell runs in (CODEX_THREAD_ID, OPENCODE_SESSION_ID, GROK_SESSION_ID,
-    /// ANTIGRAVITY_CONVERSATION_ID, then CLAUDE_CODE_SESSION_ID), else unknown.
+    /// Handle of the session sending this; default: the session the shell runs in, if
+    /// known.
     #[arg(long)]
     from: Option<String>,
 }
 
 #[derive(Args)]
 struct WaitOpts {
-    /// Wait for the turn that consumes this message to complete and print it. Its
-    /// final_text is the reply to this message on Codex, Claude, Grok and Antigravity; on
-    /// OpenCode it is the final reply of the execution that consumed it, which may also have
-    /// answered other messages queued meanwhile (read shows the adjacent messages).
+    /// Wait for the reply and print the finished turn; the reply is its final_text (on
+    /// OpenCode the reply of the run that took the message, which may also cover other
+    /// queued messages; read shows them). Claude, Grok and Antigravity run the whole turn
+    /// before returning either way.
     #[arg(long)]
     wait: bool,
     /// Seconds to wait with --wait.
@@ -62,46 +61,46 @@ impl WaitOpts {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// What each agent can do now: CLI version, daemon, service or leader, available operations.
+    /// Show each agent's installed version and which operations work now.
     Status,
-    /// List sessions with observations, paginated.
+    /// List sessions, one page per call; pass a handle to send or read.
     Ls {
-        /// codex, claude, opencode, grok or antigravity; default: every agent's first page.
+        /// Only this agent: codex, claude, opencode, grok or antigravity.
         #[arg(long)]
         agent: Option<String>,
+        /// Only sessions in this working directory.
         #[arg(long)]
         cwd: Option<PathBuf>,
-        /// Include every source kind (sub-agents, unknown).
+        /// Include sub-agent sessions and sessions of unknown origin.
         #[arg(long)]
         all: bool,
+        /// Sessions per page.
         #[arg(long, default_value_t = ops::LS_LIMIT)]
         limit: u32,
-        /// Cursor from a previous page of the same agent.
+        /// Cursor printed by a previous page; needs --agent.
         #[arg(long)]
         cursor: Option<String>,
     },
-    /// Start a session owned by agent-talk; prints handle and receipt.
+    /// Start a session with a first message; prints its handle and a receipt.
     New {
         /// codex, claude, opencode, grok or antigravity.
         agent: String,
+        /// The first message.
         prompt: String,
         /// Working directory of the session.
         #[arg(long, default_value = ".")]
         cwd: PathBuf,
-        /// Model for the session (Codex: model id; Claude: e.g. sonnet; OpenCode:
-        /// provider/model; Grok: e.g. grok-4.7; Antigravity: e.g. gemini-3.8-flash).
+        /// Model, in the agent's own naming; default: the agent's.
         #[arg(long)]
         model: Option<String>,
-        /// Title stored with the session by the agent, shown by ls (Codex thread name,
-        /// Claude session name, OpenCode title, Grok session title; Antigravity has none).
+        /// Title shown by ls; Antigravity has none.
         #[arg(long)]
         name: Option<String>,
-        /// Reasoning effort for the session; the values depend on the agent and model;
-        /// default: the agent's.
+        /// Reasoning effort, in the agent's own values; default: the agent's.
         #[arg(long)]
         effort: Option<String>,
-        /// Give the session every permission, with no sandbox and no approval prompts;
-        /// default: the agent's own configuration.
+        /// Let the session act without asking for permission; default: the agent's own
+        /// permissions.
         #[arg(long)]
         full_access: bool,
         #[command(flatten)]
@@ -109,15 +108,15 @@ enum Cmd {
         #[command(flatten)]
         sender: SenderOpts,
     },
-    /// Send a message to a session. Claude, Grok and Antigravity sends are synchronous: the
-    /// turn runs to completion even without --wait, which only controls whether the turn is
-    /// printed (Grok without a leader keeps no process after the command, so a --wait
-    /// deadline or Ctrl-C ends the turn with session/cancel).
+    /// Send a message to a session; returns once it is accepted, or with --wait once the
+    /// reply is in.
     Send {
+        /// Session handle from ls or new.
         handle: String,
+        /// The message.
         text: String,
-        /// Add the message to the running turn instead of queueing it (Codex, OpenCode, Grok
-        /// through a live leader); refused when the session is idle.
+        /// Deliver into the running turn instead of after it; refused when the session is
+        /// idle.
         #[arg(long)]
         steer: bool,
         #[command(flatten)]
@@ -127,6 +126,7 @@ enum Cmd {
     },
     /// Read a session's newest messages, oldest first.
     Read {
+        /// Session handle.
         handle: String,
         /// Messages per page.
         #[arg(long, default_value_t = ops::READ_LIMIT)]
@@ -142,25 +142,24 @@ enum Cmd {
         #[arg(long)]
         raw: bool,
     },
-    /// Wait for a specific turn, or the turn that consumed a receipt, to complete. On
-    /// OpenCode a turn is one execution and may have answered several messages.
+    /// Wait for a turn to finish and print it; the reply is its final_text.
     Wait {
+        /// Session handle.
         handle: String,
+        /// Turn id.
         #[arg(long, required_unless_present = "receipt", conflicts_with = "receipt")]
         turn: Option<String>,
+        /// Receipt id from a send or new.
         #[arg(long)]
         receipt: Option<String>,
+        /// Seconds to wait.
         #[arg(long, default_value_t = DEFAULT_TIMEOUT.as_secs())]
         timeout: u64,
     },
-    /// Serve ls, new, send, read and wait as MCP tools on stdio.
+    /// Serve the same commands as MCP tools on stdio.
     Mcp {
-        /// Pin the sender of every send and new to this handle. Without it: AGENT_TALK_CALLER
-        /// (also a pin, but inherited by child processes), then each call's
-        /// `_meta.threadId` (Codex), `_meta["ai.opencode/sessionID"]` (OpenCode) or
-        /// `_meta["antigravity.google/conversation_id"]` (Antigravity), then GROK_SESSION_ID
-        /// or CLAUDE_CODE_SESSION_ID in this server's environment (set by Grok or Claude Code
-        /// for each MCP server they start), then unknown. None of these is authenticated.
+        /// Attribute every send and new to this handle; default: the session that started
+        /// this server, if known.
         #[arg(long)]
         caller: Option<String>,
     },

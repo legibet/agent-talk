@@ -160,7 +160,9 @@ for all. agent-talk never accepts.
   Where the agent allows it they never ask (Codex `approvalPolicy: never`, Claude
   `--permission-prompts none`, OpenCode session rules that deny what the user's rules would ask;
   headless Claude and Antigravity deny on their own), and what still reaches agent-talk is
-  declined (Codex `decline`, OpenCode `reject` with a message, Grok `reject_once`).
+  declined (Codex `decline`, OpenCode `reject` with a message, Grok `reject_once`). Grok has no
+  session-level setting, so a request a leader-held turn raises after the command stopped
+  observing waits for another client (§8).
 - Sessions agent-talk did not start belong to the user: agent-talk never answers there and never
   changes their settings. It records pending requests and lets the deadline pass with
   `state: waiting`.
