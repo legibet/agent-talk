@@ -204,7 +204,13 @@ pub fn messages(lines: &[Entry]) -> Vec<(usize, Message)> {
         if s.is_user() {
             out.push((
                 i,
-                msg(item, "user", "other", user_text(s.text()).to_string(), None),
+                msg(
+                    item,
+                    "user",
+                    "prompt",
+                    user_text(s.text()).to_string(),
+                    None,
+                ),
             ));
         } else if s.kind == "SYSTEM_MESSAGE" {
             out.push((
@@ -339,7 +345,7 @@ mod tests {
                     0,
                     "0",
                     "user",
-                    "other",
+                    "prompt",
                     "Remember the word: banana. Reply OK."
                 ),
                 row(1, "0", "assistant", "final", "OK"),
@@ -347,7 +353,7 @@ mod tests {
                     2,
                     "2",
                     "user",
-                    "other",
+                    "prompt",
                     "What word did I ask you to remember?"
                 ),
                 row(
@@ -376,7 +382,7 @@ mod tests {
                     0,
                     "0",
                     "user",
-                    "other",
+                    "prompt",
                     "Run 'ls' and reply with the number of files."
                 ),
                 row(1, "0", "assistant", "other", "[tool_use run_command] ls"),
@@ -396,7 +402,7 @@ mod tests {
                     0,
                     "0",
                     "user",
-                    "other",
+                    "prompt",
                     "Run 'sleep 60' in the shell, then reply DONE."
                 ),
                 row(

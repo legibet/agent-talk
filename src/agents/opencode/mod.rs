@@ -13,9 +13,9 @@ mod transport;
 
 use self::transport::{Events, Service};
 use super::{
-    Agent, AgentStatus, ApprovalPolicy, Check, ListFilter, Operation, ReadPage, ReadRange,
-    SendRequest, StartRequest, WaitTarget, approval_policy, bounded, record, reject, resolve,
-    settle, wait_receipt,
+    Agent, AgentStatus, ApprovalPolicy, Boundary, Check, ListFilter, Operation, ReadPage,
+    ReadQuery, SendRequest, StartRequest, WaitTarget, approval_policy, bounded, cut, record,
+    reject, resolve, settle, wait_receipt,
 };
 use crate::model::{
     self, Approval, Error, ErrorCode, Message, Observations, Outcome, Page, ReceiptState, Result,
@@ -576,36 +576,46 @@ impl<'a> OpenCode<'a> {
         )
     }
 
-    /// Normalized messages of one OpenCode page, in the given (chronological) order.
-    /// `turn` is the user message id in force before the first message of the page.
-    fn messages(&self, page: &[Value], mut turn: Option<String>) -> Result<Vec<Message>> {
+    /// Normalized messages of OpenCode rows, oldest first, each with the index of its row.
+    /// `turn` is the user message id in force before the first row.
+    fn messages<'r>(
+        &self,
+        rows: impl Iterator<Item = &'r Value>,
+        mut turn: Option<String>,
+    ) -> Result<Vec<(usize, Message)>> {
         let mut out = Vec::new();
-        for m in page {
+        for (i, m) in rows.enumerate() {
             let id = text(&m["id"]).unwrap_or_default();
             let timestamp = ts(&m["time"]["created"]);
             match m["type"].as_str().unwrap_or_default() {
                 "user" => {
                     turn = Some(id.clone());
-                    out.push(Message {
-                        turn_id: id.clone(),
+                    out.push((
+                        i,
+                        Message {
+                            turn_id: id.clone(),
+                            item_id: id.clone(),
+                            role: "user",
+                            phase: "prompt",
+                            text: text(&m["text"]).unwrap_or_default(),
+                            from: self.store.sender_of(&id)?,
+                            timestamp,
+                        },
+                    ));
+                }
+                "synthetic" => out.push((
+                    i,
+                    Message {
+                        turn_id: turn.clone().unwrap_or_else(|| id.clone()),
                         item_id: id.clone(),
                         role: "user",
                         phase: "other",
-                        text: text(&m["text"]).unwrap_or_default(),
-                        from: self.store.sender_of(&id)?,
+                        text: format!("[synthetic] {}", text(&m["text"]).unwrap_or_default()),
+                        // Written by the service itself under its own id: no sender.
+                        from: None,
                         timestamp,
-                    });
-                }
-                "synthetic" => out.push(Message {
-                    turn_id: turn.clone().unwrap_or_else(|| id.clone()),
-                    item_id: id.clone(),
-                    role: "user",
-                    phase: "other",
-                    text: format!("[synthetic] {}", text(&m["text"]).unwrap_or_default()),
-                    // Written by the service itself under its own id: no sender.
-                    from: None,
-                    timestamp,
-                }),
+                    },
+                )),
                 "assistant" => {
                     let turn_id = turn.clone().unwrap_or_default();
                     let parts = m["content"]
@@ -614,47 +624,53 @@ impl<'a> OpenCode<'a> {
                         .unwrap_or_default();
                     let last_text = parts.iter().rposition(|p| p["type"] == "text");
                     let completed = ts(&m["time"]["completed"]).or(timestamp.clone());
-                    for (i, p) in parts.iter().enumerate() {
-                        let (phase, body) = match p["type"].as_str().unwrap_or_default() {
+                    for (p, part) in parts.iter().enumerate() {
+                        let (phase, body) = match part["type"].as_str().unwrap_or_default() {
                             "text" => (
-                                if m["finish"] == "stop" && Some(i) == last_text {
+                                if m["finish"] == "stop" && Some(p) == last_text {
                                     "final"
                                 } else {
                                     "commentary"
                                 },
-                                text(&p["text"]).unwrap_or_default(),
+                                text(&part["text"]).unwrap_or_default(),
                             ),
                             "tool" => (
                                 "other",
                                 format!(
                                     "[tool {}] {} {}",
-                                    p["name"].as_str().unwrap_or("?"),
-                                    p["state"]["status"].as_str().unwrap_or("?"),
-                                    p["state"]["input"]
+                                    part["name"].as_str().unwrap_or("?"),
+                                    part["state"]["status"].as_str().unwrap_or("?"),
+                                    part["state"]["input"]
                                 ),
                             ),
                             _ => continue,
                         };
-                        out.push(Message {
-                            turn_id: turn_id.clone(),
-                            item_id: format!("{id}#{i}"),
-                            role: "assistant",
-                            phase,
-                            text: body,
-                            from: None,
-                            timestamp: completed.clone(),
-                        });
+                        out.push((
+                            i,
+                            Message {
+                                turn_id: turn_id.clone(),
+                                item_id: format!("{id}#{p}"),
+                                role: "assistant",
+                                phase,
+                                text: body,
+                                from: None,
+                                timestamp: completed.clone(),
+                            },
+                        ));
                     }
                     if !m["error"].is_null() {
-                        out.push(Message {
-                            turn_id: turn_id.clone(),
-                            item_id: format!("{id}#error"),
-                            role: "assistant",
-                            phase: "other",
-                            text: format!("[error] {}", m["error"]),
-                            from: None,
-                            timestamp: completed,
-                        });
+                        out.push((
+                            i,
+                            Message {
+                                turn_id: turn_id.clone(),
+                                item_id: format!("{id}#error"),
+                                role: "assistant",
+                                phase: "other",
+                                text: format!("[error] {}", m["error"]),
+                                from: None,
+                                timestamp: completed,
+                            },
+                        ));
                     }
                 }
                 // Hidden: idle, system, compaction, skill, shell, {agent,model,location}-switched.
@@ -662,28 +678,6 @@ impl<'a> OpenCode<'a> {
             }
         }
         Ok(out)
-    }
-
-    /// `read --tail n`: `desc` holds the newest OpenCode rows, newest first. They are
-    /// over-fetched because idle markers are hidden and one assistant row can expand into
-    /// several messages, so the trim to the last `n` visible messages happens after
-    /// normalization. Returns the rows oldest first and the trimmed messages.
-    fn tail(
-        &self,
-        mut desc: Vec<Value>,
-        turn: Option<String>,
-        n: usize,
-    ) -> Result<(Vec<Value>, Vec<Message>)> {
-        desc.reverse();
-        let mut messages = self.messages(&desc, turn)?;
-        messages.drain(..messages.len().saturating_sub(n));
-        // Raw rows cover the same span: from the row of the first kept message on
-        // (part messages are `<row id>#<index>`).
-        let start = messages.first().map_or(desc.len(), |m| {
-            let row = m.item_id.split('#').next().unwrap_or_default();
-            desc.iter().position(|r| r["id"] == row).unwrap_or(0)
-        });
-        Ok((desc.split_off(start), messages))
     }
 }
 
@@ -852,58 +846,48 @@ impl Agent for OpenCode<'_> {
         self.submit(&svc, session_id, req, deadline).await
     }
 
-    async fn read(&self, session_id: &str, range: ReadRange) -> Result<ReadPage> {
+    async fn read(&self, session_id: &str, q: &ReadQuery) -> Result<ReadPage> {
         let svc = self.connect().await?;
-        let path = format!("/api/session/{session_id}/message");
-        let (raw, items, next_cursor) = match range {
-            ReadRange::Forward { since, limit } => {
-                let mut q = vec![("limit", limit.to_string())];
-                match &since {
-                    Some(c) => q.push(("cursor", c.clone())),
-                    None => q.push(("order", "asc".into())),
-                }
-                let mut page = svc.get(&path, &q).await?;
-                let rows = take_data(&mut page);
-                // An empty page carries null cursors; keep the caller's so polling can continue.
-                let next = if rows.is_empty() {
-                    since
-                } else {
-                    text(&page["cursor"]["next"])
-                };
-                let older = text(&page["cursor"]["previous"]);
-                let turn = turn_before(&svc, session_id, rows.first(), older.as_deref()).await?;
-                let items = self.messages(&rows, turn)?;
-                (rows, items, next)
-            }
-            ReadRange::Tail(n) => {
-                // Newest first, page by page, until the rows hold n visible messages.
-                let mut desc = Vec::new();
-                let mut count = 0;
-                let mut cursor: Option<String> = None;
-                // Cursor toward the rows older than everything fetched.
-                let mut older: Option<String> = None;
-                loop {
-                    let (rows, next) = svc.history(session_id, cursor.as_deref()).await?;
-                    if rows.is_empty() {
-                        break;
-                    }
-                    // Visibility does not depend on order or turn.
-                    count += self.messages(&rows, None)?.len();
-                    desc.extend(rows);
-                    older = next;
-                    match &older {
-                        Some(c) if count < n as usize => cursor = Some(c.clone()),
-                        _ => break,
-                    }
-                }
-                let turn = turn_before(&svc, session_id, desc.last(), older.as_deref()).await?;
-                let (rows, items) = self.tail(desc, turn, n as usize)?;
-                (rows, items, None)
+        let before = q.before.as_deref().map(Boundary::parse).transpose()?;
+        let local = ReadQuery {
+            limit: q.limit,
+            before: before.as_ref().map(|b| b.item.clone()),
+            all: q.all,
+        };
+        // Rows oldest first, each with the cursor its page was fetched with; pages come
+        // newest first until they hold the page asked for.
+        let mut fetch = before.and_then(|b| b.page);
+        let mut rows: Vec<(Option<String>, Value)> = Vec::new();
+        let older = loop {
+            let (page, next) = svc.history(session_id, fetch.as_deref()).await?;
+            rows.splice(0..0, page.into_iter().rev().map(|r| (fetch.clone(), r)));
+            // Which messages the page shows does not depend on their turn.
+            let messages = self.messages(rows.iter().map(|(_, r)| r), None)?;
+            let have = cut(&local, messages, rows.len(), next.is_some())?
+                .messages
+                .len();
+            match next {
+                Some(c) if have < q.limit => fetch = Some(c),
+                _ => break next,
             }
         };
+        let oldest = rows.first().map(|(_, r)| r);
+        let turn = turn_before(&svc, session_id, oldest, older.as_deref()).await?;
+        let messages = self.messages(rows.iter().map(|(_, r)| r), turn)?;
+        let cut = cut(&local, messages, rows.len(), older.is_some())?;
+        let next_cursor = cut.cursor_item().map(|(i, m)| {
+            Boundary {
+                item: m.item_id.clone(),
+                page: rows[*i].0.clone(),
+            }
+            .encode()
+        });
         Ok(ReadPage {
-            messages: Page { items, next_cursor },
-            raw,
+            messages: Page {
+                next_cursor,
+                items: cut.messages.into_iter().map(|(_, m)| m).collect(),
+            },
+            raw: rows.drain(cut.records).map(|(_, r)| r).collect(),
         })
     }
 
@@ -1064,7 +1048,7 @@ mod tests {
     fn messages_group_by_user_message_and_phase() {
         let store = Store::memory();
         let oc = OpenCode::new(&store);
-        let page = vec![
+        let page = [
             json!({"id":"msg_u1","time":{"created":1},"text":"slow","type":"user"}),
             json!({"id":"msg_a1","time":{"created":2,"completed":3},"type":"assistant","agent":"build","model":{"id":"m","providerID":"p"},
                 "finish":"tool-calls","content":[{"type":"reasoning","text":"hmm"},{"type":"tool","name":"shell","state":{"status":"completed","input":{"command":"sleep 1"}}}]}),
@@ -1073,50 +1057,30 @@ mod tests {
                 "finish":"stop","content":[{"type":"text","text":"working"},{"type":"text","text":"two"}]}),
             json!({"id":"msg_i","time":{"created":7},"type":"idle","outcome":"succeeded"}),
         ];
-        let m = oc.messages(&page, None).unwrap();
+        let m = oc.messages(page.iter(), None).unwrap();
         let brief: Vec<(&str, &str, &str, &str)> = m
             .iter()
-            .map(|m| (m.turn_id.as_str(), m.role, m.phase, m.text.as_str()))
+            .map(|(_, m)| (m.turn_id.as_str(), m.role, m.phase, m.text.as_str()))
             .collect();
         assert_eq!(
             brief,
             vec![
-                ("msg_u1", "user", "other", "slow"),
+                ("msg_u1", "user", "prompt", "slow"),
                 (
                     "msg_u1",
                     "assistant",
                     "other",
                     "[tool shell] completed {\"command\":\"sleep 1\"}"
                 ),
-                ("msg_u2", "user", "other", "two"),
+                ("msg_u2", "user", "prompt", "two"),
                 ("msg_u2", "assistant", "commentary", "working"),
                 ("msg_u2", "assistant", "final", "two"),
             ]
         );
         // A page starting mid-turn takes the turn id handed in.
-        let m = oc.messages(&page[1..2], Some("msg_u0".into())).unwrap();
-        assert_eq!(m[0].turn_id, "msg_u0");
-    }
-
-    /// `--tail` counts visible messages, not OpenCode rows (the hidden
-    /// idle marker was counted, so `--tail 2` printed only the assistant line).
-    #[test]
-    fn tail_counts_visible_messages() {
-        let store = Store::memory();
-        let oc = OpenCode::new(&store);
-        // Newest first, as `GET …/message?order=desc` returns it.
-        let desc = vec![
-            json!({"id":"msg_i2","time":{"created":7},"type":"idle","outcome":"succeeded"}),
-            json!({"id":"msg_a2","time":{"created":5,"completed":6},"type":"assistant","finish":"stop","content":[{"type":"text","text":"two"}]}),
-            json!({"id":"msg_u2","time":{"created":4},"text":"second","type":"user"}),
-            json!({"id":"msg_i1","time":{"created":3},"type":"idle","outcome":"succeeded"}),
-            json!({"id":"msg_a1","time":{"created":2,"completed":2},"type":"assistant","finish":"stop","content":[{"type":"text","text":"one"}]}),
-            json!({"id":"msg_u1","time":{"created":1},"text":"first","type":"user"}),
-        ];
-        let (rows, m) = oc.tail(desc, None, 2).unwrap();
-        // Raw rows start where the kept messages start.
-        assert_eq!(rows[0]["id"], "msg_u2");
-        let brief: Vec<(&str, &str)> = m.iter().map(|m| (m.role, m.text.as_str())).collect();
-        assert_eq!(brief, vec![("user", "second"), ("assistant", "two")]);
+        let m = oc
+            .messages(page[1..2].iter(), Some("msg_u0".into()))
+            .unwrap();
+        assert_eq!(m[0].1.turn_id, "msg_u0");
     }
 }

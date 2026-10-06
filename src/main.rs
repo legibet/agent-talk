@@ -4,7 +4,7 @@ mod model;
 mod ops;
 mod store;
 
-use agents::{ReadRange, WaitTarget};
+use agents::{ReadQuery, WaitTarget};
 use clap::{Args, Parser, Subcommand};
 use model::{Approval, Caller, CallerKind, Outcome, Receipt, Turn};
 use ops::{
@@ -46,7 +46,7 @@ struct WaitOpts {
     /// Wait for the turn that consumes this message to complete and print it. Its
     /// final_text is the reply to this message on Codex, Claude, Grok and Antigravity; on
     /// OpenCode it is the final reply of the execution that consumed it, which may also have
-    /// answered other messages queued meanwhile (read --tail shows the adjacent messages).
+    /// answered other messages queued meanwhile (read shows the adjacent messages).
     #[arg(long)]
     wait: bool,
     /// Seconds to wait with --wait.
@@ -125,20 +125,20 @@ enum Cmd {
         #[command(flatten)]
         sender: SenderOpts,
     },
-    /// Read messages, oldest first, one page per call.
+    /// Read a session's newest messages, oldest first.
     Read {
         handle: String,
-        /// Cursor from a previous page.
-        #[arg(long, conflicts_with = "tail")]
-        since: Option<String>,
-        /// Page size, oldest first (Codex: turns; OpenCode: message rows; Claude, Grok,
-        /// Antigravity: messages).
-        #[arg(long, default_value_t = ops::READ_LIMIT, conflicts_with = "tail")]
-        limit: u32,
-        /// The newest N messages instead, printed oldest first; no cursor.
+        /// Messages per page.
+        #[arg(long, default_value_t = ops::READ_LIMIT)]
+        limit: usize,
+        /// Cursor printed by a previous page, for the messages before it.
         #[arg(long)]
-        tail: Option<u32>,
-        /// Print the agent's raw records of the span instead of normalized messages.
+        cursor: Option<String>,
+        /// Every message, including intermediate text and tool calls; by default only what
+        /// was sent and the final replies.
+        #[arg(long)]
+        all: bool,
+        /// Print the agent's raw records of the span instead of messages.
         #[arg(long)]
         raw: bool,
     },
@@ -306,15 +306,16 @@ fn request(cmd: Cmd) -> model::Result<Request> {
         }),
         Cmd::Read {
             handle,
-            since,
             limit,
-            tail,
+            cursor,
+            all,
             raw,
         } => Request::Read(ReadArgs {
             handle,
-            range: match tail {
-                Some(n) => ReadRange::Tail(n),
-                None => ReadRange::Forward { since, limit },
+            query: ReadQuery {
+                limit,
+                before: cursor,
+                all,
             },
             raw,
         }),

@@ -305,7 +305,10 @@ pub struct Message {
     pub item_id: String,
     #[schemars(extend("enum" = ["user", "assistant"]))]
     pub role: &'static str,
-    #[schemars(extend("enum" = ["final", "commentary", "other"]))]
+    /// `prompt`: input a person or an agent sent; `final`: the reply that ended a turn;
+    /// `commentary`: text the agent wrote on the way; `other`: tool calls and results,
+    /// input the agent's runtime injected, interruptions and errors.
+    #[schemars(extend("enum" = ["prompt", "final", "commentary", "other"]))]
     pub phase: &'static str,
     pub text: String,
     /// User messages: the caller recorded for the intent that sent it, or

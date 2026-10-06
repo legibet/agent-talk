@@ -4,7 +4,7 @@
 //! so results are exactly what `--json` prints, and refusals are the CLI's error object
 //! returned as a tool error (`isError: true`), not a protocol error.
 
-use crate::agents::{ReadRange, WaitTarget};
+use crate::agents::{ReadQuery, WaitTarget};
 use crate::model::{self, Caller, Error, ErrorCode, Outcome};
 use crate::ops::{
     self, DEFAULT_TIMEOUT, LS_LIMIT, LsArgs, NewArgs, READ_LIMIT, Read, ReadArgs, Request,
@@ -111,13 +111,13 @@ struct SendParams {
 struct ReadParams {
     /// Session handle.
     handle: String,
-    /// The newest N messages (oldest first). Use this to see the latest exchange.
-    tail: Option<u32>,
-    /// `next_cursor` from a previous read, to page forward from the oldest messages.
-    since: Option<String>,
-    /// Page size when paging forward (default 20; Codex counts turns, OpenCode message rows,
-    /// Claude, Grok and Antigravity messages).
-    limit: Option<u32>,
+    /// Messages per page (default 20).
+    limit: Option<usize>,
+    /// `next_cursor` of a previous read, for the messages before that page.
+    cursor: Option<String>,
+    /// Every message, including intermediate text and tool calls; by default only what was
+    /// sent and the final replies.
+    all: Option<bool>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -291,22 +291,16 @@ impl Server {
         title = "Read history",
         output_schema = schema_for_type::<Read>(),
         annotations(read_only_hint = true, open_world_hint = false),
-        description = "Read the conversation of another agent session: user and assistant messages, oldest first, each with turn id and, for messages sent through agent-talk, who sent them (from). Use tail=N for the latest messages, or page forward from the start with since/limit."
+        description = "Read another agent session's conversation: its newest messages, oldest first, by default only what was sent to it and its final replies, each with its turn id and, for messages sent through agent-talk, who sent them (from). Pass next_cursor back as cursor for older messages; all=true includes intermediate text and tool calls."
     )]
     async fn read(&self, Parameters(p): Parameters<ReadParams>) -> CallToolResult {
-        let range = match p.tail {
-            Some(_) if p.since.is_some() || p.limit.is_some() => {
-                return invalid("pass tail, or since/limit, not both");
-            }
-            Some(n) => ReadRange::Tail(n),
-            None => ReadRange::Forward {
-                since: p.since,
-                limit: p.limit.unwrap_or(READ_LIMIT),
-            },
-        };
         self.exec(Request::Read(ReadArgs {
             handle: p.handle,
-            range,
+            query: ReadQuery {
+                limit: p.limit.unwrap_or(READ_LIMIT),
+                before: p.cursor,
+                all: p.all.unwrap_or(false),
+            },
             raw: false,
         }))
         .await

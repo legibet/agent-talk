@@ -20,8 +20,8 @@ mod updates;
 use self::acp::{Conn, Event, Reply, ServerRequest, Spawn};
 use self::updates::{History, first_prompt};
 use super::{
-    Agent, AgentStatus, ApprovalPolicy, Check, ListFilter, Operation, ReadPage, ReadRange,
-    SendRequest, StartRequest, WaitTarget, approval_policy, bounded, cli_version, first_line,
+    Agent, AgentStatus, ApprovalPolicy, Check, ListFilter, Operation, ReadPage, ReadQuery,
+    SendRequest, StartRequest, WaitTarget, approval_policy, bounded, cli_version, cut, first_line,
     full_access, lock, pid_alive, record, reject, settle, strip_provenance, wait_receipt,
 };
 use crate::model::{
@@ -1165,7 +1165,7 @@ impl Agent for Grok<'_> {
         res
     }
 
-    async fn read(&self, id: &str, range: ReadRange) -> Result<ReadPage> {
+    async fn read(&self, id: &str, q: &ReadQuery) -> Result<ReadPage> {
         check_id(id)?;
         let dir = self.require(id)?;
         let history = History::new(updates::load(&dir.join("updates.jsonl"))?);
@@ -1178,45 +1178,18 @@ impl Agent for Grok<'_> {
                 m.message.from = self.store.sender_of(p)?;
             }
         }
-        let (start, end) = match range {
-            ReadRange::Tail(n) => (messages.len().saturating_sub(n as usize), messages.len()),
-            ReadRange::Forward { since, limit } => {
-                let after: usize = match since {
-                    Some(c) => c.parse().map_err(|_| {
-                        Error::new(ErrorCode::Precondition, format!("invalid cursor {c}"))
-                    })?,
-                    None => 0,
-                };
-                let s = messages.partition_point(|m| m.no <= after);
-                (s, (s + limit as usize).min(messages.len()))
-            }
-        };
-        let more = end < messages.len();
-        let page: Vec<_> = messages.drain(start..end).collect();
-        let next_cursor = if more {
-            page.last().map(|m| m.no.to_string())
-        } else {
-            None
-        };
-        // Every line in the span (thoughts, tool updates, hooks included).
-        let first = page.first().map_or(usize::MAX, |m| m.no);
-        let last = if more {
-            page.last().map_or(0, |m| m.no)
-        } else {
-            usize::MAX
-        };
-        let raw = history
-            .lines
-            .iter()
-            .filter(|l| l.no >= first && l.no <= last)
-            .map(|l| l.raw.clone())
-            .collect();
+        let messages = messages.into_iter().map(|m| (m.line, m.message)).collect();
+        let cut = cut(q, messages, history.lines.len(), false)?;
         Ok(ReadPage {
             messages: Page {
-                items: page.into_iter().map(|m| m.message).collect(),
-                next_cursor,
+                next_cursor: cut.cursor_item().map(|(_, m)| m.item_id.clone()),
+                items: cut.messages.into_iter().map(|(_, m)| m).collect(),
             },
-            raw,
+            // Every line in the span (thoughts, tool updates, hooks included).
+            raw: history.lines[cut.records]
+                .iter()
+                .map(|l| l.raw.clone())
+                .collect(),
         })
     }
 

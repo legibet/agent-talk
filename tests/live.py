@@ -172,6 +172,19 @@ def native(handle: str) -> str:
     return handle.split(":", 1)[1]
 
 
+def paged(handle: str, limit: int) -> list[dict]:
+    """Every message of the session, oldest first, read `limit` at a time from the newest."""
+    messages, seen = [], set()
+    out = cli("read", handle, "--all", "--limit", str(limit))
+    while True:
+        messages = out["messages"] + messages
+        cur = out.get("next_cursor")
+        if not cur or cur in seen:
+            return messages
+        seen.add(cur)
+        out = cli("read", handle, "--all", "--limit", str(limit), "--cursor", cur)
+
+
 def check(agent: str, name: str, fn):
     label = f"{agent}/{name}"
     t0 = time.monotonic()
@@ -494,7 +507,7 @@ def codex_main():
         expect((out["receipt"].get("delivered_text") or "").startswith("[from codex:T1 "), "delivered_text header")
         expect(out["turn"]["turn_id"] != st["A_turn1"], "new turn id")
         expect("fig" in final(out), "final ~ fig")
-        out = cli("read", st["A"], "--tail", "2")
+        out = cli("read", st["A"], "--limit", "2")
         msgs = out["messages"]
         expect(len(msgs) == 2, "two messages")
         expect((msgs[0].get("from") or {}).get("session") == "codex:T1", "messages[0].from.session")
@@ -792,7 +805,7 @@ def claude_tier():
         model = run_init("claude", out["receipt"]["receipt_id"]).get("model")
         expect(model == st.get("S_model"), f"send runs new's model {st.get('S_model')}, got {model}")
         turn = out["receipt"]["turn_id"]
-        out = cli("read", st["S"], "--tail", "2")
+        out = cli("read", st["S"], "--limit", "2")
         m0 = out["messages"][0]
         expect(m0["turn_id"] == turn, "messages[0].turn_id == receipt.turn_id")
         expect((m0.get("from") or {}).get("session") == "codex:harness", "messages[0].from.session")
@@ -969,21 +982,13 @@ def opencode_tier():
 
     def p4():
         need("O")
-        tail = cli("read", st["O"], "--tail", "2")["messages"]
-        expect(len(tail) == 2 and tail[-1]["role"] == "assistant", "tail: 2 messages, last assistant")
-        full = cli("read", st["O"], "--limit", "100")["messages"]
-        paged, seen = [], set()
-        out = cli("read", st["O"], "--limit", "2")
-        while True:
-            paged += out["messages"]
-            cur = out.get("next_cursor")
-            if not cur or cur in seen:
-                break
-            seen.add(cur)
-            out = cli("read", st["O"], "--limit", "2", "--since", cur)
+        page = cli("read", st["O"], "--limit", "2")["messages"]
+        expect([m["phase"] for m in page] == ["prompt", "final"], "newest page: the prompt and the final reply")
+        full = cli("read", st["O"], "--all", "--limit", "100")["messages"]
+        pages = paged(st["O"], 2)
         expect(
-            [m["item_id"] for m in paged] == [m["item_id"] for m in full],
-            f"paged {len(paged)} items == full {len(full)} items",
+            [m["item_id"] for m in pages] == [m["item_id"] for m in full],
+            f"paged {len(pages)} items == full {len(full)} items",
         )
 
     def p5():
@@ -1099,7 +1104,7 @@ def opencode_tier():
         expect(not is_err, "isError false")
         expect(inner["from"].get("session") == "opencode:ses_harnesscaller", "from.session")
         expect("plum" in final(inner), "final ~ plum")
-        out = cli("read", st["O"], "--tail", "2")
+        out = cli("read", st["O"], "--limit", "2")
         user = next((x for x in out["messages"] if x["role"] == "user"), None)
         expect(user is not None, "user message in tail")
         expect((user.get("from") or {}).get("session") == "opencode:ses_harnesscaller", "user from.session")
@@ -1218,7 +1223,7 @@ def grok_tier():
         )
         expect("kiwi" in final(out), "final ~ kiwi")
         st["G_turn"], st["G_text"] = out["turn"]["turn_id"], out["turn"]["final_text"]
-        tail = cli("read", st["G"], "--tail", "2")["messages"]
+        tail = cli("read", st["G"], "--limit", "2")["messages"]
         expect(len(tail) == 2 and tail[0]["turn_id"] == st["G_turn"], "tail[0] is the kiwi prompt")
         expect((tail[0].get("from") or {}).get("session") == f"grok:{caller}", "tail[0].from.session")
         expect(tail[0]["text"].startswith(f"[from grok:{caller} "), "text starts with header")
@@ -1226,22 +1231,14 @@ def grok_tier():
 
     def g4():
         need("G")
-        full = cli("read", st["G"], "--limit", "1000")["messages"]
-        paged, seen = [], set()
-        out = cli("read", st["G"], "--limit", "2")
-        while True:
-            paged += out["messages"]
-            cur = out.get("next_cursor")
-            if not cur or cur in seen:
-                break
-            seen.add(cur)
-            out = cli("read", st["G"], "--limit", "2", "--since", cur)
+        full = cli("read", st["G"], "--all", "--limit", "1000")["messages"]
+        pages = paged(st["G"], 2)
         expect(
-            [m["item_id"] for m in paged] == [m["item_id"] for m in full],
-            f"paged {len(paged)} items == full {len(full)} items",
+            [m["item_id"] for m in pages] == [m["item_id"] for m in full],
+            f"paged {len(pages)} items == full {len(full)} items",
         )
         expect(len(full) >= 4, f"at least 4 messages, got {len(full)}")
-        raw = cli("read", st["G"], "--tail", "2", "--raw")["raw"]
+        raw = cli("read", st["G"], "--limit", "2", "--raw")["raw"]
         expect(raw and all("params" in line for line in raw), "--raw: updates.jsonl lines")
 
     def g5():
@@ -1442,7 +1439,7 @@ def antigravity_tier():
         turn = out["receipt"]["turn_id"]
         expect(turn and turn.isdigit(), "turn id is a step index")
         st["AG_turn"] = turn
-        tail = cli("read", st["AG"], "--tail", "3")["messages"]
+        tail = cli("read", st["AG"], "--limit", "3")["messages"]
         user = next((m for m in tail if m["role"] == "user" and m["turn_id"] == turn), None)
         expect(user is not None, "the user message is in the tail")
         expect((user.get("from") or {}).get("session") == f"antigravity:{caller}", "read: user from.session")
@@ -1460,21 +1457,11 @@ def antigravity_tier():
 
     def a4():
         need("AG")
-        full = cli("read", st["AG"], "--limit", "1000")["messages"]
-        tail = cli("read", st["AG"], "--tail", "2")["messages"]
-        expect([m["item_id"] for m in tail] == [m["item_id"] for m in full[-2:]], "tail 2 == last 2 of the full read")
-        paged, seen = [], set()
-        out = cli("read", st["AG"], "--limit", "3")
-        while True:
-            paged += out["messages"]
-            cur = out.get("next_cursor")
-            if not cur or cur in seen:
-                break
-            seen.add(cur)
-            out = cli("read", st["AG"], "--limit", "3", "--since", cur)
+        full = cli("read", st["AG"], "--all", "--limit", "1000")["messages"]
+        pages = paged(st["AG"], 3)
         expect(
-            [m["item_id"] for m in paged] == [m["item_id"] for m in full],
-            f"paged {len(paged)} items == full {len(full)} items",
+            [m["item_id"] for m in pages] == [m["item_id"] for m in full],
+            f"paged {len(pages)} items == full {len(full)} items",
         )
         raw = cli("read", st["AG"], "--raw", "--limit", "1000")
         expect(

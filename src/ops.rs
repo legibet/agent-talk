@@ -2,7 +2,7 @@
 //! provenance header, hop limit, agent dispatch, typed output.
 
 use crate::agents::{
-    Adapter, Agent, AgentStatus, ListFilter, ReadRange, SendRequest, StartRequest, WaitTarget,
+    Adapter, Agent, AgentStatus, ListFilter, ReadQuery, SendRequest, StartRequest, WaitTarget,
     delivered,
 };
 use crate::model::{Caller, Error, ErrorCode, Message, Outcome, Result, Session};
@@ -20,7 +20,7 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
 /// Agent-to-agent hops allowed before a message is refused (DESIGN.md §4).
 pub const MAX_HOPS: u32 = 3;
 pub const LS_LIMIT: u32 = 25;
-pub const READ_LIMIT: u32 = 20;
+pub const READ_LIMIT: usize = 20;
 
 pub enum Request {
     /// `sender` is who this shell's `new` and `send` would be attributed to.
@@ -71,7 +71,7 @@ pub struct SendArgs {
 
 pub struct ReadArgs {
     pub handle: String,
-    pub range: ReadRange,
+    pub query: ReadQuery,
     /// The agent's raw records instead of normalized messages.
     pub raw: bool,
 }
@@ -116,7 +116,7 @@ pub struct ListError {
 #[derive(Serialize, JsonSchema)]
 pub struct Read {
     pub handle: String,
-    /// Cursor of the next page when paging forward; absent for `--tail`.
+    /// Cursor of the page of older messages; absent at the start of history.
     pub next_cursor: Option<String>,
     /// Normalized messages (absent with `--raw`).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -224,7 +224,7 @@ async fn send(store: &Store, a: SendArgs) -> Result<Output> {
 
 async fn read(store: &Store, a: ReadArgs) -> Result<Output> {
     let (name, id) = split_handle(&a.handle)?;
-    let page = Adapter::named(store, name)?.read(id, a.range).await?;
+    let page = Adapter::named(store, name)?.read(id, &a.query).await?;
     Ok(Output::Read(Read {
         handle: a.handle,
         next_cursor: page.messages.next_cursor,

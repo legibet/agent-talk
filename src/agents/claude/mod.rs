@@ -21,9 +21,9 @@ use self::process::{AgentEntry, agents};
 use self::stream::{Run, StreamEvent, System, denial, result_turn};
 use self::transcript::{TurnEnd, head, live_branch, load, slug, transcript_turn, turn_end};
 use super::{
-    Agent, AgentStatus, ApprovalPolicy, Check, ListFilter, Operation, ReadPage, ReadRange,
-    SendRequest, StartRequest, WaitTarget, approval_policy, bounded, cli_version, first_line, lock,
-    pid_alive, record, settle, tail, wait_receipt,
+    Agent, AgentStatus, ApprovalPolicy, Check, ListFilter, Operation, ReadPage, ReadQuery,
+    SendRequest, StartRequest, WaitTarget, approval_policy, bounded, cli_version, cut, first_line,
+    lock, pid_alive, record, settle, tail, wait_receipt,
 };
 use crate::model::{
     self, AgentError, Approval, Error, ErrorCode, Observations, Outcome, Page, ReceiptState,
@@ -672,7 +672,7 @@ impl Agent for Claude<'_> {
             .await
     }
 
-    async fn read(&self, id: &str, range: ReadRange) -> Result<ReadPage> {
+    async fn read(&self, id: &str, q: &ReadQuery) -> Result<ReadPage> {
         check_id(id)?;
         let entries = load(&self.require_transcript(id)?)?;
         let branch = live_branch(&entries);
@@ -683,50 +683,14 @@ impl Agent for Claude<'_> {
                 m.from = self.store.sender_of(&m.item_id)?;
             }
         }
-        let (start_msg, end_msg, start_line) = match range {
-            ReadRange::Tail(n) => {
-                let s = messages.len().saturating_sub(n as usize);
-                let line = messages.get(s).map_or(entries.len(), |(i, _)| *i);
-                (s, messages.len(), line)
-            }
-            ReadRange::Forward { since: None, limit } => {
-                (0, (limit as usize).min(messages.len()), 0)
-            }
-            ReadRange::Forward {
-                since: Some(c),
-                limit,
-            } => {
-                let line = entries
-                    .iter()
-                    .position(|e| e.uuid() == Some(c.as_str()))
-                    .ok_or_else(|| {
-                        Error::new(ErrorCode::Precondition, format!("unknown cursor {c}"))
-                    })?;
-                let s = messages.partition_point(|(i, _)| *i <= line);
-                (s, (s + limit as usize).min(messages.len()), line + 1)
-            }
-        };
-        let more = end_msg < messages.len();
-        let page: Vec<_> = messages.drain(start_msg..end_msg).collect();
-        let end_line = match (more, page.last()) {
-            (true, Some((i, _))) => i + 1,
-            _ => entries.len(),
-        };
-        let next_cursor = if more {
-            page.last().map(|(_, m)| m.item_id.clone())
-        } else {
-            None
-        };
+        let cut = cut(q, messages, entries.len(), false)?;
         Ok(ReadPage {
             messages: Page {
-                items: page.into_iter().map(|(_, m)| m).collect(),
-                next_cursor,
+                next_cursor: cut.cursor_item().map(|(_, m)| m.item_id.clone()),
+                items: cut.messages.into_iter().map(|(_, m)| m).collect(),
             },
             // Every line in the span, orphaned branches and sub-agent lines included.
-            raw: entries[start_line..end_line]
-                .iter()
-                .map(|e| e.raw.clone())
-                .collect(),
+            raw: entries[cut.records].iter().map(|e| e.raw.clone()).collect(),
         })
     }
 

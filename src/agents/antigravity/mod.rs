@@ -27,8 +27,8 @@ use self::transcript::{
     ends_with_reply, load, messages, preview, span_reply, turn_span, user_input,
 };
 use super::{
-    Agent, AgentStatus, Check, ListFilter, Operation, ReadPage, ReadRange, SendRequest,
-    StartRequest, WaitTarget, bounded, cli_version, lock, pid_alive, record, settle, tail,
+    Agent, AgentStatus, Check, ListFilter, Operation, ReadPage, ReadQuery, SendRequest,
+    StartRequest, WaitTarget, bounded, cli_version, cut, lock, pid_alive, record, settle, tail,
     wait_receipt,
 };
 use crate::model::{
@@ -712,7 +712,7 @@ impl Agent for Antigravity<'_> {
             .await
     }
 
-    async fn read(&self, id: &str, range: ReadRange) -> Result<ReadPage> {
+    async fn read(&self, id: &str, q: &ReadQuery) -> Result<ReadPage> {
         check_id(id)?;
         self.require_conversation(id)?;
         let h = handle(id);
@@ -723,59 +723,13 @@ impl Agent for Antigravity<'_> {
                 m.from = self.store.sender_by_turn(&h, &m.turn_id)?;
             }
         }
-        let (start_msg, end_msg, start_line) = match range {
-            ReadRange::Tail(n) => {
-                let s = messages.len().saturating_sub(n as usize);
-                let line = messages.get(s).map_or(lines.len(), |(i, _)| *i);
-                (s, messages.len(), line)
-            }
-            ReadRange::Forward { since: None, limit } => {
-                (0, (limit as usize).min(messages.len()), 0)
-            }
-            ReadRange::Forward {
-                since: Some(c),
-                limit,
-            } => {
-                let line: usize = c.parse().map_err(|_| {
-                    Error::new(
-                        ErrorCode::Precondition,
-                        format!("invalid cursor {c}; expected a transcript line position"),
-                    )
-                })?;
-                let s = messages.partition_point(|(i, _)| *i <= line);
-                (s, (s + limit as usize).min(messages.len()), line + 1)
-            }
-        };
-        // A planner response with text and tool calls yields two messages from one line;
-        // the cursor is a line, so a page never ends between them.
-        let mut end_msg = end_msg;
-        while end_msg > start_msg
-            && end_msg < messages.len()
-            && messages[end_msg].0 == messages[end_msg - 1].0
-        {
-            end_msg += 1;
-        }
-        let more = end_msg < messages.len();
-        let page: Vec<_> = messages.drain(start_msg..end_msg).collect();
-        // An empty page (`--limit 0`) with more left gets no cursor (it would skip the
-        // rest) and no raw lines.
-        let end_line = match (more, page.last()) {
-            (true, Some((i, _))) => i + 1,
-            (true, None) => start_line.min(lines.len()),
-            (false, _) => lines.len(),
-        };
-        let next_cursor = more
-            .then(|| page.last().map(|(i, _)| i.to_string()))
-            .flatten();
+        let cut = cut(q, messages, lines.len(), false)?;
         Ok(ReadPage {
             messages: Page {
-                items: page.into_iter().map(|(_, m)| m).collect(),
-                next_cursor,
+                next_cursor: cut.cursor_item().map(|(_, m)| m.item_id.clone()),
+                items: cut.messages.into_iter().map(|(_, m)| m).collect(),
             },
-            raw: lines[start_line.min(lines.len())..end_line]
-                .iter()
-                .map(|l| l.raw.clone())
-                .collect(),
+            raw: lines[cut.records].iter().map(|l| l.raw.clone()).collect(),
         })
     }
 

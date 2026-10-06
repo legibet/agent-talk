@@ -126,7 +126,7 @@ standalone `codex exec` or `--no-daemon` run. agent-talk proceeds through the da
 ```
 session  { handle, agent, id, cwd?, name?, preview?, observations, state: idle|running|waiting|unknown, owned }
 turn     { handle, turn_id, status: completed|failed|interrupted|unknown, final_text?, error?, duration_ms?, basis? }
-message  { turn_id, item_id, role: user|assistant, phase: final|commentary|other, text, from?, timestamp? }
+message  { turn_id, item_id, role: user|assistant, phase: prompt|final|commentary|other, text, from?, timestamp? }
 approval { handle, turn_id?, item_id?, request_id, kind, summary, outcome: pending|declined|resolved|denied, raw }
 receipt  { receipt_id, handle, client_msg_id, state, queue_id?, turn_id?, item_id?, agent_error?, delivered_text? }
 caller   { kind: agent|unknown|runtime, session?, turn? }
@@ -239,7 +239,7 @@ agent-talk ls [--agent A] [--cwd DIR] [--all] [--limit N] [--cursor C]
 agent-talk new A "prompt" [--cwd DIR] [--name N] [--model M] [--effort E] [--full-access]
     [--wait] [--timeout S] [--from H]
 agent-talk send H "text" [--steer] [--wait] [--timeout S] [--from H]
-agent-talk read H [--tail N | --since CURSOR [--limit N]] [--raw]
+agent-talk read H [--limit N] [--cursor C] [--all] [--raw]
 agent-talk wait H (--turn ID | --receipt R) [--timeout S]
 agent-talk mcp [--caller H]
 ```
@@ -266,9 +266,12 @@ agent-talk mcp [--caller H]
   OpenCode `title`, Grok `_x.ai/session/rename`; Antigravity has no interface outside the TUI and
   refuses). agent-talk keeps no copy. `ls` shows `name` and strips the provenance header from
   `preview`, so a session an agent created is recognizable without reading its history.
-- `read --raw` prints the agent's records of the span instead of messages. `read` shows each tool
-  call as one `other` message (`[tool name] status input`), the one place normalization goes past
-  text, because an agent reading a session must see that tools ran.
+- `read` returns the newest N messages, oldest first, and `next_cursor` names the page of older
+  ones. By default a message is a `prompt` (what a person or an agent sent) or a `final` reply, so
+  a page is the conversation itself; `--all` adds `commentary` and `other` messages, each tool call
+  being one `other` message (`[tool name] status input`), the one place normalization goes past
+  text. N counts the messages returned, on every agent. `--raw` prints the agent's records of the
+  span instead.
 - `ls` without `--agent` returns every agent's first page; a failing agent is reported
   in `errors` and does not hide the others.
 
@@ -720,8 +723,8 @@ servers are configured globally only.
 - **Turn ids come from the agent or from agent-talk's own client id**, never from matching text:
   Codex turn id, Claude user-line uuid, OpenCode user message id, Grok `promptId`, Antigravity
   `USER_INPUT` step index (§6).
-- **History is paged to the answer.** `read --tail N` and turn attribution follow the agent's
-  cursor until the rows are found or history ends. The only fixed caps are the 40 pages an
+- **History is paged to the answer.** `read` and turn attribution follow the agent's cursor,
+  newest first, until the page is full, the rows are found or history ends. The only fixed caps are the 40 pages an
   OpenCode turn lookup searches (older messages report absent) and the ten Codex resume retries.
 - **Shared lifecycle, separate observe loops.** Receipt and approval handling lives once; a generic
   event-loop driver would hide genuinely different end-of-turn authorities behind mode flags.

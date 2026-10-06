@@ -19,7 +19,7 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 pub struct Line {
-    /// 1-based line number in the file; the read cursor.
+    /// 1-based line number in the file, the item id.
     pub no: usize,
     pub raw: Value,
 }
@@ -179,10 +179,10 @@ impl History {
                         .or(c["text"].as_str())
                         .unwrap_or("");
                     out.push(Msg {
-                        no: l.no,
+                        line: i,
                         span,
                         prompt: opens_turn(&l.raw),
-                        message: message("user", "other", text.to_string()),
+                        message: message("user", "prompt", text.to_string()),
                     });
                 }
                 "agent_message_chunk" => {
@@ -195,7 +195,7 @@ impl History {
                     match out.last_mut() {
                         Some(m) if extends => m.message.text.push_str(text),
                         _ => out.push(Msg {
-                            no: l.no,
+                            line: i,
                             span,
                             prompt: false,
                             message: message("assistant", "commentary", text.to_string()),
@@ -226,7 +226,7 @@ impl History {
                     .unwrap_or_default();
                     let status = u["status"].as_str().unwrap_or("pending");
                     out.push(Msg {
-                        no: l.no,
+                        line: i,
                         span,
                         prompt: false,
                         message: message("assistant", "other", tool_text(&name, status, &detail)),
@@ -278,7 +278,8 @@ impl History {
 }
 
 pub struct Msg {
-    pub no: usize,
+    /// Index of the line it came from.
+    pub line: usize,
     pub span: Option<usize>,
     /// The user prompt that opened the turn (not a steer message).
     pub prompt: bool,
@@ -382,15 +383,15 @@ mod tests {
         assert_eq!(
             texts(&h),
             [
-                (a.into(), "other", "Run this shell command: for i in 1 2 3 4 5 6 7 8; do echo $i; sleep 2; done . Then reply with exactly DONE-A.".into()),
+                (a.into(), "prompt", "Run this shell command: for i in 1 2 3 4 5 6 7 8; do echo $i; sleep 2; done . Then reply with exactly DONE-A.".into()),
                 (a.into(), "commentary", "I'll run the loop, then reply with exactly DONE-A.".into()),
                 (a.into(), "other", "[run_terminal_command] pending for i in 1 2 3 4 5 6 7 8; do echo $i; sleep 2; done".into()),
-                (b.into(), "other", "Reply with exactly DONE-B.".into()),
+                (b.into(), "prompt", "Reply with exactly DONE-B.".into()),
                 (b.into(), "final", "DONE-B".into()),
                 (a.into(), "final", "DONE-A".into()),
             ]
         );
-        assert_eq!(m[0].no, 1);
+        assert_eq!(m[0].line, 0);
         assert!(m[0].prompt && !m[1].prompt);
     }
 
@@ -433,7 +434,7 @@ mod tests {
             m[2],
             (
                 id.clone(),
-                "other",
+                "prompt",
                 "Also append the word CHERRY to your final reply.".into()
             )
         );

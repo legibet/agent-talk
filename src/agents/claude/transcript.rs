@@ -467,7 +467,8 @@ fn to_message(line: &Line, turn_id: &str, item_id: &str) -> Option<Message> {
     let (role, phase, text) = match line.kind.as_str() {
         "user" if body.tool_result_only() => ("user", "other", tool_result_summary(body)),
         "user" if line.is_interrupt() => ("user", "other", "[interrupted]".to_string()),
-        "user" => ("user", "other", body.text()),
+        "user" if line.is_runtime() => ("user", "other", body.text()),
+        "user" => ("user", "prompt", body.text()),
         "assistant" => {
             let text = body.text();
             if !text.is_empty() {
@@ -627,7 +628,7 @@ mod tests {
         let user = line(USER_LINE);
         assert!(user.is_prompt());
         let m = to_message(&user, "t", "fd2165bd-f040-4bc7-95d7-79241d222fbb").unwrap();
-        assert_eq!((m.role, m.phase), ("user", "other"));
+        assert_eq!((m.role, m.phase), ("user", "prompt"));
         assert_eq!(m.text, "Reply with the single word pong.");
 
         let tool = line(TOOL_RESULT_LINE);

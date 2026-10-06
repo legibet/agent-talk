@@ -6,9 +6,9 @@ pub mod transport;
 use self::protocol::*;
 use self::transport::{Conn, Event, ServerRequest, decode};
 use super::{
-    Agent, AgentStatus, ApprovalPolicy, Check, ListFilter, Operation, ReadPage, ReadRange,
-    SendRequest, StartRequest, WaitTarget, approval_policy, bounded, cli_version, full_access,
-    record, reject, resolve, settle, strip_provenance, wait_receipt,
+    Agent, AgentStatus, ApprovalPolicy, Boundary, Check, ListFilter, Operation, ReadPage,
+    ReadQuery, SendRequest, StartRequest, WaitTarget, approval_policy, bounded, cli_version, cut,
+    full_access, record, reject, resolve, settle, strip_provenance, wait_receipt,
 };
 use crate::model::{
     self, Approval, Error, ErrorCode, Message, Observations, Outcome, Page, Result, Session,
@@ -424,8 +424,11 @@ impl<'a> Codex<'a> {
         }
     }
 
-    /// Normalized messages of Codex turns (full items), in the given order.
-    fn messages(&self, turns: &[Value]) -> Result<Vec<Message>> {
+    /// Normalized messages of Codex turns (full items), each with the index of its turn.
+    fn messages<'t>(
+        &self,
+        turns: impl Iterator<Item = &'t Value>,
+    ) -> Result<Vec<(usize, Message)>> {
         let at = |turn: &Value, key: &str| {
             turn[key]
                 .as_i64()
@@ -433,14 +436,14 @@ impl<'a> Codex<'a> {
                 .map(|t| t.to_string())
         };
         let mut messages = Vec::new();
-        for turn in turns {
+        for (i, turn) in turns.enumerate() {
             let turn_id = turn["id"].as_str().unwrap_or_default();
             for item in turn["items"].as_array().into_iter().flatten() {
                 let message = match Item::parse(item) {
                     Item::User(u) => Message {
                         turn_id: turn_id.into(),
                         role: "user",
-                        phase: "other",
+                        phase: "prompt",
                         text: u.text(),
                         from: match &u.client_id {
                             Some(c) => self.store.sender_of(c)?,
@@ -464,7 +467,7 @@ impl<'a> Codex<'a> {
                     },
                     Item::Other => continue,
                 };
-                messages.push(message);
+                messages.push((i, message));
             }
         }
         Ok(messages)
@@ -849,62 +852,54 @@ impl Agent for Codex<'_> {
         self.finish(conn, res, Some(&receipt_id), w, progress).await
     }
 
-    async fn read(&self, thread_id: &str, range: ReadRange) -> Result<ReadPage> {
+    async fn read(&self, thread_id: &str, q: &ReadQuery) -> Result<ReadPage> {
         let conn = self.connect().await?;
-        let call = |cursor: Option<String>, limit: u32, sort_direction: &'static str| {
-            let conn = &conn;
-            async move {
-                let mut params = json!({
-                    "threadId": thread_id,
-                    "limit": limit,
-                    "sortDirection": sort_direction,
-                    "itemsView": "full",
-                });
-                if let Some(c) = cursor {
-                    params["cursor"] = json!(c);
-                }
-                conn.call::<TurnsPage>("thread/turns/list", params).await
-            }
+        let before = q.before.as_deref().map(Boundary::parse).transpose()?;
+        let local = ReadQuery {
+            limit: q.limit,
+            before: before.as_ref().map(|b| b.item.clone()),
+            all: q.all,
         };
-        let (turns, messages, next_cursor) = match range {
-            ReadRange::Forward { since, limit } => {
-                let page = call(since, limit, "asc").await?;
-                let messages = self.messages(&page.data)?;
-                (page.data, messages, page.next_cursor)
+        // Turns oldest first, each with the cursor its page was fetched with; pages come
+        // newest first until they hold the page asked for.
+        let mut fetch = before.and_then(|b| b.page);
+        let mut turns: Vec<(Option<String>, Value)> = Vec::new();
+        let cut = loop {
+            let mut params = json!({
+                "threadId": thread_id,
+                "limit": 20,
+                "sortDirection": "desc",
+                "itemsView": "full",
+            });
+            if let Some(c) = &fetch {
+                params["cursor"] = json!(c);
             }
-            ReadRange::Tail(n) => {
-                // Newest turns first until they hold n messages, then back to oldest first.
-                let mut turns = Vec::new();
-                let mut count = 0;
-                let mut cursor = None;
-                loop {
-                    let page = call(cursor, 20, "desc").await?;
-                    count += self.messages(&page.data)?.len();
-                    turns.extend(page.data);
-                    match page.next_cursor {
-                        Some(c) if count < n as usize => cursor = Some(c),
-                        _ => break,
-                    }
-                }
-                turns.reverse();
-                let mut messages = self.messages(&turns)?;
-                let skip = messages.len().saturating_sub(n as usize);
-                messages.drain(..skip);
-                let first_turn = messages.first().map(|m| m.turn_id.clone());
-                let start = turns
-                    .iter()
-                    .position(|t| t["id"].as_str() == first_turn.as_deref())
-                    .unwrap_or(turns.len());
-                (turns.split_off(start), messages, None)
+            let page = conn.call::<TurnsPage>("thread/turns/list", params).await?;
+            turns.splice(
+                0..0,
+                page.data.into_iter().rev().map(|t| (fetch.clone(), t)),
+            );
+            let messages = self.messages(turns.iter().map(|(_, t)| t))?;
+            let cut = cut(&local, messages, turns.len(), page.next_cursor.is_some())?;
+            match page.next_cursor {
+                Some(c) if cut.messages.len() < q.limit => fetch = Some(c),
+                _ => break cut,
             }
         };
         conn.close().await;
+        let next_cursor = cut.cursor_item().map(|(i, m)| {
+            Boundary {
+                item: m.item_id.clone(),
+                page: turns[*i].0.clone(),
+            }
+            .encode()
+        });
         Ok(ReadPage {
             messages: Page {
-                items: messages,
                 next_cursor,
+                items: cut.messages.into_iter().map(|(_, m)| m).collect(),
             },
-            raw: turns,
+            raw: turns.drain(cut.records).map(|(_, t)| t).collect(),
         })
     }
 
