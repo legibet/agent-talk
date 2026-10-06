@@ -40,7 +40,7 @@ one itself.
 
 ```sh
 agent-talk ls --cwd .
-agent-talk new claude --cwd . --wait "list the failing tests"
+agent-talk new claude --wait "list the failing tests"
 agent-talk send codex:<thread id> --wait "what are you working on?"
 agent-talk read opencode:<session id> --tail 4
 agent-talk wait codex:<thread id> --receipt <receipt id>
@@ -49,14 +49,15 @@ agent-talk caps
 
 Each session is identified by a handle such as `codex:<thread id>`, which `ls` and `new` print.
 Every command accepts `--json` for machine-readable output. By default, `send` queues the message
-to run after the current reply. `--mode steer` adds the message to the running turn instead.
+to run after the current reply. `--steer` adds the message to the running turn instead.
 Steering works on Codex, on OpenCode and on Grok CLI through the leader, and it is refused when the
 session is idle.
 
 When an agent sends a message to another agent, agent-talk adds the first line
-`[from <handle> via agent-talk]` so that the receiving agent can see who sent it. The handle is
-not verified. To prevent agents from forwarding messages to each other indefinitely, agent-talk
-refuses a send whose reply chain is longer than `--max-hops` (3 by default) with the error
+`[from <handle> via agent-talk; answer in your final response]`, so that the receiving agent can
+see who sent it and answers in its final response, which the sender reads with `send --wait`,
+`wait` or `read`. The handle is not verified. To keep agents from messaging each other without end,
+agent-talk refuses a message more than three hops down an agent-to-agent chain with the error
 `E_MAX_HOPS`.
 
 A session started with `agent-talk new` runs under the agent's own permission settings, and

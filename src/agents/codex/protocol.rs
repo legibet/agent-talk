@@ -127,7 +127,7 @@ pub struct ThreadQueueStartResponse {
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadListResponse {
-    pub data: Vec<Value>,
+    pub data: Vec<Thread>,
     #[serde(default)]
     pub next_cursor: Option<String>,
 }

@@ -15,7 +15,6 @@ CREATE TABLE IF NOT EXISTS intents (
     client_msg_id TEXT NOT NULL UNIQUE,
     text          TEXT NOT NULL,
     "from"        TEXT,                       -- JSON model::Caller
-    reply_to      TEXT,
     depth         INTEGER NOT NULL DEFAULT 0, -- hop depth, see Store::hop_depth
     delivered_text TEXT,                      -- what reached the agent, when not `text`
     created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
@@ -70,7 +69,6 @@ pub struct NewIntent<'a> {
     pub client_msg_id: &'a str,
     pub text: &'a str,
     pub from: &'a Caller,
-    pub reply_to: Option<&'a str>,
     pub depth: u32,
     /// Set when the agent got something other than `text` (the provenance header).
     pub delivered_text: Option<&'a str>,
@@ -121,16 +119,15 @@ impl Store {
     pub fn insert_intent(&self, i: &NewIntent) -> Result<()> {
         let tx = self.db.unchecked_transaction()?;
         tx.execute(
-            r#"INSERT INTO intents (receipt_id, handle, client_msg_id, text, "from", reply_to, depth,
+            r#"INSERT INTO intents (receipt_id, handle, client_msg_id, text, "from", depth,
                                     delivered_text)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"#,
             params![
                 i.receipt_id,
                 i.handle,
                 i.client_msg_id,
                 i.text,
                 serde_json::to_string(i.from).unwrap(),
-                i.reply_to,
                 i.depth,
                 i.delivered_text
             ],
@@ -231,34 +228,18 @@ impl Store {
     }
 
     /// Hop depth for a new intent sent by `from`, and how it was derived:
-    /// - with `reply_to`: 1 + the depth of the intent it names (a receipt, turn, item or
-    ///   client message id; an unknown id counts as depth 0);
-    /// - else, from an agent: 1 + the depth of the intent that started the caller's turn
-    ///   when the caller's turn id is known and recorded, else of the newest intent
-    ///   delivered to the caller's own session, the message it is presumably acting on
-    ///   (none recorded: 0);
-    /// - else (unknown caller, no `reply_to`): 0.
-    pub fn hop_depth(&self, from: &Caller, reply_to: Option<&str>) -> Result<(u32, String)> {
-        if let Some(r) = reply_to {
-            let parent: Option<u32> = self.db.query_row(
-                "SELECT MAX(i.depth) FROM intents i JOIN receipts r USING (receipt_id)
-                 WHERE i.receipt_id = ?1 OR i.client_msg_id = ?1 OR r.turn_id = ?1 OR r.item_id = ?1",
-                params![r],
-                |row| row.get(0),
-            )?;
-            let basis = match parent {
-                Some(d) => format!("reply_to {r} has depth {d}"),
-                None => format!("reply_to {r} names no recorded message (depth 0)"),
-            };
-            return Ok((parent.unwrap_or(0) + 1, basis));
-        }
+    /// - from an agent: 1 + the depth of the intent that started the caller's turn when the
+    ///   caller's turn id is known and recorded, else of the newest intent delivered to the
+    ///   caller's own session, the message it is presumably acting on (none recorded: 0);
+    /// - else (a person or an unknown caller): 0.
+    pub fn hop_depth(&self, from: &Caller) -> Result<(u32, String)> {
         let Caller {
             kind: CallerKind::Agent,
             session: Some(session),
             turn,
         } = from
         else {
-            return Ok((0, "no reply_to and no agent caller".into()));
+            return Ok((0, "the sender is not an agent".into()));
         };
         if let Some(t) = turn {
             let parent: Option<u32> = self.db.query_row(
@@ -415,15 +396,14 @@ impl Store {
 mod tests {
     use super::*;
 
-    fn intent(s: &Store, id: &str, handle: &str, from: &Caller, reply_to: Option<&str>) -> u32 {
-        let (depth, _) = s.hop_depth(from, reply_to).unwrap();
+    fn intent(s: &Store, id: &str, handle: &str, from: &Caller) -> u32 {
+        let (depth, _) = s.hop_depth(from).unwrap();
         s.insert_intent(&NewIntent {
             receipt_id: id,
             handle,
             client_msg_id: &format!("c-{id}"),
             text: "x",
             from,
-            reply_to,
             depth,
             delivered_text: None,
         })
@@ -432,45 +412,39 @@ mod tests {
     }
 
     #[test]
-    fn hop_depth_follows_reply_to_and_agent_callers() {
+    fn hop_depth_follows_agent_callers() {
         let s = Store::memory();
         let a = Caller::agent("claude:a");
         let b = Caller::agent("codex:b");
         // A person starts claude:a; claude:a asks codex:b; codex:b answers claude:a; …
-        assert_eq!(intent(&s, "r0", "claude:a", &Caller::UNKNOWN, None), 0);
-        assert_eq!(intent(&s, "r1", "codex:b", &a, None), 1);
-        assert_eq!(intent(&s, "r2", "claude:a", &b, None), 2);
-        assert_eq!(intent(&s, "r3", "codex:b", &a, None), 3);
-        // Explicit reply_to wins over the caller's newest message.
-        assert_eq!(intent(&s, "r4", "codex:b", &a, Some("r0")), 1);
-        // Turn ids recorded on receipts name the intent too.
-        s.accept("r3", None, Some("turn-3"), None).unwrap();
-        assert_eq!(s.hop_depth(&Caller::UNKNOWN, Some("turn-3")).unwrap().0, 4);
-        // Unknown reply_to and an agent with nothing delivered to it: depth 1.
-        assert_eq!(s.hop_depth(&Caller::UNKNOWN, Some("nope")).unwrap().0, 1);
-        assert_eq!(s.hop_depth(&Caller::agent("codex:z"), None).unwrap().0, 1);
+        assert_eq!(intent(&s, "r0", "claude:a", &Caller::UNKNOWN), 0);
+        assert_eq!(intent(&s, "r1", "codex:b", &a), 1);
+        assert_eq!(intent(&s, "r2", "claude:a", &b), 2);
+        assert_eq!(intent(&s, "r3", "codex:b", &a), 3);
+        // An agent with nothing delivered to it: depth 1.
+        assert_eq!(s.hop_depth(&Caller::agent("codex:z")).unwrap().0, 1);
         // A known caller turn picks the intent that started that turn, not the newest.
         s.accept("r1", None, Some("turn-1"), None).unwrap();
         let in_turn_1 = Caller {
             turn: Some("turn-1".into()),
             ..b.clone()
         };
-        assert_eq!(s.hop_depth(&in_turn_1, None).unwrap().0, 2);
+        assert_eq!(s.hop_depth(&in_turn_1).unwrap().0, 2);
         let unknown_turn = Caller {
             turn: Some("nope".into()),
             ..b.clone()
         };
-        assert_eq!(s.hop_depth(&unknown_turn, None).unwrap().0, 2);
+        assert_eq!(s.hop_depth(&unknown_turn).unwrap().0, 4);
         // Rejected intents are not what the caller is acting on.
-        s.settle_unaccepted("r4", ReceiptState::Rejected, None)
+        s.settle_unaccepted("r3", ReceiptState::Rejected, None)
             .unwrap();
-        assert_eq!(s.hop_depth(&b, None).unwrap().0, 4);
+        assert_eq!(s.hop_depth(&b).unwrap().0, 2);
     }
 
     #[test]
     fn sender_round_trips_and_ignores_legacy_labels() {
         let s = Store::memory();
-        intent(&s, "r0", "codex:b", &Caller::agent("claude:a"), None);
+        intent(&s, "r0", "codex:b", &Caller::agent("claude:a"));
         assert_eq!(
             s.sender_of("c-r0").unwrap(),
             Some(Caller::agent("claude:a"))

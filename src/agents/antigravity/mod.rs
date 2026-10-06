@@ -27,9 +27,8 @@ use self::transcript::{
     ends_with_reply, load, messages, preview, span_reply, turn_span, user_input,
 };
 use super::{
-    Agent, Caps, Check, ListFilter, Mode, Operation, ReadPage, ReadRange, SendRequest,
-    StartRequest, WaitTarget, bounded, cli_version, lock, pid_alive, record, settle, tail,
-    wait_receipt,
+    Agent, Caps, Check, ListFilter, Operation, ReadPage, ReadRange, SendRequest, StartRequest,
+    WaitTarget, bounded, cli_version, lock, pid_alive, record, settle, tail, wait_receipt,
 };
 use crate::model::{
     self, Approval, Error, ErrorCode, Observations, Outcome, Page, ReceiptState, Result, Session,
@@ -135,39 +134,21 @@ struct Summary {
     /// CASCADE_RUN_STATUS_IDLE | CASCADE_RUN_STATUS_RUNNING; empty on rows agy has not
     /// rewritten since an older version.
     status: String,
-    raw: Value,
 }
 
-const SUMMARY_COLUMNS: &str = "conversation_id, title, preview, step_count, last_modified_time, workspace_uris, status, not_fully_idle, killed, last_user_input_time";
+const SUMMARY_COLUMNS: &str = "conversation_id, title, last_modified_time, workspace_uris, status";
 
 fn summary_row(row: &rusqlite::Row) -> rusqlite::Result<Summary> {
-    let id: String = row.get(0)?;
-    let title: String = row.get(1)?;
-    let modified: String = row.get(4)?;
-    let uris: String = row.get(5)?;
-    let status: String = row.get(6)?;
-    let raw = json!({
-        "conversation_id": id,
-        "title": title,
-        "preview": row.get::<_, String>(2)?,
-        "step_count": row.get::<_, i64>(3)?,
-        "last_modified_time": modified,
-        "workspace_uris": uris,
-        "status": status,
-        "not_fully_idle": row.get::<_, Option<i64>>(7)?,
-        "killed": row.get::<_, Option<i64>>(8)?,
-        "last_user_input_time": row.get::<_, String>(9)?,
-    });
+    let uris: String = row.get(3)?;
     let cwd = serde_json::from_str::<Vec<String>>(&uris)
         .ok()
         .and_then(|u| u.first().and_then(|u| uri_path(u)));
     Ok(Summary {
-        id,
-        title,
-        modified,
+        id: row.get(0)?,
+        title: row.get(1)?,
+        modified: row.get(2)?,
         cwd,
-        status,
-        raw,
+        status: row.get(4)?,
     })
 }
 
@@ -369,7 +350,6 @@ impl<'a> Antigravity<'a> {
                 basis: Some(
                     "the agy -p process agent-talk started exited without a result event".into(),
                 ),
-                raw: Value::Null,
             };
             return Ok((turn, Vec::new()));
         };
@@ -453,7 +433,7 @@ impl<'a> Antigravity<'a> {
         let (end, closed) = turn_span(&lines, start);
         let span = &lines[start..end];
         let replied = ends_with_reply(span);
-        let turn = |status, basis: String, observed: Value| model::Turn {
+        let turn = |status, basis: String| model::Turn {
             handle: handle(id),
             turn_id: turn_id.to_string(),
             status,
@@ -463,21 +443,15 @@ impl<'a> Antigravity<'a> {
             basis: Some(format!(
                 "{basis}; the transcript is lossy: {TRANSCRIPT_LOSSES}"
             )),
-            raw: json!({
-                "observed": observed,
-                "lines": span.iter().map(|l| &l.raw).collect::<Vec<_>>(),
-            }),
         };
         if closed {
             return Ok(Ok(turn(
                 if replied { "completed" } else { "unknown" },
                 "transcript-derived: a later USER_INPUT exists".into(),
-                Value::Null,
             )));
         }
         let held = self.presence_held(id)?;
         let status = self.summary(id)?.map(|s| s.status).unwrap_or_default();
-        let observed = json!({"presence_lock_held": held, "summary_status": status});
         if held {
             return Ok(Err(format!(
                 "transcript-derived: waiting for a later USER_INPUT, or for the presence lock to be released after a final reply (held by some agy process; summary status {status:?})"
@@ -491,7 +465,6 @@ impl<'a> Antigravity<'a> {
                 format!(
                     "transcript-derived, best effort: the turn ends with a reply without tool calls, no process holds the conversation and the summary status is {status:?}"
                 ),
-                observed,
             )
         } else {
             turn(
@@ -504,7 +477,6 @@ impl<'a> Antigravity<'a> {
                         "does not end with a reply"
                     }
                 ),
-                observed,
             )
         }))
     }
@@ -599,7 +571,6 @@ impl Agent for Antigravity<'_> {
                 },
                 state,
                 owned,
-                raw: row.raw,
                 id: row.id,
             });
         }
@@ -654,7 +625,6 @@ impl Agent for Antigravity<'_> {
             text: req.prompt,
             delivered_text: (req.delivered != req.prompt).then_some(req.delivered),
             from: req.from,
-            reply_to: None,
             depth: req.depth,
         })?;
         let watch = RunWatch {
@@ -673,10 +643,10 @@ impl Agent for Antigravity<'_> {
         deadline: Option<Instant>,
     ) -> Result<Outcome> {
         check_id(id)?;
-        if req.mode == Mode::Steer {
+        if req.steer {
             return Err(Error::new(
                 ErrorCode::NoSteer,
-                "Antigravity conversations cannot be steered (a line written during a turn becomes the next turn); send with --mode queue",
+                "Antigravity conversations cannot be steered (a line written during a turn becomes the next turn); send without --steer",
             ));
         }
         let h = handle(id);
@@ -721,7 +691,6 @@ impl Agent for Antigravity<'_> {
             text: req.text,
             delivered_text: (req.delivered != req.text).then_some(req.delivered),
             from: req.from,
-            reply_to: req.reply_to,
             depth: req.depth,
         })?;
         let log = self.log_path(&receipt_id);

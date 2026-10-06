@@ -20,6 +20,7 @@ import contextlib
 import json
 import os
 import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -277,6 +278,19 @@ class Mcp:
 # ---------------------------------------------------------------- offline
 
 
+def seed_max_hops(handle: str) -> None:
+    """Record a message at the hop limit (3) delivered to `handle` in the offline store, so
+    whatever `handle` sends next is refused with E_MAX_HOPS before any agent is contacted."""
+    db = sqlite3.connect(Path(T) / ".agent-talk/store.db")
+    with contextlib.closing(db), db:
+        rid = str(uuid.uuid4())
+        db.execute(
+            "INSERT INTO intents (receipt_id, handle, client_msg_id, text, depth) VALUES (?, ?, ?, 'x', 3)",
+            (rid, handle, rid),
+        )
+        db.execute("INSERT INTO receipts (receipt_id, state) VALUES (?, 'accepted')", (rid,))
+
+
 def offline():
     def o1():
         out = cli("ls", "--agent", "codex", env={"HOME": T}, expect_exit=2)
@@ -301,21 +315,12 @@ def offline():
         expect(err(out).get("code") == "E_PRECONDITION", "ls --cursor x: E_PRECONDITION")
 
     def o4():
-        out = cli("send", f"claude:{uuid.uuid4()}", "x", "--mode", "steer", env={"HOME": T}, expect_exit=2)
+        out = cli("send", f"claude:{uuid.uuid4()}", "x", "--steer", env={"HOME": T}, expect_exit=2)
         expect(err(out).get("code") == "E_NO_STEER", "E_NO_STEER")
 
     def o5():
-        out = cli(
-            "new",
-            "codex",
-            "--cwd",
-            str(DIR),
-            "--max-hops",
-            "0",
-            "hi",
-            env={"HOME": T, "AGENT_TALK_CALLER": "codex:x"},
-            expect_exit=2,
-        )
+        seed_max_hops("codex:x")
+        out = cli("new", "codex", "hi", env={"HOME": T, "AGENT_TALK_CALLER": "codex:x"}, expect_exit=2)
         expect(err(out).get("code") == "E_MAX_HOPS", "E_MAX_HOPS (hop check before daemon contact)")
 
     def o6():
@@ -350,7 +355,9 @@ def offline():
                 not incomplete,
                 f"({protocol}) every tool has title, annotations and outputSchema; missing on {incomplete}",
             )
-        m = Mcp(home, ["--max-hops", "0"])
+        for h in ("codex:T", "opencode:ses_x", "claude:C"):
+            seed_max_hops(h)
+        m = Mcp(home)
         try:
             args = {"handle": "codex:x", "text": "hi"}
             for label, meta in (("a", {"threadId": "T"}), ("b", {"ai.opencode/sessionID": "ses_x"})):
@@ -362,7 +369,7 @@ def offline():
             expect(is_err and err(inner).get("code") == "E_PRECONDITION", "wait without turn/receipt: E_PRECONDITION")
         finally:
             m.close()
-        m = Mcp({**home, "CLAUDE_CODE_SESSION_ID": "C"}, ["--max-hops", "0"])
+        m = Mcp({**home, "CLAUDE_CODE_SESSION_ID": "C"})
         try:
             is_err, inner = m.call("send", {"handle": "codex:x", "text": "hi"})
             expect(is_err and err(inner).get("code") == "E_MAX_HOPS", "(c) CLAUDE_CODE_SESSION_ID: E_MAX_HOPS")
@@ -509,7 +516,7 @@ def codex_main():
 
     def c3a():
         busy_guard()
-        out = cli("send", st["B"], "also say STEERED", "--mode", "steer", "--expect-turn", st["T0"])
+        out = cli("send", st["B"], "also say STEERED", "--steer")
         expect(out["receipt"]["turn_id"] == st["T0"], "receipt.turn_id == T0")
 
     def c3b():
@@ -550,19 +557,14 @@ def codex_main():
 
     def c3g():
         need("B", "T0")
-        out = cli("send", st["B"], "x", "--mode", "steer", "--expect-turn", st["T0"], expect_exit=2)
-        expect(err(out).get("code") == "E_PRECONDITION", "E_PRECONDITION")
+        out = cli("send", st["B"], "x", "--steer", expect_exit=2)
+        expect(err(out).get("code") == "E_PRECONDITION", "idle steer: E_PRECONDITION")
         expect((err(out).get("agent_error") or {}).get("code") == -32600, "agent_error.code == -32600")
 
     def c3h():
         need("B")
         out = cli("wait", st["B"], "--turn", "bogus", "--timeout", "5", expect_exit=2)
         expect(err(out).get("code") == "E_PRECONDITION", "E_PRECONDITION")
-
-    def c3i():
-        need("B", "RA")
-        out = cli("send", st["B"], "x", "--reply-to", st["RA"], "--max-hops", "0", expect_exit=2)
-        expect(err(out).get("code") == "E_MAX_HOPS", "E_MAX_HOPS")
 
     def c4():
         # A thread agent-talk did not start, created over the daemon with approvals on: agent-talk
@@ -663,7 +665,6 @@ def codex_main():
         ("C3f", c3f),
         ("C3g", c3g),
         ("C3h", c3h),
-        ("C3i", c3i),
         ("C4", c4),
         ("C7", c7),
         ("C9", c9),
@@ -961,7 +962,7 @@ def opencode_tier():
 
     def p3():
         need("O")
-        out = cli("send", st["O"], "x", "--mode", "steer", expect_exit=2)
+        out = cli("send", st["O"], "x", "--steer", expect_exit=2)
         expect(err(out).get("code") == "E_PRECONDITION", "idle steer: E_PRECONDITION")
         out = cli("wait", st["O"], "--turn", "msg_bogus", "--timeout", "5", expect_exit=2)
         expect(err(out).get("code") == "E_PRECONDITION", "unknown turn: E_PRECONDITION")
@@ -997,8 +998,7 @@ def opencode_tier():
             "send",
             st["O"],
             "reply with the single word steered",
-            "--mode",
-            "steer",
+            "--steer",
             "--wait",
             expect_exit=(0, 2) if not running else 0,
         )
@@ -1203,7 +1203,9 @@ def grok_tier():
         out = cli("send", st["G"], "reply with the single word kiwi", "--wait", env={"GROK_SESSION_ID": caller})
         expect(out["from"].get("session") == f"grok:{caller}", "from.session == grok:<GROK_SESSION_ID>")
         expect(
-            (out["receipt"].get("delivered_text") or "").startswith(f"[from grok:{caller} via agent-talk]"),
+            (out["receipt"].get("delivered_text") or "").startswith(
+                f"[from grok:{caller} via agent-talk; answer in your final response]"
+            ),
             "delivered_text carries the provenance header",
         )
         expect("kiwi" in final(out), "final ~ kiwi")
@@ -1242,7 +1244,7 @@ def grok_tier():
         expect(out["receipt"] and out["receipt"]["turn_id"] == st["G_turn"], "receipt attached")
         out = cli("wait", st["G"], "--turn", "bogus", "--timeout", "5", expect_exit=2)
         expect(err(out).get("code") == "E_PRECONDITION", "unknown turn: E_PRECONDITION")
-        out = cli("send", st["G"], "x", "--mode", "steer", expect_exit=2)
+        out = cli("send", st["G"], "x", "--steer", expect_exit=2)
         expect(err(out).get("code") == "E_NO_STEER", "steer without a leader: E_NO_STEER")
 
     def g6():
@@ -1359,6 +1361,13 @@ def agy_user_inputs(conv: str, text: str) -> int:
     return sum(1 for s in agy_steps(conv) if s.get("type") == "USER_INPUT" and text in (s.get("content") or ""))
 
 
+def agy_summary_status(conv: str) -> str | None:
+    db = sqlite3.connect(f"file:{AGY_HOME / 'conversation_summaries.db'}?mode=ro", uri=True)
+    with contextlib.closing(db):
+        row = db.execute("SELECT status FROM conversation_summaries WHERE conversation_id = ?", (conv,)).fetchone()
+    return row[0] if row else None
+
+
 def agy_lock_held(conv: str) -> bool:
     import fcntl
 
@@ -1388,7 +1397,7 @@ def antigravity_tier():
         expect(out["turn"].get("basis"), "turn.basis present")
         out = cli("new", "antigravity", "--cwd", str(DIR), "--name", "x", "hi", expect_exit=2)
         expect(err(out).get("code") == "E_UNSUPPORTED", "new --name: E_UNSUPPORTED")
-        out = cli("send", st["AG"], "x", "--mode", "steer", expect_exit=2)
+        out = cli("send", st["AG"], "x", "--steer", expect_exit=2)
         expect(err(out).get("code") == "E_NO_STEER", "steer: E_NO_STEER")
 
     def a2():
@@ -1498,9 +1507,9 @@ def antigravity_tier():
         expect(t.get("status") != "completed", f"a killed turn is not completed, got {t.get('status')}")
         expect(t.get("basis") or err(out).get("state") in ("running", "unknown"), "basis or running/unknown state")
         expect(not agy_lock_held(conv), "presence lock released by the kill")
-        rows = cli("ls", "--agent", "antigravity", "--cwd", str(DIR), "--raw")["sessions"]
+        rows = cli("ls", "--agent", "antigravity", "--cwd", str(DIR))["sessions"]
         row = next((s for s in rows if s["handle"] == st["AG"]), {})
-        if (row.get("raw") or {}).get("status") != "CASCADE_RUN_STATUS_RUNNING":
+        if agy_summary_status(conv) != "CASCADE_RUN_STATUS_RUNNING":
             raise Inconclusive("the kill landed before agy marked the run RUNNING; the summary status stayed IDLE")
         # RUNNING with the lock free: the lock, not the status, is liveness.
         expect(row.get("state") == "unknown", "ls: state unknown (lock free, status RUNNING)")

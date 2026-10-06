@@ -2,8 +2,7 @@
 //! provenance header, hop limit, agent dispatch, typed output.
 
 use crate::agents::{
-    Adapter, Agent, Caps, ListFilter, Mode, ReadRange, SendRequest, StartRequest, WaitTarget,
-    delivered,
+    Adapter, Agent, Caps, ListFilter, ReadRange, SendRequest, StartRequest, WaitTarget, delivered,
 };
 use crate::model::{Caller, Error, ErrorCode, Message, Outcome, Result, Session};
 use crate::store::Store;
@@ -17,7 +16,8 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
-pub const DEFAULT_MAX_HOPS: u32 = 3;
+/// Agent-to-agent hops allowed before a message is refused (DESIGN.md §4).
+pub const MAX_HOPS: u32 = 3;
 pub const LS_LIMIT: u32 = 25;
 pub const READ_LIMIT: u32 = 20;
 
@@ -42,8 +42,6 @@ pub struct LsArgs {
     pub limit: u32,
     /// Only with `agent`: cursors belong to one agent.
     pub cursor: Option<String>,
-    /// Keep the agent's raw records (`raw`) in the output.
-    pub raw: bool,
 }
 
 pub struct NewArgs {
@@ -58,24 +56,16 @@ pub struct NewArgs {
     /// Observe the first turn for this long; `None` returns once the agent accepted it.
     pub wait: Option<Duration>,
     pub from: Caller,
-    pub max_hops: u32,
-    /// Keep the agent's raw record of the turn (`turn.raw`) in the output.
-    pub raw: bool,
 }
 
 pub struct SendArgs {
     pub handle: String,
     pub text: String,
-    pub mode: Mode,
-    /// Steer only: the running turn the caller expects.
-    pub expect_turn: Option<String>,
-    pub reply_to: Option<String>,
+    /// Into the running turn instead of queued after it.
+    pub steer: bool,
     /// Observe the turn for this long; `None` returns once the agent accepted the message.
     pub wait: Option<Duration>,
     pub from: Caller,
-    pub max_hops: u32,
-    /// Keep the agent's raw record of the turn (`turn.raw`) in the output.
-    pub raw: bool,
 }
 
 pub struct ReadArgs {
@@ -89,8 +79,6 @@ pub struct WaitArgs {
     pub handle: String,
     pub target: WaitTarget,
     pub timeout: Duration,
-    /// Keep the agent's raw record of the turn (`turn.raw`) in the output.
-    pub raw: bool,
 }
 
 /// What a request produces; `--json` prints it as is.
@@ -159,7 +147,7 @@ async fn ls(store: &Store, a: LsArgs) -> Result<Output> {
         let agent = Adapter::named(store, name)?;
         let page = agent.list(&filter, a.limit, a.cursor.as_deref()).await?;
         return Ok(Output::Sessions(Sessions {
-            sessions: sessions_output(page.items, a.raw),
+            sessions: page.items,
             next_cursors: BTreeMap::from([(agent.name(), page.next_cursor)]),
             errors: Vec::new(),
         }));
@@ -188,27 +176,10 @@ async fn ls(store: &Store, a: LsArgs) -> Result<Output> {
         }
     }
     Ok(Output::Sessions(Sessions {
-        sessions: sessions_output(sessions, a.raw),
+        sessions,
         next_cursors,
         errors,
     }))
-}
-
-/// Raw agent records are large and rarely needed; they stay only on request.
-fn sessions_output(mut sessions: Vec<Session>, raw: bool) -> Vec<Session> {
-    if !raw {
-        for s in &mut sessions {
-            s.raw = Value::Null;
-        }
-    }
-    sessions
-}
-
-fn outcome(mut o: Outcome, raw: bool) -> Output {
-    if !raw && let Some(t) = &mut o.turn {
-        t.raw = Value::Null;
-    }
-    Output::Outcome(Box::new(o))
 }
 
 async fn new(store: &Store, a: NewArgs) -> Result<Output> {
@@ -223,36 +194,28 @@ async fn new(store: &Store, a: NewArgs) -> Result<Output> {
         name: a.name.as_deref(),
         effort: a.effort.as_deref(),
         full_access: a.full_access,
-        depth: hop_depth(store, &a.from, None, a.max_hops)?,
+        depth: hop_depth(store, &a.from)?,
         from: &a.from,
     };
     let mut o = agent.start(&req, a.wait.map(deadline)).await?;
     o.from = Some(a.from);
-    Ok(outcome(o, a.raw))
+    Ok(Output::Outcome(Box::new(o)))
 }
 
 async fn send(store: &Store, a: SendArgs) -> Result<Output> {
     let (name, id) = split_handle(&a.handle)?;
     let agent = Adapter::named(store, name)?;
-    if a.expect_turn.is_some() && a.mode != Mode::Steer {
-        return Err(Error::new(
-            ErrorCode::Precondition,
-            "--expect-turn applies to --mode steer only",
-        ));
-    }
     let delivered = delivered(&a.from, &a.text);
     let req = SendRequest {
         text: &a.text,
         delivered: &delivered,
-        mode: a.mode,
-        depth: hop_depth(store, &a.from, a.reply_to.as_deref(), a.max_hops)?,
+        steer: a.steer,
+        depth: hop_depth(store, &a.from)?,
         from: &a.from,
-        reply_to: a.reply_to.as_deref(),
-        expect_turn: a.expect_turn.as_deref(),
     };
     let mut o = agent.send(id, &req, a.wait.map(deadline)).await?;
     o.from = Some(a.from);
-    Ok(outcome(o, a.raw))
+    Ok(Output::Outcome(Box::new(o)))
 }
 
 async fn read(store: &Store, a: ReadArgs) -> Result<Output> {
@@ -271,7 +234,7 @@ async fn wait(store: &Store, a: WaitArgs) -> Result<Output> {
     let o = Adapter::named(store, name)?
         .wait(id, &a.target, deadline(a.timeout))
         .await?;
-    Ok(outcome(o, a.raw))
+    Ok(Output::Outcome(Box::new(o)))
 }
 
 /// Split `<agent>:<id>`.
@@ -306,17 +269,15 @@ fn deadline(after: Duration) -> Instant {
     Instant::now() + after
 }
 
-/// Hop depth of a new intent, refused above `max_hops`.
-fn hop_depth(store: &Store, from: &Caller, reply_to: Option<&str>, max_hops: u32) -> Result<u32> {
-    let (depth, basis) = store.hop_depth(from, reply_to)?;
-    if depth > max_hops {
+/// Hop depth of a new intent, refused above `MAX_HOPS`.
+fn hop_depth(store: &Store, from: &Caller) -> Result<u32> {
+    let (depth, basis) = store.hop_depth(from)?;
+    if depth > MAX_HOPS {
         return Err(Error::new(
             ErrorCode::MaxHops,
             format!(
-                "refused: this message would be hop {depth} of an agent-to-agent chain and the limit is {max_hops} ({basis}). \
-                 Hop depth is 1 + the depth of the message being answered: reply_to if given, else, for an agent sender, \
-                 the message that started its current turn or the newest message delivered to its own session; \
-                 an unknown sender without reply_to starts at 0. Do not forward again; answer whoever asked you instead."
+                "refused: this message would be hop {depth} of an agent-to-agent chain and the limit is {MAX_HOPS} ({basis}). \
+                 Do not forward again; answer whoever asked you in your final response."
             ),
         ));
     }
@@ -326,16 +287,32 @@ fn hop_depth(store: &Store, from: &Caller, reply_to: Option<&str>, max_hops: u32
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::NewIntent;
 
     #[test]
     fn hop_limit_is_inclusive() {
         let store = Store::memory();
-        // An unknown sender starts at depth 0: allowed even with a limit of 0.
-        assert_eq!(hop_depth(&store, &Caller::UNKNOWN, None, 0).unwrap(), 0);
-        // An agent with nothing delivered to it is at depth 1: refused at 0, allowed at 1.
         let agent = Caller::agent("codex:t1");
-        let e = hop_depth(&store, &agent, None, 0).unwrap_err();
+        let deliver = |id: &str, depth| {
+            store
+                .insert_intent(&NewIntent {
+                    receipt_id: id,
+                    handle: "codex:t1",
+                    client_msg_id: id,
+                    text: "x",
+                    from: &Caller::UNKNOWN,
+                    depth,
+                    delivered_text: None,
+                })
+                .unwrap()
+        };
+        // A person's message is not a hop.
+        assert_eq!(hop_depth(&store, &Caller::UNKNOWN).unwrap(), 0);
+        // An agent acting on a message one hop below the limit may still send.
+        deliver("r1", MAX_HOPS - 1);
+        assert_eq!(hop_depth(&store, &agent).unwrap(), MAX_HOPS);
+        deliver("r2", MAX_HOPS);
+        let e = hop_depth(&store, &agent).unwrap_err();
         assert_eq!(e.code, ErrorCode::MaxHops);
-        assert_eq!(hop_depth(&store, &agent, None, 1).unwrap(), 1);
     }
 }

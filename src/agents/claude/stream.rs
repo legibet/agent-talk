@@ -89,7 +89,6 @@ pub fn result_turn(handle: String, turn_id: String, ev: &Value) -> model::Turn {
         final_text: ev["result"].as_str().map(String::from),
         duration_ms: ev["duration_ms"].as_i64(),
         basis: Some("result event of the claude -p process agent-talk started".into()),
-        raw: ev.clone(),
     }
 }
 

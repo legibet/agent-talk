@@ -6,7 +6,7 @@ use super::io_err;
 use crate::agents::{first_line, strip_provenance};
 use crate::model::{self, Caller, Message, Result};
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -347,14 +347,14 @@ pub fn turn_end(entries: &[Entry], branch: &HashSet<usize>, start: usize) -> Opt
 }
 
 /// Turn derived from the live-branch lines from the prompt at `start` to `end`.
-/// `agents` is what `claude agents` said about the session, reported alongside.
+/// `agent_status` is the session's status in `claude agents`, reported in the basis.
 pub fn transcript_turn(
     handle: String,
     entries: &[Entry],
     branch: &HashSet<usize>,
     start: usize,
     end: TurnEnd,
-    agents: Value,
+    agent_status: Option<&str>,
 ) -> model::Turn {
     let stop = match end {
         // The turn_duration line belongs to the turn it closes.
@@ -362,13 +362,9 @@ pub fn transcript_turn(
         TurnEnd::Interrupt(i) | TurnEnd::NextPrompt(i) => i,
         TurnEnd::ProcessGone => entries.len(),
     };
-    let span: Vec<&Entry> = (start..stop)
+    let assistants: Vec<&Line> = (start..stop)
         .filter(|i| branch.contains(i))
-        .map(|i| &entries[i])
-        .collect();
-    let assistants: Vec<&Line> = span
-        .iter()
-        .filter_map(|e| e.line.as_ref())
+        .filter_map(|i| entries[i].line.as_ref())
         .filter(|l| l.kind == "assistant")
         .collect();
     let final_text = assistants
@@ -387,7 +383,7 @@ pub fn transcript_turn(
     } else {
         "unknown"
     };
-    let (status, duration_ms, basis, observed) = match end {
+    let (status, duration_ms, basis) = match end {
         TurnEnd::Duration(i) => {
             let td = &entries[i].raw;
             (
@@ -396,9 +392,8 @@ pub fn transcript_turn(
                 format!(
                     "transcript-derived, best effort: system/turn_duration after the prompt (pendingBackgroundAgentCount {}; claude agents status {})",
                     td["pendingBackgroundAgentCount"],
-                    agents["status"].as_str().unwrap_or("not listed")
+                    agent_status.unwrap_or("not listed")
                 ),
-                json!({"claude_agents": agents, "turn_duration": td}),
             )
         }
         TurnEnd::Interrupt(_) => (
@@ -406,19 +401,16 @@ pub fn transcript_turn(
             None,
             "transcript-derived, best effort: '[Request interrupted by user]' after the prompt"
                 .into(),
-            json!({"claude_agents": agents}),
         ),
         TurnEnd::NextPrompt(_) => (
             by_stop_reason,
             None,
             "transcript-derived: a later user message exists".into(),
-            json!({"claude_agents": agents}),
         ),
         TurnEnd::ProcessGone => (
             by_stop_reason,
             None,
             "transcript-derived: no live process holds the session".into(),
-            json!({"claude_agents": agents}),
         ),
     };
     model::Turn {
@@ -429,7 +421,6 @@ pub fn transcript_turn(
         final_text,
         duration_ms,
         basis: Some(basis),
-        raw: json!({ "observed": observed, "lines": span.iter().map(|e| &e.raw).collect::<Vec<_>>() }),
     }
 }
 
@@ -660,14 +651,7 @@ mod tests {
         assert_eq!(live.len(), 4);
         assert_eq!(turn_end(&entries, &live, 0), Some(TurnEnd::NextPrompt(3)));
         assert_eq!(turn_end(&entries, &live, 3), None);
-        let t = transcript_turn(
-            handle(),
-            &entries,
-            &live,
-            0,
-            TurnEnd::NextPrompt(3),
-            Value::Null,
-        );
+        let t = transcript_turn(handle(), &entries, &live, 0, TurnEnd::NextPrompt(3), None);
         assert_eq!(t.status, "completed");
         assert_eq!(t.final_text.as_deref(), Some("pong"));
     }
@@ -689,7 +673,7 @@ mod tests {
         let live = live_branch(&entries);
         let end = turn_end(&entries, &live, 0);
         assert_eq!(end, Some(TurnEnd::Duration(3)));
-        let t = transcript_turn(handle(), &entries, &live, 0, end.unwrap(), Value::Null);
+        let t = transcript_turn(handle(), &entries, &live, 0, end.unwrap(), None);
         assert_eq!((t.status, t.duration_ms), ("completed", Some(45007)));
     }
 
@@ -798,14 +782,7 @@ mod tests {
         let live = live_branch(&entries);
         assert_eq!(live.len(), 5);
         assert_eq!(turn_end(&entries, &live, 0), None);
-        let t = transcript_turn(
-            handle(),
-            &entries,
-            &live,
-            0,
-            TurnEnd::ProcessGone,
-            Value::Null,
-        );
+        let t = transcript_turn(handle(), &entries, &live, 0, TurnEnd::ProcessGone, None);
         assert_eq!(t.final_text.as_deref(), Some("pong"));
     }
 
@@ -837,7 +814,7 @@ mod tests {
         assert_eq!(live.len(), 4);
         let end = turn_end(&entries, &live, 0);
         assert_eq!(end, Some(TurnEnd::Interrupt(3)));
-        let t = transcript_turn(handle(), &entries, &live, 0, end.unwrap(), Value::Null);
+        let t = transcript_turn(handle(), &entries, &live, 0, end.unwrap(), None);
         assert_eq!(t.status, "interrupted");
     }
 
@@ -858,7 +835,7 @@ mod tests {
         let live = live_branch(&entries);
         let end = turn_end(&entries, &live, 0);
         assert_eq!(end, Some(TurnEnd::Interrupt(3)));
-        let t = transcript_turn(handle(), &entries, &live, 0, end.unwrap(), Value::Null);
+        let t = transcript_turn(handle(), &entries, &live, 0, end.unwrap(), None);
         assert_eq!(t.status, "interrupted");
     }
 

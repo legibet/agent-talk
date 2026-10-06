@@ -20,9 +20,9 @@ mod updates;
 use self::acp::{Conn, Event, Reply, ServerRequest, Spawn};
 use self::updates::{History, first_prompt};
 use super::{
-    Agent, ApprovalPolicy, Caps, Check, ListFilter, Mode, Operation, ReadPage, ReadRange,
-    SendRequest, StartRequest, WaitTarget, approval_policy, bounded, cli_version, first_line,
-    full_access, lock, pid_alive, record, reject, settle, strip_provenance, wait_receipt,
+    Agent, ApprovalPolicy, Caps, Check, ListFilter, Operation, ReadPage, ReadRange, SendRequest,
+    StartRequest, WaitTarget, approval_policy, bounded, cli_version, first_line, full_access, lock,
+    pid_alive, record, reject, settle, strip_provenance, wait_receipt,
 };
 use crate::model::{
     self, Approval, Error, ErrorCode, Observations, Outcome, Page, ReceiptState, Result, Session,
@@ -108,7 +108,6 @@ struct Active {
 struct Listed {
     resident: bool,
     activity: String,
-    raw: Value,
 }
 
 /// The leader as seen at the start of this command: its socket answered a connect.
@@ -407,7 +406,6 @@ impl TurnWatch {
                 Some(n) => format!("{basis}; {n}"),
                 None => basis.into(),
             }),
-            raw: result.clone(),
         }
     }
 }
@@ -539,7 +537,6 @@ impl<'a> Grok<'a> {
                         Listed {
                             resident: s["resident"].as_bool() == Some(true),
                             activity: s["activity"].as_str().unwrap_or("unknown").to_string(),
-                            raw: s.clone(),
                         },
                     )
                 })
@@ -707,7 +704,6 @@ impl<'a> Grok<'a> {
                     final_text: (!w.text.is_empty()).then(|| w.text.clone()),
                     duration_ms: None,
                     basis: Some("session/prompt error response".into()),
-                    raw: Value::Null,
                 }),
             }
         });
@@ -748,7 +744,7 @@ impl<'a> Grok<'a> {
         Ok(r)
     }
 
-    /// `send --mode steer`: `_x.ai/interject` on a session working in the leader.
+    /// `send --steer`: `_x.ai/interject` on a session working in the leader.
     async fn steer(
         &self,
         id: &str,
@@ -762,7 +758,7 @@ impl<'a> Grok<'a> {
             return Err(Error::new(
                 ErrorCode::NoSteer,
                 format!(
-                    "Grok steers only through a live leader ({} does not answer), and in direct mode no process of an earlier command survives to steer; send with --mode queue",
+                    "Grok steers only through a live leader ({} does not answer), and in direct mode no process of an earlier command survives to steer; send without --steer",
                     self.socket.display()
                 ),
             ));
@@ -776,7 +772,7 @@ impl<'a> Grok<'a> {
                     return Err(Error::new(
                         ErrorCode::Precondition,
                         format!(
-                            "{h} is {} in the leader; steer needs a running turn (Grok would start a fallback turn instead); send with --mode queue",
+                            "{h} is {} in the leader; steer needs a running turn (Grok would start a fallback turn instead); send without --steer",
                             l.activity
                         ),
                     ));
@@ -785,7 +781,7 @@ impl<'a> Grok<'a> {
                     return Err(Error::new(
                         ErrorCode::NoSteer,
                         format!(
-                            "{h} is not resident in the Grok leader, so no running turn can be joined; send with --mode queue"
+                            "{h} is not resident in the Grok leader, so no running turn can be joined; send without --steer"
                         ),
                     ));
                 }
@@ -794,15 +790,6 @@ impl<'a> Grok<'a> {
             let running = loaded["_meta"]["x.ai/runningPromptId"]
                 .as_str()
                 .map(String::from);
-            // Grok has no expected-turn check; agent-talk compares before the call.
-            if let Some(t) = req.expect_turn
-                && running.as_deref() != Some(t)
-            {
-                return Err(Error::new(
-                    ErrorCode::Precondition,
-                    format!("the running turn of {h} is {running:?}, not {t}"),
-                ));
-            }
             let receipt_id = uuid::Uuid::new_v4().to_string();
             let client_msg_id = uuid::Uuid::new_v4().to_string();
             self.store.insert_intent(&NewIntent {
@@ -812,7 +799,6 @@ impl<'a> Grok<'a> {
                 text: req.text,
                 delivered_text: (req.delivered != req.text).then_some(req.delivered),
                 from: req.from,
-                reply_to: req.reply_to,
                 depth: req.depth,
             })?;
             let mut w = TurnWatch::steer(id, &receipt_id, running, req.delivered, policy);
@@ -909,8 +895,8 @@ impl Agent for Grok<'_> {
         limit: u32,
         cursor: Option<&str>,
     ) -> Result<Page<Session>> {
-        // (dir, summary, raw), newest first, ties by id.
-        let mut rows: Vec<(PathBuf, Summary, Value)> = Vec::new();
+        // (dir, summary), newest first, ties by id.
+        let mut rows: Vec<(PathBuf, Summary)> = Vec::new();
         for group in std::fs::read_dir(self.sessions())
             .into_iter()
             .flatten()
@@ -925,28 +911,24 @@ impl Agent for Grok<'_> {
                 let Ok(text) = std::fs::read_to_string(&path) else {
                     continue;
                 };
-                let Ok(raw) = serde_json::from_str::<Value>(&text) else {
+                let Ok(s) = serde_json::from_str::<Summary>(&text) else {
                     tracing::warn!("undecodable {}", path.display());
-                    continue;
-                };
-                let Ok(s) = Summary::deserialize(&raw) else {
-                    tracing::warn!("unexpected {}", path.display());
                     continue;
                 };
                 if filter.cwd.is_some() && s.info.cwd.as_deref() != filter.cwd {
                     continue;
                 }
-                rows.push((dir.path(), s, raw));
+                rows.push((dir.path(), s));
             }
         }
-        rows.sort_by(|(_, a, _), (_, b, _)| b.at().cmp(a.at()).then(a.info.id.cmp(&b.info.id)));
+        rows.sort_by(|(_, a), (_, b)| b.at().cmp(a.at()).then(a.info.id.cmp(&b.info.id)));
         let skip = match cursor {
             Some(c) => {
                 let (at, id) = c.split_once('|').ok_or_else(|| {
                     Error::new(ErrorCode::Precondition, format!("invalid cursor {c}"))
                 })?;
                 rows.iter()
-                    .position(|(_, s, _)| s.at() < at || (s.at() == at && s.info.id.as_str() > id))
+                    .position(|(_, s)| s.at() < at || (s.at() == at && s.info.id.as_str() > id))
                     .unwrap_or(rows.len())
             }
             None => 0,
@@ -988,13 +970,13 @@ impl Agent for Grok<'_> {
             Err(e) => tracing::warn!("{e}"),
         }
         let mut items = Vec::new();
-        for (dir, s, raw) in page {
+        for (dir, s) in page {
             let id = s.info.id.as_str();
             let h = handle(id);
             let owned = self.store.is_owned(&h)?;
             let tui = active
                 .iter()
-                .find(|a| a.session_id == id && pid_alive(a.pid));
+                .any(|a| a.session_id == id && pid_alive(a.pid));
             let lead = listed.iter().find(|(sid, _)| sid == id).map(|(_, l)| l);
             let updates_path = dir.join("updates.jsonl");
             let own_pid = self.own_run(id, &dir)?;
@@ -1004,7 +986,7 @@ impl Agent for Grok<'_> {
                 (None, Some(l)) if l.resident && l.activity == "idle" => "idle",
                 _ => "unknown",
             };
-            let loaded = own_pid.is_some() || tui.is_some() || lead.is_some_and(|l| l.resident);
+            let loaded = own_pid.is_some() || tui || lead.is_some_and(|l| l.resident);
             items.push(Session {
                 handle: h,
                 agent: "grok",
@@ -1028,12 +1010,6 @@ impl Agent for Grok<'_> {
                 },
                 state,
                 owned,
-                raw: json!({
-                    "summary": raw,
-                    "active_session": tui.map(|a| json!({"pid": a.pid})),
-                    "leader": lead.map(|l| &l.raw),
-                    "dir": dir,
-                }),
                 id: id.to_string(),
             });
         }
@@ -1085,7 +1061,6 @@ impl Agent for Grok<'_> {
                 text: req.prompt,
                 delivered_text: (req.delivered != req.prompt).then_some(req.delivered),
                 from: req.from,
-                reply_to: None,
                 depth: req.depth,
             };
             self.run(&mut conn, id, &intent, policy, deadline, &leader)
@@ -1131,7 +1106,7 @@ impl Agent for Grok<'_> {
             }
         };
         let policy = approval_policy(self.store, &h)?;
-        if req.mode == Mode::Steer {
+        if req.steer {
             return self.steer(id, &cwd, req, policy, deadline).await;
         }
         // Through the leader only when the session is resident there: a listed but
@@ -1176,7 +1151,6 @@ impl Agent for Grok<'_> {
                 text: req.text,
                 delivered_text: (req.delivered != req.text).then_some(req.delivered),
                 from: req.from,
-                reply_to: req.reply_to,
                 depth: req.depth,
             };
             self.run(&mut conn, id, &intent, policy, deadline, &leader)
@@ -1314,7 +1288,6 @@ impl Agent for Grok<'_> {
                         basis: Some(format!(
                             "updates.jsonl; the grok agent agent-talk started for this prompt (pid {pid}) has exited, and in direct mode nothing else continues it"
                         )),
-                        raw: Value::Null,
                     });
                 }
                 tokio::time::sleep(Duration::from_secs(1)).await;

@@ -5,7 +5,6 @@ use super::io_err;
 use crate::agents::{ApprovalPolicy, agent_cmd};
 use crate::model::Result;
 use serde::Deserialize;
-use serde_json::Value;
 use std::fs::File;
 use std::path::Path;
 use std::process::Stdio;
@@ -95,8 +94,8 @@ pub struct AgentEntry {
     pub started_at: Option<i64>,
 }
 
-/// `claude agents --json --all`, each entry decoded and raw.
-pub async fn agents() -> std::result::Result<Vec<(AgentEntry, Value)>, String> {
+/// `claude agents --json --all`, each entry decoded.
+pub async fn agents() -> std::result::Result<Vec<AgentEntry>, String> {
     let out = agent_cmd("claude")
         .args(["agents", "--json", "--all"])
         .stdin(Stdio::null())
@@ -110,15 +109,8 @@ pub async fn agents() -> std::result::Result<Vec<(AgentEntry, Value)>, String> {
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    let list: Vec<Value> = serde_json::from_slice(&out.stdout)
-        .map_err(|e| format!("claude agents --json: unexpected output: {e}"))?;
     // Every entry must decode: a dropped one could be the process that is writing the
     // session, and the caller would then proceed as if nothing ran it.
-    list.into_iter()
-        .map(|raw| {
-            AgentEntry::deserialize(&raw)
-                .map(|a| (a, raw))
-                .map_err(|e| format!("claude agents --json: unexpected entry: {e}"))
-        })
-        .collect()
+    serde_json::from_slice(&out.stdout)
+        .map_err(|e| format!("claude agents --json: unexpected output: {e}"))
 }

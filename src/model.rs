@@ -229,9 +229,6 @@ pub struct Session {
     #[schemars(extend("enum" = ["idle", "running", "waiting", "unknown"]))]
     pub state: &'static str,
     pub owned: bool,
-    /// The agent's raw record, only when raw output was requested.
-    #[serde(default, skip_serializing_if = "Value::is_null")]
-    pub raw: Value,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -250,9 +247,6 @@ pub struct Turn {
     // the adapter applied. The adapters word it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub basis: Option<String>,
-    /// The agent's raw record of the turn, only when raw output was requested.
-    #[serde(default, skip_serializing_if = "Value::is_null")]
-    pub raw: Value,
 }
 
 /// Who sent a message. Attribution, not authenticated identity.

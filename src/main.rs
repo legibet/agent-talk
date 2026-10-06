@@ -4,12 +4,12 @@ mod model;
 mod ops;
 mod store;
 
-use agents::{Mode, ReadRange, WaitTarget};
+use agents::{ReadRange, WaitTarget};
 use clap::{Args, Parser, Subcommand};
 use model::{Approval, Caller, CallerKind, Outcome, Receipt, Turn};
 use ops::{
-    DEFAULT_MAX_HOPS, DEFAULT_TIMEOUT, LsArgs, NewArgs, Output, Read, ReadArgs, Request, SendArgs,
-    Sessions, WaitArgs, caller_from_handle, env_var,
+    DEFAULT_TIMEOUT, LsArgs, NewArgs, Output, Read, ReadArgs, Request, SendArgs, Sessions,
+    WaitArgs, caller_from_handle, env_var,
 };
 use serde_json::json;
 use std::path::PathBuf;
@@ -31,7 +31,7 @@ struct Cli {
     cmd: Cmd,
 }
 
-/// Who is sending, and how far an agent-to-agent chain may go.
+/// Who is sending.
 #[derive(Args)]
 struct SenderOpts {
     /// Handle of the session issuing this command. Default: AGENT_TALK_CALLER, else the
@@ -39,11 +39,6 @@ struct SenderOpts {
     /// ANTIGRAVITY_CONVERSATION_ID, then CLAUDE_CODE_SESSION_ID), else unknown.
     #[arg(long)]
     from: Option<String>,
-    /// Refuse when the message's hop depth exceeds this: 1 + the depth of the message
-    /// it answers (--reply-to, else for an agent sender the message that started its
-    /// turn or the newest one delivered to it); 0 for an unknown sender without --reply-to.
-    #[arg(long, default_value_t = DEFAULT_MAX_HOPS)]
-    max_hops: u32,
 }
 
 #[derive(Args)]
@@ -84,16 +79,14 @@ enum Cmd {
         /// Cursor from a previous page of the same agent.
         #[arg(long)]
         cursor: Option<String>,
-        /// Include the agent's raw records under `raw` in --json output (large).
-        #[arg(long)]
-        raw: bool,
     },
     /// Start a session owned by agent-talk; prints handle and receipt.
     New {
         /// codex, claude, opencode, grok or antigravity.
         agent: String,
         prompt: String,
-        #[arg(long)]
+        /// Working directory of the session.
+        #[arg(long, default_value = ".")]
         cwd: PathBuf,
         /// Model for the session (Codex: model id; Claude: e.g. sonnet; OpenCode:
         /// provider/model[#variant]; Grok: e.g. grok-4.7; Antigravity: e.g. gemini-3.8-flash).
@@ -111,9 +104,6 @@ enum Cmd {
         /// default: the agent's own configuration.
         #[arg(long)]
         full_access: bool,
-        /// Include the agent's raw record of the turn under `raw` in --json output (large).
-        #[arg(long)]
-        raw: bool,
         #[command(flatten)]
         wait: WaitOpts,
         #[command(flatten)]
@@ -126,21 +116,10 @@ enum Cmd {
     Send {
         handle: String,
         text: String,
-        /// queue: after the current reply (Codex, Grok: as its own turn; OpenCode: inside the
-        /// same execution; Antigravity: as the next turn of a new agy process); steer: into
-        /// the running turn (Codex, OpenCode, Grok through a live leader), refused when the
-        /// session is idle.
-        #[arg(long, value_enum, default_value_t = Mode::Queue)]
-        mode: Mode,
-        /// Receipt, turn or message id this message answers.
+        /// Add the message to the running turn instead of queueing it (Codex, OpenCode, Grok
+        /// through a live leader); refused when the session is idle.
         #[arg(long)]
-        reply_to: Option<String>,
-        /// Steer only: the running turn id you expect (default: the newest turn).
-        #[arg(long)]
-        expect_turn: Option<String>,
-        /// Include the agent's raw record of the turn under `raw` in --json output (large).
-        #[arg(long)]
-        raw: bool,
+        steer: bool,
         #[command(flatten)]
         wait: WaitOpts,
         #[command(flatten)]
@@ -173,9 +152,6 @@ enum Cmd {
         receipt: Option<String>,
         #[arg(long, default_value_t = DEFAULT_TIMEOUT.as_secs())]
         timeout: u64,
-        /// Include the agent's raw record of the turn under `raw` in --json output (large).
-        #[arg(long)]
-        raw: bool,
     },
     /// Serve ls, new, send, read and wait as MCP tools on stdio.
     Mcp {
@@ -187,9 +163,6 @@ enum Cmd {
         /// for each MCP server they start), then unknown. None of these is authenticated.
         #[arg(long)]
         caller: Option<String>,
-        /// Hop limit applied to every send and new issued through this server.
-        #[arg(long, default_value_t = DEFAULT_MAX_HOPS)]
-        max_hops: u32,
     },
 }
 
@@ -214,8 +187,8 @@ fn main() -> ExitCode {
         .enable_all()
         .build()
         .expect("tokio runtime");
-    if let Cmd::Mcp { caller, max_hops } = cli.cmd {
-        return match rt.block_on(mcp::serve(caller, max_hops)) {
+    if let Cmd::Mcp { caller } = cli.cmd {
+        return match rt.block_on(mcp::serve(caller)) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("error: {e}");
@@ -290,14 +263,12 @@ fn request(cmd: Cmd) -> model::Result<Request> {
             all,
             limit,
             cursor,
-            raw,
         } => Request::Ls(LsArgs {
             agent,
             cwd,
             all,
             limit,
             cursor,
-            raw,
         }),
         Cmd::New {
             agent,
@@ -307,7 +278,6 @@ fn request(cmd: Cmd) -> model::Result<Request> {
             name,
             effort,
             full_access,
-            raw,
             wait,
             sender,
         } => Request::New(NewArgs {
@@ -320,28 +290,19 @@ fn request(cmd: Cmd) -> model::Result<Request> {
             full_access,
             wait: wait.duration(),
             from: cli_caller(sender.from.as_deref())?,
-            max_hops: sender.max_hops,
-            raw,
         }),
         Cmd::Send {
             handle,
             text,
-            mode,
-            reply_to,
-            expect_turn,
-            raw,
+            steer,
             wait,
             sender,
         } => Request::Send(SendArgs {
             handle,
             text,
-            mode,
-            expect_turn,
-            reply_to,
+            steer,
             wait: wait.duration(),
             from: cli_caller(sender.from.as_deref())?,
-            max_hops: sender.max_hops,
-            raw,
         }),
         Cmd::Read {
             handle,
@@ -362,7 +323,6 @@ fn request(cmd: Cmd) -> model::Result<Request> {
             turn,
             receipt,
             timeout,
-            raw,
         } => Request::Wait(WaitArgs {
             handle,
             target: match (turn, receipt) {
@@ -371,7 +331,6 @@ fn request(cmd: Cmd) -> model::Result<Request> {
                 (None, None) => unreachable!("clap requires --turn or --receipt"),
             },
             timeout: Duration::from_secs(timeout),
-            raw,
         }),
     })
 }

@@ -13,9 +13,9 @@ mod transport;
 
 use self::transport::{Events, Service};
 use super::{
-    Agent, ApprovalPolicy, Caps, Check, ListFilter, Mode, Operation, ReadPage, ReadRange,
-    SendRequest, StartRequest, WaitTarget, approval_policy, bounded, record, reject, resolve,
-    settle, wait_receipt,
+    Agent, ApprovalPolicy, Caps, Check, ListFilter, Operation, ReadPage, ReadRange, SendRequest,
+    StartRequest, WaitTarget, approval_policy, bounded, record, reject, resolve, settle,
+    wait_receipt,
 };
 use crate::model::{
     self, Approval, Error, ErrorCode, Message, Observations, Outcome, Page, ReceiptState, Result,
@@ -227,7 +227,7 @@ impl Span {
             .map(|m| &m["error"])
             .find(|e| !e.is_null())
             .cloned();
-        let (status, ended_at, idle) = match &self.end {
+        let (status, ended_at) = match &self.end {
             Some(End::Idle(i)) => (
                 match i["outcome"].as_str() {
                     Some("succeeded") => "completed",
@@ -236,16 +236,14 @@ impl Span {
                     _ => "unknown",
                 },
                 i["time"]["created"].as_i64(),
-                i.clone(),
             ),
             Some(End::Aborted) => (
                 "interrupted",
                 self.after
                     .last()
                     .and_then(|m| m["time"]["completed"].as_i64()),
-                Value::Null,
             ),
-            None => ("unknown", None, Value::Null),
+            None => ("unknown", None),
         };
         let started = self.user["time"]["created"].as_i64();
         model::Turn {
@@ -261,7 +259,6 @@ impl Span {
             basis: Some(
                 "history: the first idle message after the user message, or its interrupted step when a new user message followed without one or nothing runs any more; one execution may answer several user messages".into(),
             ),
-            raw: json!({"user": self.user, "after": self.after, "idle": idle}),
         }
     }
 }
@@ -511,10 +508,10 @@ impl<'a> OpenCode<'a> {
             false,
         );
         let work = async {
-            if req.mode == Mode::Steer && !svc.active(session_id).await? {
+            if req.steer && !svc.active(session_id).await? {
                 return Err(Error::new(
                     ErrorCode::Precondition,
-                    "no running execution to steer (the service would silently start a new one); use --mode queue",
+                    "no running execution to steer (the service would silently start a new one); send without --steer",
                 ));
             }
             // Subscribe before submitting: the stream replays nothing.
@@ -529,18 +526,16 @@ impl<'a> OpenCode<'a> {
                 text: req.text,
                 delivered_text: (req.delivered != req.text).then_some(req.delivered),
                 from: req.from,
-                reply_to: req.reply_to,
                 depth: req.depth,
             })?;
             let body = json!({
                 "id": msg_id,
                 "text": req.delivered,
                 // Always explicit: the service defaults to steer.
-                "delivery": match req.mode { Mode::Queue => "queue", Mode::Steer => "steer" },
+                "delivery": if req.steer { "steer" } else { "queue" },
                 "metadata": {"agent-talk": {
                     "receipt": receipt_id,
                     "from": req.from,
-                    "reply_to": req.reply_to,
                     "depth": req.depth,
                 }},
             });
@@ -757,7 +752,6 @@ impl Agent for OpenCode<'_> {
                 },
                 state: if running { "running" } else { "idle" },
                 owned,
-                raw: s.clone(),
             });
         }
         Ok(Page {
@@ -798,11 +792,9 @@ impl Agent for OpenCode<'_> {
         let send = SendRequest {
             text: req.prompt,
             delivered: req.delivered,
-            mode: Mode::Queue,
+            steer: false,
             from: req.from,
-            reply_to: None,
             depth: req.depth,
-            expect_turn: None,
         };
         self.submit(&svc, &session_id, &send, deadline).await
     }
@@ -813,12 +805,6 @@ impl Agent for OpenCode<'_> {
         req: &SendRequest<'_>,
         deadline: Option<Instant>,
     ) -> Result<Outcome> {
-        if req.expect_turn.is_some() {
-            return Err(Error::new(
-                ErrorCode::Unsupported,
-                "OpenCode steer has no expected-turn check; omit --expect-turn",
-            ));
-        }
         let svc = self.connect().await?;
         self.submit(&svc, session_id, req, deadline).await
     }
@@ -992,7 +978,7 @@ mod tests {
         assert_eq!(t.status, "interrupted");
         assert_eq!(t.final_text, None);
         assert_eq!(t.duration_ms, Some(900));
-        assert_eq!(t.raw["after"].as_array().unwrap().len(), 1);
+        assert_eq!(span.after.len(), 1);
 
         // Resumed after a service restart: the turn goes on.
         let restart = json!({"id":"msg_s","type":"synthetic","text":"The server restarted…","metadata":{"notice":"restart"}});

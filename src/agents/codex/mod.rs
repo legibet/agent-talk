@@ -6,9 +6,9 @@ pub mod transport;
 use self::protocol::*;
 use self::transport::{Conn, Event, ServerRequest, decode};
 use super::{
-    Agent, ApprovalPolicy, Caps, Check, ListFilter, Mode, Operation, ReadPage, ReadRange,
-    SendRequest, StartRequest, WaitTarget, approval_policy, bounded, cli_version, full_access,
-    record, reject, resolve, settle, strip_provenance, wait_receipt,
+    Agent, ApprovalPolicy, Caps, Check, ListFilter, Operation, ReadPage, ReadRange, SendRequest,
+    StartRequest, WaitTarget, approval_policy, bounded, cli_version, full_access, record, reject,
+    resolve, settle, strip_provenance, wait_receipt,
 };
 use crate::model::{
     self, Approval, Error, ErrorCode, Message, Observations, Outcome, Page, Result, Session,
@@ -318,7 +318,7 @@ impl<'a> Codex<'a> {
                     return Ok(if turn.status == "inProgress" {
                         Lookup::Running
                     } else {
-                        Lookup::Done(to_turn(thread_id, turn, raw))
+                        Lookup::Done(to_turn(thread_id, turn))
                     });
                 }
             }
@@ -416,7 +416,7 @@ impl<'a> Codex<'a> {
                     let n: TurnCompletedNotification = decode(&method, &params)?;
                     if n.turn["id"] == turn_id.as_str() {
                         let turn = decode("turn", &n.turn)?;
-                        return Ok(to_turn(&n.thread_id, turn, n.turn));
+                        return Ok(to_turn(&n.thread_id, turn));
                     }
                 }
                 _ => {}
@@ -482,9 +482,8 @@ impl<'a> Codex<'a> {
     }
 }
 
-/// Build the normalized turn from a Codex turn (summary or full items), decoded as `t`
-/// and kept as `raw`.
-fn to_turn(thread_id: &str, t: protocol::Turn, raw: Value) -> model::Turn {
+/// Build the normalized turn from a decoded Codex turn (summary or full items).
+fn to_turn(thread_id: &str, t: protocol::Turn) -> model::Turn {
     let agents: Vec<AgentMessage> = t
         .items
         .iter()
@@ -512,7 +511,6 @@ fn to_turn(thread_id: &str, t: protocol::Turn, raw: Value) -> model::Turn {
         final_text,
         duration_ms: t.duration_ms,
         basis: None,
-        raw,
     }
 }
 
@@ -630,8 +628,7 @@ impl Agent for Codex<'_> {
         conn.close().await;
         let mut items = Vec::new();
         let mut seen = HashSet::new();
-        for raw in threads.data {
-            let t: Thread = decode("thread", &raw)?;
+        for t in threads.data {
             // The default listing scans rollout files and lists a thread once per file
             // (a thread resumed into a new file has several); the first row is the newest.
             if !seen.insert(t.id.clone()) {
@@ -664,7 +661,6 @@ impl Agent for Codex<'_> {
                 state: session_state(&t.status),
                 owned,
                 id: t.id,
-                raw,
             });
         }
         Ok(Page {
@@ -715,7 +711,6 @@ impl Agent for Codex<'_> {
                 text: req.prompt,
                 delivered_text: (req.delivered != req.prompt).then_some(req.delivered),
                 from: req.from,
-                reply_to: None,
                 depth: req.depth,
             })?;
             let started: TurnStartResponse = conn
@@ -776,17 +771,15 @@ impl Agent for Codex<'_> {
                 .map(|t| decode("turn", &t))
                 .transpose()?;
             let idle = newest.as_ref().is_none_or(|t| t.status != "inProgress");
-            let newest_turn = newest.map(|t| t.id);
-            let expected_turn = match req.mode {
-                Mode::Queue => None,
-                Mode::Steer => Some(
-                    req.expect_turn
-                        .map(String::from)
-                        .or(newest_turn)
-                        .ok_or_else(|| {
-                            Error::new(ErrorCode::Precondition, "thread has no turn to steer")
-                        })?,
-                ),
+            let expected_turn = match (req.steer, newest) {
+                (false, _) => None,
+                (true, Some(t)) => Some(t.id),
+                (true, None) => {
+                    return Err(Error::new(
+                        ErrorCode::Precondition,
+                        "thread has no turn to steer",
+                    ));
+                }
             };
             self.store.insert_intent(&NewIntent {
                 receipt_id: &receipt_id,
@@ -795,7 +788,6 @@ impl Agent for Codex<'_> {
                 text: req.text,
                 delivered_text: (req.delivered != req.text).then_some(req.delivered),
                 from: req.from,
-                reply_to: req.reply_to,
                 depth: req.depth,
             })?;
             let target = target.insert(match expected_turn {

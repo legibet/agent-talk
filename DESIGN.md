@@ -27,7 +27,7 @@ behalf, deleting sessions.
 4. **The user's install and login.** Same binaries, same accounts, same permission defaults,
    unless `new --full-access` asks for more.
 5. **Thin.** Normalize only conversation-level events (text, role, phase, turn boundaries,
-   approval requests). Everything else passes through as raw agent JSON behind `--raw`.
+   approval requests). Everything else passes through as raw agent JSON behind `read --raw`.
 6. **Receipts, not assumptions.** Every mutation returns a receipt stating what was accepted. A
    timeout is an unknown outcome, not a rejection; mutations are never retried automatically.
 
@@ -57,7 +57,7 @@ belongs there, not in a system daemon (§7).
 `store.db` (SQLite) has five tables:
 
 - `intents`, written **before** any send: receipt id, handle, client message id, text, delivered
-  text when it differs (provenance header), sender, `reply_to`, hop depth.
+  text when it differs (provenance header), sender, hop depth.
 - `receipts`: `pending | accepted | unknown | rejected`, queue id, turn id, item id, agent error.
   Intent and receipt are written in one transaction.
 - `owned`: sessions agent-talk started (handle, cwd, start arguments).
@@ -124,8 +124,8 @@ standalone `codex exec` or `--no-daemon` run. agent-talk proceeds through the da
 ### Types
 
 ```
-session  { handle, agent, id, cwd?, name?, preview?, observations, state: idle|running|waiting|unknown, owned, raw? }
-turn     { handle, turn_id, status: completed|failed|interrupted|unknown, final_text?, error?, duration_ms?, basis?, raw? }
+session  { handle, agent, id, cwd?, name?, preview?, observations, state: idle|running|waiting|unknown, owned }
+turn     { handle, turn_id, status: completed|failed|interrupted|unknown, final_text?, error?, duration_ms?, basis? }
 message  { turn_id, item_id, role: user|assistant, phase: final|commentary|other, text, from?, timestamp? }
 approval { handle, turn_id?, item_id?, request_id, kind, summary, outcome: pending|declined|resolved|denied, raw }
 receipt  { receipt_id, handle, client_msg_id, state, queue_id?, turn_id?, item_id?, agent_error?, delivered_text? }
@@ -180,16 +180,18 @@ daemon's sandbox once it has unloaded, and a direct-mode Grok load starts a new 
 
 ### Provenance and loops (best-effort)
 
-Each intent records `from`, `reply_to` and `depth`. Depth, computed before any agent call:
+A message from another agent is answered in the receiving turn's final response, which the
+sender gets through `send --wait`, `wait` or `read`; the provenance header says so. An agent
+that answers with `send` instead, or forwards the task again, adds a hop.
 
-- `reply_to` given: 1 + depth of the intent it names (receipt, client message, turn or item id;
-  an unknown id counts as 0).
-- no `reply_to`, agent sender: 1 + depth of the intent that started the caller's current turn
-  when known, else of the newest non-rejected intent delivered to the caller's session (none: 0).
-- no `reply_to`, unknown sender (a person at the CLI): 0.
+Each intent records `from` and `depth`. Depth, computed before any agent call:
 
-A depth above `--max-hops` (default 3) is refused with `E_MAX_HOPS`; the message explains the rule
-and says not to forward again.
+- agent sender: 1 + depth of the intent that started the caller's current turn when known, else
+  of the newest non-rejected intent delivered to the caller's session (none: 0).
+- unknown sender (a person at the CLI): 0.
+
+A depth above 3 is refused with `E_MAX_HOPS`, a fixed backstop against agents messaging each
+other without end; the message says not to forward again.
 
 Sender identity, in priority order:
 
@@ -208,17 +210,18 @@ Sender identity, in priority order:
    order cannot detect.
 4. `unknown`.
 
-An agent sender's message is delivered with a first line `[from <handle> via agent-talk]` and a
-blank line (not doubled when the text already starts with `[from`). The intent keeps the original
-text and records the delivered one. All of this is attribution, not authenticated identity.
+An agent sender's message is delivered with a first line
+`[from <handle> via agent-talk; answer in your final response]` and a blank line (not doubled
+when the text already starts with `[from`). The intent keeps the original text and records the
+delivered one. All of this is attribution, not authenticated identity.
 
 ### MCP server
 
-`agent-talk mcp [--caller H] [--max-hops N]` is an ordinary stdio MCP server that the user
+`agent-talk mcp [--caller H]` is an ordinary stdio MCP server that the user
 configures once, globally; agent-talk never writes agent configuration or injects itself into
 sessions. It serves `ls / new / send / read / wait` with the JSON the CLI prints under `--json`;
 refusals are tool errors (`isError`), not protocol errors. `new` takes `full_access` as on the
-CLI.
+CLI, and requires `cwd`, because the server's working directory is not the caller's.
 
 Code-mode clients (Codex for its gpt-6 models, OpenCode, pi) call tools from a script and pass
 results on without the model reading them, so every tool declares an `outputSchema` generated
@@ -232,14 +235,13 @@ versions (Codex sends 2025-06-18, Grok 2025-11-25). Logging is stderr only.
 
 ```
 agent-talk caps
-agent-talk ls [--agent A] [--cwd DIR] [--all] [--limit N] [--cursor C] [--raw]
-agent-talk new A "prompt" --cwd DIR [--name N] [--model M] [--effort E] [--full-access]
-    [--wait] [--timeout S] [--from H] [--max-hops N] [--raw]
-agent-talk send H "text" [--mode queue|steer] [--expect-turn T] [--reply-to R] [--wait]
-    [--timeout S] [--from H] [--max-hops N] [--raw]
+agent-talk ls [--agent A] [--cwd DIR] [--all] [--limit N] [--cursor C]
+agent-talk new A "prompt" [--cwd DIR] [--name N] [--model M] [--effort E] [--full-access]
+    [--wait] [--timeout S] [--from H]
+agent-talk send H "text" [--steer] [--wait] [--timeout S] [--from H]
 agent-talk read H [--tail N | --since CURSOR [--limit N]] [--raw]
-agent-talk wait H (--turn ID | --receipt R) [--timeout S] [--raw]
-agent-talk mcp [--caller H] [--max-hops N]
+agent-talk wait H (--turn ID | --receipt R) [--timeout S]
+agent-talk mcp [--caller H]
 ```
 
 - `--json` on every command; default output is for humans. Exit codes: 0 ok, 2 refused with a
@@ -251,10 +253,10 @@ agent-talk mcp [--caller H] [--max-hops N]
   connection; notifications arriving before the RPC response are buffered.
 - `wait` checks history first (the turn may be complete), then observes. It matches session and
   turn id and returns the terminal status as reported. "Latest" does not exist.
-- `--mode queue` (default) runs after the current reply: as its own turn on Codex, Grok and
-  Antigravity, inside the same execution on OpenCode. `--mode steer` joins the running turn
+- `send` queues by default: the message runs after the current reply, as its own turn on Codex,
+  Grok and Antigravity, inside the same execution on OpenCode. `--steer` joins the running turn
   (Codex, OpenCode, Grok through a live leader) and is refused when the session is idle.
-  `--expect-turn` is accepted only with steer, and OpenCode refuses it (no expected-turn check).
+- `new --cwd` defaults to the current directory.
 - `new --model` (all) and `--effort` (Codex, Grok, Antigravity) pass through unvalidated in the
   agent's syntax; Claude and OpenCode refuse `--effort` with `E_UNSUPPORTED`. Sends to a Claude or
   Antigravity session agent-talk started pass the model (and effort) `new` recorded again.
@@ -262,11 +264,9 @@ agent-talk mcp [--caller H] [--max-hops N]
   OpenCode `title`, Grok `_x.ai/session/rename`; Antigravity has no interface outside the TUI and
   refuses). agent-talk keeps no copy. `ls` shows `name` and strips the provenance header from
   `preview`, so a session an agent created is recognizable without reading its history.
-- `--raw` (MCP `raw: true`) adds the agent's record under `raw` to each `ls` session and to the
-  turn of `new`, `send` and `wait`; `read --raw` prints the agent's records of the span instead of
-  messages. `read` shows each tool call as one `other` message (`[tool name] status input`), the
-  one place normalization goes past text, because an agent reading a session must see that tools
-  ran.
+- `read --raw` prints the agent's records of the span instead of messages. `read` shows each tool
+  call as one `other` message (`[tool name] status input`), the one place normalization goes past
+  text, because an agent reading a session must see that tools ran.
 - `ls` without `--agent` returns every agent's first page; a failing agent is reported
   in `errors` and does not hide the others.
 
@@ -341,8 +341,8 @@ intent; `wait` leaves its receipt as it was).
 
 - A busy `turn/start` creates no turn: its input is folded into the active turn and displaces the
   original answer. Only `new` uses it, on the thread it just created.
-- Steer is `turn/steer {expectedTurnId}` (`--expect-turn`, else the active turn from the resume
-  response); the input lands at the next model step.
+- Steer is `turn/steer {expectedTurnId}` with the newest turn from the resume response; the input
+  lands at the next model step.
 - Queue is `thread/resume`, then `thread/queue/add`, which the daemon drains FIFO as separate
   turns. Queue id, user item id and turn id differ; correlation is `clientUserMessageId` to
   `userMessage.clientId` to the containing turn.
@@ -447,7 +447,7 @@ before submitting and filters on `data.sessionID`.
   `<providerID>/<modelID>[#variant]`), then the first prompt as a queue send.
 - There is no turn id; execution events carry only the session id. The client may choose the user
   message id (`msg_` prefix) and attach `metadata`, both stored verbatim. agent-talk sends `{id,
-  text, delivery, metadata: {"agent-talk": {receipt, from, reply_to, depth}}}` with an id in the
+  text, delivery, metadata: {"agent-talk": {receipt, from, depth}}}` with an id in the
   service's ascending format; turn id = queue id = that message id.
 - An execution end writes an `idle` row with `outcome: succeeded|failed|interrupted`, except an
   interrupt with reason `shutdown` (a message-less permission reject, the service going down): no
@@ -549,8 +549,7 @@ leader check, since clients of one leader do not exclude each other.
 - Steer: `_x.ai/interject` on a session `working` in a live leader (`E_NO_STEER` without one,
   `E_PRECONDITION` when idle). It has no client id and no expected-turn check: the ack is
   acceptance, the turn comes from `_x.ai/session/interjection`, and if the turn ended meanwhile
-  Grok starts a fallback turn (`interject-fallback-...`) that the receipt then names. agent-talk
-  checks `--expect-turn` itself.
+  Grok starts a fallback turn (`interject-fallback-...`) that the receipt then names.
 - In direct mode the turn dies with the child (closing stdin ends it within about two seconds,
   with no `turn_completed`), and a `session/cancel` sent before `runningPromptId` names the prompt
   is ignored. So the command runs until the turn ends even without `--wait`; when a deadline or

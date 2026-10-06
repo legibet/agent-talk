@@ -22,22 +22,28 @@ use tokio::time::Instant;
 
 /// The text delivered for `text` from `from`: agent senders get a one-line provenance
 /// header so the receiving model, and a person watching its session, sees who is
-/// talking. Not doubled when the text already starts with one (`[from `).
+/// talking and that the answer belongs in the turn's final response (DESIGN.md §4). Not
+/// doubled when the text already starts with one (`[from `).
 pub fn delivered(from: &Caller, text: &str) -> String {
     match (&from.kind, &from.session) {
         (CallerKind::Agent, Some(h)) if !text.starts_with("[from ") => {
-            format!("[from {h} via agent-talk]\n\n{text}")
+            format!("[from {h} via agent-talk; answer in your final response]\n\n{text}")
         }
         _ => text.to_string(),
     }
 }
 
 /// `text` without the provenance header `delivered` adds, for previews: the agent's
-/// first-prompt preview would otherwise show only the header.
+/// first-prompt preview would otherwise show only the header. Also strips the older
+/// `[from <handle> via agent-talk]` form still in session histories.
 pub fn strip_provenance(text: &str) -> &str {
-    match text.strip_prefix("[from ") {
-        Some(rest) if rest.contains(" via agent-talk]\n") => {
-            text.split_once("\n\n").map_or("", |(_, body)| body)
+    match text.split_once("\n\n") {
+        Some((line, body))
+            if line.starts_with("[from ")
+                && line.ends_with(']')
+                && line.contains(" via agent-talk") =>
+        {
+            body
         }
         _ => text,
     }
@@ -323,15 +329,6 @@ impl Agent for Adapter<'_> {
     }
 }
 
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, serde::Deserialize, schemars::JsonSchema,
-)]
-#[serde(rename_all = "lowercase")]
-pub enum Mode {
-    Queue,
-    Steer,
-}
-
 pub enum WaitTarget {
     Turn(String),
     Receipt(String),
@@ -370,13 +367,11 @@ pub struct SendRequest<'a> {
     pub text: &'a str,
     /// What reaches the agent: `text`, with a provenance header for agent senders.
     pub delivered: &'a str,
-    pub mode: Mode,
+    /// Into the running turn (`send --steer`) instead of queued after it.
+    pub steer: bool,
     pub from: &'a Caller,
-    pub reply_to: Option<&'a str>,
     /// Hop depth of this message (`Store::hop_depth`).
     pub depth: u32,
-    /// Steer only: the active turn id the caller expects; defaults to the newest turn.
-    pub expect_turn: Option<&'a str>,
 }
 
 /// Which part of the history `read` returns.
@@ -612,12 +607,13 @@ mod tests {
         let text = delivered(&agent, "what is the word?");
         assert_eq!(
             text,
-            "[from codex:01a1029c-17b8-75c1-9e19-0fc6d58b0512 via agent-talk]\n\nwhat is the word?"
+            "[from codex:01a1029c-17b8-75c1-9e19-0fc6d58b0512 via agent-talk; answer in your final response]\n\nwhat is the word?"
         );
         assert_eq!(strip_provenance(&text), "what is the word?");
         // A header the model wrote itself is not doubled.
         let own = "[from codex:x via agent-talk]\n\nhi";
         assert_eq!(delivered(&agent, own), own);
+        assert_eq!(strip_provenance(own), "hi");
         // People and unknown senders: unchanged, and a text that merely starts with
         // "[from " is not a header.
         assert_eq!(delivered(&Caller::UNKNOWN, "hi"), "hi");
@@ -635,7 +631,6 @@ mod tests {
                 client_msg_id: &format!("c-{id}"),
                 text: "x",
                 from: &Caller::UNKNOWN,
-                reply_to: None,
                 depth: 0,
                 delivered_text: None,
             })

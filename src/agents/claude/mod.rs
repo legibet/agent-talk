@@ -21,9 +21,9 @@ use self::process::{AgentEntry, agents};
 use self::stream::{Run, StreamEvent, System, denial, result_turn};
 use self::transcript::{TurnEnd, head, live_branch, load, slug, transcript_turn, turn_end};
 use super::{
-    Agent, ApprovalPolicy, Caps, Check, ListFilter, Mode, Operation, ReadPage, ReadRange,
-    SendRequest, StartRequest, WaitTarget, approval_policy, bounded, cli_version, first_line, lock,
-    pid_alive, record, settle, tail, wait_receipt,
+    Agent, ApprovalPolicy, Caps, Check, ListFilter, Operation, ReadPage, ReadRange, SendRequest,
+    StartRequest, WaitTarget, approval_policy, bounded, cli_version, first_line, lock, pid_alive,
+    record, settle, tail, wait_receipt,
 };
 use crate::model::{
     self, AgentError, Approval, Error, ErrorCode, Observations, Outcome, Page, ReceiptState,
@@ -186,7 +186,6 @@ impl<'a> Claude<'a> {
         })?;
         Ok(agents
             .into_iter()
-            .map(|(a, _)| a)
             .find(|a| a.session_id.as_deref() == Some(id) && a.pid.is_some())
             .map(|a| {
                 let pid = a.pid.and_then(|p| u32::try_from(p).ok()).unwrap_or(0);
@@ -328,7 +327,6 @@ impl<'a> Claude<'a> {
                     final_text: None,
                     duration_ms: None,
                     basis: Some("claude -p process exited".into()),
-                    raw: Value::Null,
                 });
             };
             for d in r["permission_denials"].as_array().into_iter().flatten() {
@@ -399,7 +397,7 @@ impl Agent for Claude<'_> {
     ) -> Result<Page<Session>> {
         struct Row {
             id: String,
-            agent: Option<(AgentEntry, Value)>,
+            agent: Option<AgentEntry>,
             file: Option<PathBuf>,
             recency_ms: i64,
         }
@@ -455,7 +453,7 @@ impl Agent for Claude<'_> {
                 );
             }
         }
-        for (a, raw) in agents {
+        for a in agents {
             let Some(id) = a.session_id.clone() else {
                 continue;
             };
@@ -463,7 +461,7 @@ impl Agent for Claude<'_> {
             match rows.get_mut(&id) {
                 Some(row) => {
                     row.recency_ms = row.recency_ms.max(started);
-                    row.agent = Some((a, raw));
+                    row.agent = Some(a);
                 }
                 None => {
                     if filter.cwd.is_some() && a.cwd.as_deref() != filter.cwd {
@@ -473,7 +471,7 @@ impl Agent for Claude<'_> {
                         id.clone(),
                         Row {
                             id,
-                            agent: Some((a, raw)),
+                            agent: Some(a),
                             file: None,
                             recency_ms: started,
                         },
@@ -499,7 +497,7 @@ impl Agent for Claude<'_> {
                 Some(p) => head(p),
                 None => (None, None, None, None),
             };
-            let agent = row.agent.as_ref().map(|(a, _)| a);
+            let agent = row.agent.as_ref();
             let live_pid = agent
                 .and_then(|a| a.pid)
                 .and_then(|p| u32::try_from(p).ok());
@@ -554,11 +552,6 @@ impl Agent for Claude<'_> {
                 },
                 state,
                 owned,
-                raw: json!({
-                    "agent": row.agent.as_ref().map(|(_, raw)| raw),
-                    "transcript": row.file,
-                    "mtime_ms": row.recency_ms,
-                }),
                 id: row.id,
             });
         }
@@ -590,7 +583,6 @@ impl Agent for Claude<'_> {
             text: req.prompt,
             delivered_text: (req.delivered != req.prompt).then_some(req.delivered),
             from: req.from,
-            reply_to: None,
             depth: req.depth,
         })?;
         let mut args = process::args(
@@ -620,10 +612,10 @@ impl Agent for Claude<'_> {
         deadline: Option<Instant>,
     ) -> Result<Outcome> {
         check_id(id)?;
-        if req.mode == Mode::Steer {
+        if req.steer {
             return Err(Error::new(
                 ErrorCode::NoSteer,
-                "Claude sessions cannot be steered (agent-talk keeps no long-lived claude process); send with --mode queue",
+                "Claude sessions cannot be steered (agent-talk keeps no long-lived claude process); send without --steer",
             ));
         }
         let h = handle(id);
@@ -662,7 +654,6 @@ impl Agent for Claude<'_> {
             text: req.text,
             delivered_text: (req.delivered != req.text).then_some(req.delivered),
             from: req.from,
-            reply_to: req.reply_to,
             depth: req.depth,
         })?;
         // A session agent-talk started keeps the model and permissions `new` gave it.
@@ -801,11 +792,8 @@ impl Agent for Claude<'_> {
                 }
                 let live = self.live(id).await?;
                 let agent_status = match &live {
-                    Some(Live::Foreign(a)) => json!({
-                        "pid": a.pid, "status": a.status, "kind": a.kind,
-                    }),
-                    Some(Live::Own(pid)) => json!({"pid": pid, "own": true}),
-                    None => Value::Null,
+                    Some(Live::Foreign(a)) => a.status.as_deref(),
+                    _ => None,
                 };
                 // 2. A transcript marker or a later prompt closes the turn; 3. so does
                 // the end of every process that could still write it.
@@ -837,7 +825,6 @@ impl Agent for Claude<'_> {
                             final_text: None,
                             duration_ms: None,
                             basis: Some("claude -p process exited".into()),
-                            raw: Value::Null,
                         });
                     }
                     Some(Live::Own(pid)) => {

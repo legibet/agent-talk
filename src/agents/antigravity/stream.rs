@@ -107,7 +107,6 @@ pub fn result_turn(handle: String, run: &Run, result: &Value) -> model::Turn {
         // conversation, not this turn's.
         duration_ms: None,
         basis: Some("result event of the agy -p process agent-talk started".into()),
-        raw: result.clone(),
     }
 }
 

@@ -13,7 +13,7 @@
 
 use crate::agents::first_line;
 use crate::model::{self, Message, Result};
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
@@ -256,7 +256,7 @@ impl History {
     }
 
     /// The finished turn of a span: status from `stop_reason`, the final message as
-    /// `final_text`, the span's lines as raw.
+    /// `final_text`.
     pub fn turn(&self, handle: String, span: usize, messages: &[Msg]) -> Option<model::Turn> {
         let s = &self.spans[span];
         let end = &self.lines[s.end?].raw;
@@ -273,12 +273,6 @@ impl History {
                 .map(|m| m.message.text.clone()),
             duration_ms: u["elapsed_ms"].as_i64(),
             basis: Some("updates.jsonl turn_completed".into()),
-            raw: json!(
-                self.lines[s.start..=s.end?]
-                    .iter()
-                    .map(|l| &l.raw)
-                    .collect::<Vec<_>>()
-            ),
         })
     }
 }
