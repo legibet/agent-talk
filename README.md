@@ -42,8 +42,9 @@ one itself.
 agent-talk ls --cwd .
 agent-talk new claude --wait "list the failing tests"
 agent-talk send codex:<thread id> --wait "what are you working on?"
-agent-talk read opencode:<session id> --tail 4
+agent-talk read opencode:<session id> --limit 4
 agent-talk wait codex:<thread id> --receipt <receipt id>
+agent-talk models opencode deepseek
 agent-talk status
 ```
 
@@ -99,9 +100,9 @@ agent's own TUI or app depends on the agent.
 
 ## MCP
 
-`agent-talk mcp` runs agent-talk as an MCP server. It provides the tools `ls`, `new`, `send`,
-`read` and `wait`, which correspond to the CLI commands of the same name and return the same JSON
-as `--json`. Register it with the absolute path of the binary.
+`agent-talk mcp` runs agent-talk as an MCP server. It provides the tools `models`, `ls`, `new`,
+`send`, `read` and `wait`, which correspond to the CLI commands of the same name and return the
+same JSON as `--json`. Register it with the absolute path of the binary.
 
 For Claude Code, run:
 

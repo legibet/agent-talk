@@ -330,6 +330,15 @@ pub struct Page<T> {
     pub next_cursor: Option<String>,
 }
 
+/// A model an agent can start a session on.
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+pub struct Model {
+    /// What `new --model` takes (OpenCode: `provider/model`).
+    pub id: String,
+    /// What `new --effort` takes with this model; empty when it has no effort setting.
+    pub efforts: Vec<String>,
+}
+
 /// Result of `new`, `send` and `wait`.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct Outcome {

@@ -26,7 +26,7 @@ use super::{
     lock, pid_alive, record, settle, tail, wait_receipt,
 };
 use crate::model::{
-    self, AgentError, Approval, Error, ErrorCode, Observations, Outcome, Page, ReceiptState,
+    self, AgentError, Approval, Error, ErrorCode, Model, Observations, Outcome, Page, ReceiptState,
     Result, Session,
 };
 use crate::store::{NewIntent, Store};
@@ -40,6 +40,12 @@ use tokio::time::Instant;
 
 /// Why agent-talk refuses a second writer (DESIGN.md §6.2).
 const SECOND_WRITER: &str = "a concurrent --resume would fork the transcript and silently drop one branch of the conversation";
+
+/// Claude Code has no listing interface; `--model` takes an alias for the latest model of a
+/// family (`claude --help`, plus `haiku`, accepted on 2.1.291) and `--effort` one of these
+/// levels. The one model list agent-talk carries itself (DESIGN.md §5).
+const MODELS: [&str; 4] = ["fable", "opus", "sonnet", "haiku"];
+const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 
 pub struct Claude<'a> {
     store: &'a Store,
@@ -357,6 +363,16 @@ impl<'a> Claude<'a> {
 }
 
 impl Agent for Claude<'_> {
+    async fn models(&self) -> Result<Vec<Model>> {
+        Ok(MODELS
+            .iter()
+            .map(|id| Model {
+                id: (*id).into(),
+                efforts: EFFORTS.map(String::from).into(),
+            })
+            .collect())
+    }
+
     async fn status(&self) -> AgentStatus {
         let version = cli_version("claude").await;
         let cli: Check = version.as_ref().map(|_| ()).map_err(String::clone);

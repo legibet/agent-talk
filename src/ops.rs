@@ -1,11 +1,11 @@
-//! The five operations behind both front-ends (CLI and MCP): handle parsing, sender
+//! The operations behind both front-ends (CLI and MCP): handle parsing, sender
 //! provenance header, hop limit, agent dispatch, typed output.
 
 use crate::agents::{
     Adapter, Agent, AgentStatus, ListFilter, ReadQuery, SendRequest, StartRequest, WaitTarget,
     delivered,
 };
-use crate::model::{Caller, Error, ErrorCode, Message, Outcome, Result, Session};
+use crate::model::{Caller, Error, ErrorCode, Message, Model, Outcome, Result, Session};
 use crate::store::Store;
 use futures_util::future::join_all;
 use schemars::JsonSchema;
@@ -21,17 +21,28 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
 pub const MAX_HOPS: u32 = 3;
 pub const LS_LIMIT: u32 = 25;
 pub const READ_LIMIT: usize = 20;
+pub const MODELS_LIMIT: usize = 50;
 
 pub enum Request {
     /// `sender` is who this shell's `new` and `send` would be attributed to.
     Status {
         sender: Caller,
     },
+    Models(ModelsArgs),
     Ls(LsArgs),
     New(NewArgs),
     Send(SendArgs),
     Read(ReadArgs),
     Wait(WaitArgs),
+}
+
+pub struct ModelsArgs {
+    pub agent: String,
+    /// Only models whose id contains this, case-insensitively.
+    pub query: Option<String>,
+    pub limit: usize,
+    /// The last id of the previous page.
+    pub cursor: Option<String>,
 }
 
 pub struct LsArgs {
@@ -90,9 +101,18 @@ pub enum Output {
         agents: Vec<AgentStatus>,
         sender: Caller,
     },
+    Models(Models),
     Sessions(Sessions),
     Read(Read),
     Outcome(Box<Outcome>),
+}
+
+/// Result of `models`: one page of an agent's models, sorted by id.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct Models {
+    pub models: Vec<Model>,
+    /// Cursor of the next page; absent on the last.
+    pub next_cursor: Option<String>,
 }
 
 /// Result of `ls`: one page per agent asked; an unavailable agent does not hide
@@ -132,6 +152,10 @@ pub async fn run(store: &Store, req: Request) -> Result<Output> {
             let adapters = Adapter::all(store);
             let agents = join_all(adapters.iter().map(|p| p.status())).await;
             Ok(Output::Status { agents, sender })
+        }
+        Request::Models(a) => {
+            let all = Adapter::named(store, &a.agent)?.models().await?;
+            Ok(Output::Models(page_models(all, &a)?))
         }
         Request::Ls(a) => ls(store, a).await,
         Request::New(a) => new(store, a).await,
@@ -241,6 +265,31 @@ async fn wait(store: &Store, a: WaitArgs) -> Result<Output> {
     Ok(Output::Outcome(Box::new(o)))
 }
 
+/// The page of `all` after the cursor, among the models matching the query, sorted by id.
+fn page_models(mut all: Vec<Model>, a: &ModelsArgs) -> Result<Models> {
+    all.sort_by(|x, y| x.id.cmp(&y.id));
+    let query = a.query.as_deref().map(str::to_lowercase);
+    let mut rest = all.into_iter().filter(|m| {
+        query
+            .as_ref()
+            .is_none_or(|q| m.id.to_lowercase().contains(q))
+    });
+    if let Some(c) = &a.cursor
+        && !rest.by_ref().any(|m| m.id == *c)
+    {
+        return Err(Error::new(
+            ErrorCode::Precondition,
+            format!("unknown cursor {c}"),
+        ));
+    }
+    let models: Vec<Model> = rest.by_ref().take(a.limit).collect();
+    let next_cursor = rest.next().and(models.last()).map(|m| m.id.clone());
+    Ok(Models {
+        models,
+        next_cursor,
+    })
+}
+
 /// Split `<agent>:<id>`.
 fn split_handle(handle: &str) -> Result<(&str, &str)> {
     match handle.split_once(':') {
@@ -292,6 +341,47 @@ fn hop_depth(store: &Store, from: &Caller) -> Result<u32> {
 mod tests {
     use super::*;
     use crate::store::NewIntent;
+
+    #[test]
+    fn models_page_by_id_after_the_cursor_within_the_query() {
+        let all: Vec<Model> = ["b/m2", "a/m1", "b/M1", "c/x"]
+            .map(|id| Model {
+                id: id.into(),
+                efforts: Vec::new(),
+            })
+            .into();
+        let page = |query: Option<&str>, limit, cursor: Option<&str>| {
+            page_models(
+                all.clone(),
+                &ModelsArgs {
+                    agent: "codex".into(),
+                    query: query.map(String::from),
+                    limit,
+                    cursor: cursor.map(String::from),
+                },
+            )
+        };
+        fn ids(p: &Models) -> Vec<&str> {
+            p.models.iter().map(|m| m.id.as_str()).collect()
+        }
+
+        let p = page(None, 3, None).unwrap();
+        assert_eq!(ids(&p), ["a/m1", "b/M1", "b/m2"]);
+        assert_eq!(p.next_cursor.as_deref(), Some("b/m2"));
+        let p = page(None, 3, Some("b/m2")).unwrap();
+        assert_eq!(ids(&p), ["c/x"]);
+        assert_eq!(p.next_cursor, None);
+
+        let p = page(Some("M1"), 1, None).unwrap();
+        assert_eq!(ids(&p), ["a/m1"]);
+        let p = page(Some("M1"), 1, Some("a/m1")).unwrap();
+        assert_eq!((ids(&p), p.next_cursor.is_none()), (vec!["b/M1"], true));
+
+        assert_eq!(
+            page(Some("M1"), 1, Some("c/x")).unwrap_err().code,
+            ErrorCode::Precondition
+        );
+    }
 
     #[test]
     fn hop_limit_is_inclusive() {

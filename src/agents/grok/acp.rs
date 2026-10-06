@@ -73,6 +73,8 @@ pub struct Spawn<'a> {
 }
 
 pub struct Conn {
+    /// The `initialize` response: `_meta.modelState` lists the account's models.
+    pub init: Value,
     child: Child,
     stdin: tokio::sync::Mutex<Option<ChildStdin>>,
     pending: Arc<Mutex<Pending>>,
@@ -138,7 +140,8 @@ pub async fn spawn(cwd: &str, s: &Spawn<'_>) -> Result<Conn> {
     let (tx, events) = mpsc::unbounded_channel();
     let (req_tx, requests) = mpsc::unbounded_channel();
     let reader = tokio::spawn(read_loop(stdout, pending.clone(), tx, req_tx));
-    let conn = Conn {
+    let mut conn = Conn {
+        init: Value::Null,
         stdin: tokio::sync::Mutex::new(child.stdin.take()),
         child,
         pending,
@@ -148,15 +151,16 @@ pub async fn spawn(cwd: &str, s: &Spawn<'_>) -> Result<Conn> {
         requests,
         reader,
     };
-    conn.request(
-        "initialize",
-        json!({
-            "protocolVersion": 1,
-            "clientCapabilities": {"fs": {"readTextFile": false, "writeTextFile": false}, "terminal": false},
-            "clientInfo": {"name": "agent-talk", "version": env!("CARGO_PKG_VERSION")},
-        }),
-    )
-    .await?;
+    conn.init = conn
+        .request(
+            "initialize",
+            json!({
+                "protocolVersion": 1,
+                "clientCapabilities": {"fs": {"readTextFile": false, "writeTextFile": false}, "terminal": false},
+                "clientInfo": {"name": "agent-talk", "version": env!("CARGO_PKG_VERSION")},
+            }),
+        )
+        .await?;
     Ok(conn)
 }
 

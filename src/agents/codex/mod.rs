@@ -11,7 +11,7 @@ use super::{
     full_access, record, reject, resolve, settle, strip_provenance, wait_receipt,
 };
 use crate::model::{
-    self, Approval, Error, ErrorCode, Message, Observations, Outcome, Page, Result, Session,
+    self, Approval, Error, ErrorCode, Message, Model, Observations, Outcome, Page, Result, Session,
 };
 use crate::store::{NewIntent, Store};
 use serde_json::{Value, json};
@@ -535,6 +535,35 @@ fn session_state(s: &ThreadStatus) -> &'static str {
 }
 
 impl Agent for Codex<'_> {
+    async fn models(&self) -> Result<Vec<Model>> {
+        let conn = self.connect().await?;
+        let mut models = Vec::new();
+        let mut cursor = Value::Null;
+        loop {
+            let page = conn
+                .request("model/list", json!({"cursor": cursor, "limit": 100}))
+                .await?;
+            for m in page["data"].as_array().into_iter().flatten() {
+                models.push(Model {
+                    id: m["model"].as_str().unwrap_or_default().into(),
+                    efforts: m["supportedReasoningEfforts"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|e| e["reasoningEffort"].as_str())
+                        .map(String::from)
+                        .collect(),
+                });
+            }
+            match page["nextCursor"].as_str() {
+                Some(c) => cursor = json!(c),
+                None => break,
+            }
+        }
+        conn.close().await;
+        Ok(models)
+    }
+
     async fn status(&self) -> AgentStatus {
         let version = cli_version("codex").await.ok();
         let (shared, daemon, queue, steer) = match self.connect().await {

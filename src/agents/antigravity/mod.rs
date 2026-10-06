@@ -28,11 +28,12 @@ use self::transcript::{
 };
 use super::{
     Agent, AgentStatus, Check, ListFilter, Operation, ReadPage, ReadQuery, SendRequest,
-    StartRequest, WaitTarget, bounded, cli_version, cut, lock, pid_alive, record, settle, tail,
-    wait_receipt,
+    StartRequest, WaitTarget, agent_cmd, bounded, cli_version, cut, lock, pid_alive, record,
+    settle, tail, wait_receipt,
 };
 use crate::model::{
-    self, Approval, Error, ErrorCode, Observations, Outcome, Page, ReceiptState, Result, Session,
+    self, Approval, Error, ErrorCode, Model, Observations, Outcome, Page, ReceiptState, Result,
+    Session,
 };
 use crate::store::{NewIntent, Store};
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
@@ -484,6 +485,58 @@ impl<'a> Antigravity<'a> {
 }
 
 impl Agent for Antigravity<'_> {
+    async fn models(&self) -> Result<Vec<Model>> {
+        let out = agent_cmd("agy")
+            .arg("models")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .await
+            .map_err(|e| {
+                Error::new(
+                    ErrorCode::Transport,
+                    format!("cannot run `agy models`: {e}"),
+                )
+            })?;
+        if !out.status.success() {
+            return Err(Error::new(
+                ErrorCode::Transport,
+                format!(
+                    "`agy models` failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ),
+            ));
+        }
+        // One line per model and effort, `gemini-3.8-flash-low\tGemini 3.8 Flash (Low)`;
+        // `--model` takes the alias before the effort suffix, with that `--effort`
+        // (DESIGN.md §6.5).
+        let mut models: Vec<Model> = Vec::new();
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let Some((id, name)) = line.split_once('\t') else {
+                continue;
+            };
+            let effort = name
+                .trim()
+                .rsplit_once(" (")
+                .and_then(|(_, e)| e.strip_suffix(')'))
+                .map(str::to_lowercase);
+            let alias = effort
+                .as_deref()
+                .and_then(|e| id.strip_suffix(e)?.strip_suffix('-'));
+            let (id, efforts) = match (alias, effort) {
+                (Some(alias), Some(effort)) => (alias, vec![effort]),
+                _ => (id, Vec::new()),
+            };
+            match models.iter_mut().find(|m| m.id == id) {
+                Some(m) => m.efforts.extend(efforts),
+                None => models.push(Model {
+                    id: id.into(),
+                    efforts,
+                }),
+            }
+        }
+        Ok(models)
+    }
+
     async fn status(&self) -> AgentStatus {
         let version = cli_version("agy").await;
         let cli: Check = version.as_ref().map(|_| ()).map_err(String::clone);

@@ -8,8 +8,8 @@ use agents::{ReadQuery, WaitTarget};
 use clap::{Args, Parser, Subcommand};
 use model::{Approval, Caller, CallerKind, Outcome, Receipt, Turn};
 use ops::{
-    DEFAULT_TIMEOUT, LsArgs, NewArgs, Output, Read, ReadArgs, Request, SendArgs, Sessions,
-    WaitArgs, caller_from_handle, env_var,
+    DEFAULT_TIMEOUT, LsArgs, Models, ModelsArgs, NewArgs, Output, Read, ReadArgs, Request,
+    SendArgs, Sessions, WaitArgs, caller_from_handle, env_var,
 };
 use serde_json::json;
 use std::path::PathBuf;
@@ -63,6 +63,20 @@ impl WaitOpts {
 enum Cmd {
     /// Show each agent's installed version and which operations work now.
     Status,
+    /// List the models an agent can start a session on, with the effort values each
+    /// takes; one page per call, sorted by id.
+    Models {
+        /// codex, claude, opencode, grok or antigravity.
+        agent: String,
+        /// Only models whose id contains this text.
+        query: Option<String>,
+        /// Models per page.
+        #[arg(long, default_value_t = ops::MODELS_LIMIT)]
+        limit: usize,
+        /// Cursor printed by a previous page.
+        #[arg(long)]
+        cursor: Option<String>,
+    },
     /// List sessions, one page per call; pass a handle to send or read.
     Ls {
         /// Only this agent: codex, claude, opencode, grok or antigravity.
@@ -90,13 +104,14 @@ enum Cmd {
         /// Working directory of the session.
         #[arg(long, default_value = ".")]
         cwd: PathBuf,
-        /// Model, in the agent's own naming; default: the agent's.
+        /// Model id as listed by models; default: the agent's.
         #[arg(long)]
         model: Option<String>,
         /// Title shown by ls; Antigravity has none.
         #[arg(long)]
         name: Option<String>,
-        /// Reasoning effort, in the agent's own values; default: the agent's.
+        /// Reasoning effort, one of the model's values listed by models; default: the
+        /// agent's.
         #[arg(long)]
         effort: Option<String>,
         /// Let the session act without asking for permission; default: the agent's own
@@ -256,6 +271,17 @@ fn request(cmd: Cmd) -> model::Result<Request> {
             sender: cli_caller(None)?,
         },
         Cmd::Mcp { .. } => unreachable!("handled in main"),
+        Cmd::Models {
+            agent,
+            query,
+            limit,
+            cursor,
+        } => Request::Models(ModelsArgs {
+            agent,
+            query,
+            limit,
+            cursor,
+        }),
         Cmd::Ls {
             agent,
             cwd,
@@ -392,6 +418,17 @@ fn print_human(out: &Output) {
                 "sender",
                 sender.session.as_deref().unwrap_or("unknown")
             );
+        }
+        Output::Models(Models {
+            models,
+            next_cursor,
+        }) => {
+            for m in models {
+                println!("{:<48} {}", m.id, m.efforts.join(" "));
+            }
+            if let Some(c) = next_cursor {
+                println!("next cursor: {c}");
+            }
         }
         Output::Sessions(Sessions {
             sessions,

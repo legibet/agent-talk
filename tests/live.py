@@ -360,7 +360,7 @@ def offline():
             finally:
                 m.close()
             names = {t["name"] for t in tools}
-            expect(names == {"ls", "new", "send", "read", "wait"}, f"({protocol}) tool names {names}")
+            expect(names == {"models", "ls", "new", "send", "read", "wait"}, f"({protocol}) tool names {names}")
             incomplete = [
                 t["name"] for t in tools if not (t.get("title") and t.get("annotations") and t.get("outputSchema"))
             ]

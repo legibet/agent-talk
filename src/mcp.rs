@@ -1,4 +1,4 @@
-//! `agent-talk mcp`: the CLI's ls, new, send, read and wait as MCP tools on stdio.
+//! `agent-talk mcp`: the CLI's models, ls, new, send, read and wait as MCP tools on stdio.
 //!
 //! Each tool builds the same request the CLI builds and runs it through `ops::run`,
 //! so results are exactly what `--json` prints, and refusals are the CLI's error object
@@ -7,8 +7,8 @@
 use crate::agents::{ReadQuery, WaitTarget};
 use crate::model::{self, Caller, Error, ErrorCode, Outcome};
 use crate::ops::{
-    self, DEFAULT_TIMEOUT, LS_LIMIT, LsArgs, NewArgs, READ_LIMIT, Read, ReadArgs, Request,
-    SendArgs, Sessions, WaitArgs, caller_from_handle, env_var,
+    self, DEFAULT_TIMEOUT, LS_LIMIT, LsArgs, MODELS_LIMIT, Models, ModelsArgs, NewArgs, READ_LIMIT,
+    Read, ReadArgs, Request, SendArgs, Sessions, WaitArgs, caller_from_handle, env_var,
 };
 use crate::store::Store;
 use rmcp::handler::server::tool::schema_for_type;
@@ -26,8 +26,8 @@ use std::time::Duration;
 
 const INSTRUCTIONS: &str = "Tools to talk to other agent sessions on this machine (Codex, \
 Claude Code, OpenCode, Grok CLI, Antigravity CLI): ls finds one, new starts one, send messages \
-it (wait=true returns the reply), read shows its conversation, wait waits for a turn. Messages \
-carry your own session as the sender.";
+it (wait=true returns the reply), read shows its conversation, wait waits for a turn, models \
+lists what new can start on. Messages carry your own session as the sender.";
 
 #[derive(Clone)]
 pub struct Server {
@@ -40,6 +40,18 @@ pub struct Server {
     /// every shell command.
     env: Option<Caller>,
     tool_router: ToolRouter<Self>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct ModelsParams {
+    /// `codex`, `claude`, `opencode`, `grok` or `antigravity`.
+    agent: String,
+    /// Only models whose id contains this text, e.g. a provider or a family name.
+    query: Option<String>,
+    /// Models per page (default 50).
+    limit: Option<usize>,
+    /// `next_cursor` of a previous page.
+    cursor: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -62,11 +74,12 @@ struct NewParams {
     cwd: String,
     /// First message for the new session.
     prompt: String,
-    /// Model, in the agent's own naming (default: the agent's).
+    /// Model id as listed by `models` (default: the agent's).
     model: Option<String>,
     /// Title shown by ls, to find the session again; Antigravity has none.
     name: Option<String>,
-    /// Reasoning effort, in the agent's own values (default: the agent's).
+    /// Reasoning effort, one of the model's values listed by `models` (default: the
+    /// agent's).
     effort: Option<String>,
     /// Let the session act without asking for permission (default false: the agent's own
     /// permissions).
@@ -215,6 +228,22 @@ impl Server {
 
 #[tool_router]
 impl Server {
+    #[tool(
+        title = "List models",
+        output_schema = schema_for_type::<Models>(),
+        annotations(read_only_hint = true, open_world_hint = false),
+        description = "List the models an agent can start a session on (new's model) with the effort values each takes (new's effort), sorted by id, one page per call. Pass a query to narrow by id, e.g. a provider or family name; OpenCode lists every model of every configured provider, so query it. Pass next_cursor back as cursor for the next page."
+    )]
+    async fn models(&self, Parameters(p): Parameters<ModelsParams>) -> CallToolResult {
+        self.exec(Request::Models(ModelsArgs {
+            agent: p.agent,
+            query: p.query,
+            limit: p.limit.unwrap_or(MODELS_LIMIT),
+            cursor: p.cursor,
+        }))
+        .await
+    }
+
     #[tool(
         title = "List sessions",
         output_schema = schema_for_type::<Sessions>(),

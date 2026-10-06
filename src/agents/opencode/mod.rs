@@ -18,8 +18,8 @@ use super::{
     reject, resolve, settle, wait_receipt,
 };
 use crate::model::{
-    self, Approval, Error, ErrorCode, Message, Observations, Outcome, Page, ReceiptState, Result,
-    Session,
+    self, Approval, Error, ErrorCode, Message, Model, Observations, Outcome, Page, ReceiptState,
+    Result, Session,
 };
 use crate::store::{NewIntent, Store};
 use serde_json::{Value, json};
@@ -682,6 +682,30 @@ impl<'a> OpenCode<'a> {
 }
 
 impl Agent for OpenCode<'_> {
+    async fn models(&self) -> Result<Vec<Model>> {
+        // Every model of every configured provider; a `variant` is the model's effort.
+        let rows = self.connect().await?.get("/api/model", &[]).await?;
+        Ok(rows["data"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|m| Model {
+                id: format!(
+                    "{}/{}",
+                    m["providerID"].as_str().unwrap_or_default(),
+                    m["id"].as_str().unwrap_or_default()
+                ),
+                efforts: m["variants"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|v| v["id"].as_str())
+                    .map(String::from)
+                    .collect(),
+            })
+            .collect())
+    }
+
     async fn status(&self) -> AgentStatus {
         let (version, shared, service): (Option<String>, String, Check) = match self.connect().await
         {

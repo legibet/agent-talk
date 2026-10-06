@@ -237,6 +237,7 @@ versions (Codex sends 2025-06-18, Grok 2025-11-25). Logging is stderr only.
 
 ```
 agent-talk status
+agent-talk models A [QUERY] [--limit N] [--cursor C]
 agent-talk ls [--agent A] [--cwd DIR] [--all] [--limit N] [--cursor C]
 agent-talk new A "prompt" [--cwd DIR] [--name N] [--model M] [--effort E] [--full-access]
     [--wait] [--timeout S] [--from H]
@@ -264,6 +265,15 @@ agent-talk mcp [--caller H]
   cannot change it. Claude and Antigravity take both per process, so sends to a session
   agent-talk started pass the model and effort `new` recorded again; the other agents store them
   with the session (§6).
+- `models A` lists what those two options take on one agent: `{id, efforts}` rows sorted by id,
+  `efforts` being the values `--effort` accepts with that model (empty when it has none). QUERY
+  keeps the ids containing it, case-insensitively; `--limit`/`--cursor` page, the cursor being
+  the last id shown. The rows come from the agent each time: Codex `model/list`, OpenCode
+  `GET /api/model` (every model of every configured provider, hundreds of rows, hence the query),
+  Grok the `initialize` response of a direct child, Antigravity `agy models` with its
+  `<alias>-<effort>` ids folded into the alias and its efforts. Claude Code has no listing
+  interface; its rows are the aliases and effort levels `claude --help` names, the one model
+  list agent-talk carries itself.
 - `new --name N` stores a title at the agent (Codex thread name, Claude `custom-title` line,
   OpenCode `title`, Grok `_x.ai/session/rename`; Antigravity has no interface outside the TUI and
   refuses). agent-talk keeps no copy. `ls` shows `name` and strips the provenance header from
@@ -543,6 +553,10 @@ shared leader, where sessions behave like Codex threads in the daemon. Otherwise
 - Only `ENOENT`, `ECONNREFUSED` (a stale socket) and a path too long for `SUN_LEN` select direct
   mode; `EPERM`/`EACCES` (a sandbox) is `E_TRANSPORT`.
 - The child gets `GROK_DISABLE_AUTOUPDATER=1` (`grok agent` has no `--no-auto-update`).
+- The `initialize` response carries `_meta.modelState.availableModels`, each with
+  `_meta.reasoningEfforts` where the model has them, the same list `session/new` returns. `models`
+  reads it from a direct child in `GROK_HOME` and kills the child (a clean exit takes about 4 s);
+  `initialize` alone writes no session directory.
 
 **Store.** `<GROK_HOME>/sessions/<urlencoded cwd>/<id>/`, one format for TUI, `-p`, ACP and leader.
 
@@ -653,7 +667,9 @@ no way to join a conversation another process holds.
   stdin. The intent is written once `init` names the conversation, before the message, so a
   deadline before `init` leaves no receipt and possibly an empty conversation.
 - `--model <alias>` without `--effort` fails before `init`, and a resumed conversation forgets its
-  model, so `send` reuses the model and effort `new` recorded.
+  model, so `send` reuses the model and effort `new` recorded. `agy models` prints one
+  `<alias>-<effort>\t<name> (<Effort>)` line per combination; `models` folds them into the alias
+  with its efforts.
 - `--conversation <unknown id>` silently starts a new conversation, so `send` checks that the
   conversation exists and that `init` returns the same id.
 - The stream has no client message id and no turn id. The `user_input` step update is the first

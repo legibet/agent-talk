@@ -25,7 +25,8 @@ use super::{
     full_access, lock, pid_alive, record, reject, settle, strip_provenance, wait_receipt,
 };
 use crate::model::{
-    self, Approval, Error, ErrorCode, Observations, Outcome, Page, ReceiptState, Result, Session,
+    self, Approval, Error, ErrorCode, Model, Observations, Outcome, Page, ReceiptState, Result,
+    Session,
 };
 use crate::store::{NewIntent, Store};
 use serde::Deserialize;
@@ -849,6 +850,33 @@ impl<'a> Grok<'a> {
 }
 
 impl Agent for Grok<'_> {
+    async fn models(&self) -> Result<Vec<Model>> {
+        // A direct child's `initialize` response lists the account's models with their
+        // effort choices; no session is opened (DESIGN.md §6.4).
+        let conn = self
+            .connect(&self.home.to_string_lossy(), false, None)
+            .await?;
+        let models = conn.init["_meta"]["modelState"]["availableModels"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|m| Model {
+                id: m["modelId"].as_str().unwrap_or_default().into(),
+                efforts: m["_meta"]["reasoningEfforts"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|e| e["value"].as_str())
+                    .map(String::from)
+                    .collect(),
+            })
+            .collect();
+        // Dropping kills the child: a clean exit takes about 4 s and there is nothing to
+        // flush.
+        drop(conn);
+        Ok(models)
+    }
+
     async fn status(&self) -> AgentStatus {
         let version = cli_version("grok").await;
         let cli: Check = version.as_ref().map(|_| ()).map_err(String::clone);

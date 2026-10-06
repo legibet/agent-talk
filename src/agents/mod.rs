@@ -5,8 +5,8 @@ pub mod grok;
 pub mod opencode;
 
 use crate::model::{
-    Approval, Caller, CallerKind, Error, ErrorCode, Message, Outcome, Page, Receipt, ReceiptState,
-    Result, Session, Turn,
+    Approval, Caller, CallerKind, Error, ErrorCode, Message, Model, Outcome, Page, Receipt,
+    ReceiptState, Result, Session, Turn,
 };
 use crate::store::Store;
 use serde::Serialize;
@@ -268,6 +268,16 @@ impl Agent for Adapter<'_> {
         }
     }
 
+    async fn models(&self) -> Result<Vec<Model>> {
+        match self {
+            Adapter::Codex(p) => p.models().await,
+            Adapter::Claude(p) => p.models().await,
+            Adapter::OpenCode(p) => p.models().await,
+            Adapter::Grok(p) => p.models().await,
+            Adapter::Antigravity(p) => p.models().await,
+        }
+    }
+
     async fn list(
         &self,
         filter: &ListFilter<'_>,
@@ -509,6 +519,8 @@ impl Operation {
 /// same connection.
 pub trait Agent {
     async fn status(&self) -> AgentStatus;
+    /// Every model `new --model` takes, in any order.
+    async fn models(&self) -> Result<Vec<Model>>;
     async fn list(
         &self,
         filter: &ListFilter<'_>,
