@@ -20,9 +20,9 @@ mod updates;
 use self::acp::{Conn, Event, Reply, ServerRequest, Spawn};
 use self::updates::{History, first_prompt};
 use super::{
-    Agent, ApprovalPolicy, Caps, Check, ListFilter, Operation, ReadPage, ReadRange, SendRequest,
-    StartRequest, WaitTarget, approval_policy, bounded, cli_version, first_line, full_access, lock,
-    pid_alive, record, reject, settle, strip_provenance, wait_receipt,
+    Agent, AgentStatus, ApprovalPolicy, Check, ListFilter, Operation, ReadPage, ReadRange,
+    SendRequest, StartRequest, WaitTarget, approval_policy, bounded, cli_version, first_line,
+    full_access, lock, pid_alive, record, reject, settle, strip_provenance, wait_receipt,
 };
 use crate::model::{
     self, Approval, Error, ErrorCode, Observations, Outcome, Page, ReceiptState, Result, Session,
@@ -504,18 +504,11 @@ impl<'a> Grok<'a> {
 
     /// A `grok agent` child in `cwd`, initialized: `--leader` (only after `leader()`
     /// found a live socket) or `--no-leader`.
-    async fn connect(
-        &self,
-        cwd: &str,
-        leader: bool,
-        model: Option<&str>,
-        effort: Option<&str>,
-    ) -> Result<Conn> {
+    async fn connect(&self, cwd: &str, leader: bool, model: Option<&str>) -> Result<Conn> {
         let opts = Spawn {
             leader,
             leader_socket: self.socket_override.then_some(self.socket.as_path()),
             model,
-            effort,
         };
         acp::spawn(cwd, &opts).await
     }
@@ -763,7 +756,7 @@ impl<'a> Grok<'a> {
                 ),
             ));
         };
-        let mut conn = self.connect(cwd, true, None, None).await?;
+        let mut conn = self.connect(cwd, true, None).await?;
         let res = async {
             let listed = self.listed(&conn, Some(id)).await?;
             match listed.first() {
@@ -856,7 +849,7 @@ impl<'a> Grok<'a> {
 }
 
 impl Agent for Grok<'_> {
-    async fn caps(&self) -> Caps {
+    async fn status(&self) -> AgentStatus {
         let version = cli_version("grok").await;
         let cli: Check = version.as_ref().map(|_| ()).map_err(String::clone);
         let (shared, leader): (&str, Check) = match self.leader() {
@@ -873,7 +866,7 @@ impl Agent for Grok<'_> {
         } else {
             Err(format!("{} does not exist", dir.display()))
         };
-        Caps {
+        AgentStatus {
             agent: "grok",
             version: version.ok(),
             shared: Some(shared.into()),
@@ -955,7 +948,7 @@ impl Agent for Grok<'_> {
             Ok(Some(_)) => {
                 // The client process needs some cwd; `_x.ai/sessions/list` covers all.
                 let cwd = std::env::temp_dir().to_string_lossy().into_owned();
-                match self.connect(&cwd, true, None, None).await {
+                match self.connect(&cwd, true, None).await {
                     Ok(conn) => {
                         match self.listed(&conn, None).await {
                             Ok(l) => listed = l,
@@ -1019,9 +1012,7 @@ impl Agent for Grok<'_> {
     async fn start(&self, req: &StartRequest<'_>, deadline: Option<Instant>) -> Result<Outcome> {
         let policy = ApprovalPolicy::Deny;
         let leader = self.leader()?;
-        let mut conn = self
-            .connect(req.cwd, leader.is_some(), req.model, req.effort)
-            .await?;
+        let mut conn = self.connect(req.cwd, leader.is_some(), req.model).await?;
         let res = async {
             let mut params = json!({"cwd": req.cwd, "mcpServers": []});
             if req.full_access {
@@ -1034,6 +1025,19 @@ impl Agent for Grok<'_> {
                     format!("session/new returned no sessionId: {created}"),
                 )
             })?;
+            // Set on the session, not as `--reasoning-effort`, which a leader proxy
+            // ignores (DESIGN.md §6.4). A refusal leaves the new session empty and
+            // unrecorded; agent-talk deletes nothing, so the error names it.
+            if let Some(e) = req.effort {
+                let params = json!({"sessionId": id, "configId": "reasoning_effort", "value": e});
+                if let Err(mut err) = conn.request("session/set_config_option", params).await {
+                    err.message = format!(
+                        "reasoning effort {e} refused: {}; the new session {id} has no messages and is not used (`grok sessions delete {id}` removes it)",
+                        err.message
+                    );
+                    return Err(err);
+                }
+            }
             let h = handle(id);
             // Direct mode only: clients of one leader do not exclude each other.
             let _lock = match leader {
@@ -1113,7 +1117,7 @@ impl Agent for Grok<'_> {
         // dormant session may be held in process by a TUI.
         let resident = match self.leader()? {
             Some(leader) => {
-                let conn = self.connect(&cwd, true, None, None).await?;
+                let conn = self.connect(&cwd, true, None).await?;
                 match self.listed(&conn, Some(id)).await {
                     Ok(l) if l.first().is_some_and(|(_, l)| l.resident) => Some((leader, conn)),
                     Ok(_) => {
@@ -1133,7 +1137,7 @@ impl Agent for Grok<'_> {
             None => {
                 let lock = lock(&h, SECOND_WRITER)?;
                 self.refuse_live(id, &dir)?;
-                let conn = self.connect(&cwd, false, None, None).await?;
+                let conn = self.connect(&cwd, false, None).await?;
                 (None, conn, Some(lock))
             }
         };

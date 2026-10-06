@@ -15,6 +15,7 @@ use tokio::process::Child;
 pub fn args(
     session: [&str; 2],
     model: Option<&str>,
+    effort: Option<&str>,
     policy: ApprovalPolicy,
     full_access: bool,
 ) -> Vec<String> {
@@ -32,6 +33,9 @@ pub fn args(
     .to_vec();
     if let Some(m) = model {
         args.extend(["--model".into(), m.into()]);
+    }
+    if let Some(e) = effort {
+        args.extend(["--effort".into(), e.into()]);
     }
     if full_access {
         args.extend(["--permission-mode".into(), "bypassPermissions".into()]);
@@ -55,10 +59,14 @@ pub fn spawn(cwd: &str, args: &[String], log: &Path) -> Result<Child> {
     let out = File::create(log).map_err(|e| io_err(&log.display().to_string(), e))?;
     let err = File::create(log.with_extension("stderr"))
         .map_err(|e| io_err(&log.display().to_string(), e))?;
+    let mut cmd = agent_cmd("claude");
+    // CLAUDE_CODE_EFFORT_LEVEL silently overrides --effort (claude 2.1.291, DESIGN.md §6.2).
+    if args.iter().any(|a| a == "--effort") {
+        cmd.env_remove("CLAUDE_CODE_EFFORT_LEVEL");
+    }
     // A nested `claude -p` with the inherited CLAUDECODE=1 runs normally (observed on
     // claude 2.1.288).
-    agent_cmd("claude")
-        .args(args)
+    cmd.args(args)
         .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(out)

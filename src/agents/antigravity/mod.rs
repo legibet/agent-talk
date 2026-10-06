@@ -8,7 +8,7 @@
 //! running when the command stops observing, and its pid is recorded, as for Claude.
 //!
 //! History comes from Antigravity's files under `~/.gemini/antigravity-cli/`: the per-
-//! conversation `brain/<id>/.system_generated/logs/transcript.jsonl` (lossy, see `caps`),
+//! conversation `brain/<id>/.system_generated/logs/transcript.jsonl` (lossy, see `status`),
 //! the shared `conversation_summaries.db` (read-only, in place) and `presence/<id>.lock`,
 //! which the process that has a conversation open keeps flocked. agy itself ignores that
 //! lock, so agent-talk refuses to write while it is held.
@@ -27,8 +27,9 @@ use self::transcript::{
     ends_with_reply, load, messages, preview, span_reply, turn_span, user_input,
 };
 use super::{
-    Agent, Caps, Check, ListFilter, Operation, ReadPage, ReadRange, SendRequest, StartRequest,
-    WaitTarget, bounded, cli_version, lock, pid_alive, record, settle, tail, wait_receipt,
+    Agent, AgentStatus, Check, ListFilter, Operation, ReadPage, ReadRange, SendRequest,
+    StartRequest, WaitTarget, bounded, cli_version, lock, pid_alive, record, settle, tail,
+    wait_receipt,
 };
 use crate::model::{
     self, Approval, Error, ErrorCode, Observations, Outcome, Page, ReceiptState, Result, Session,
@@ -483,7 +484,7 @@ impl<'a> Antigravity<'a> {
 }
 
 impl Agent for Antigravity<'_> {
-    async fn caps(&self) -> Caps {
+    async fn status(&self) -> AgentStatus {
         let version = cli_version("agy").await;
         let cli: Check = version.as_ref().map(|_| ()).map_err(String::clone);
         let store: Check = if self.dir.is_dir() {
@@ -491,7 +492,7 @@ impl Agent for Antigravity<'_> {
         } else {
             Err(format!("{} does not exist", self.dir.display()))
         };
-        Caps {
+        AgentStatus {
             agent: "antigravity",
             version: version.ok(),
             shared: None,

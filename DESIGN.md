@@ -7,9 +7,9 @@ heading; facts only read in agent source or documentation are marked as such.
 
 ## 1. Scope
 
-In: Codex (shared app-server daemon), Claude Code (`claude -p`), OpenCode (shared background
-service), Grok CLI (ACP to `grok agent stdio`, through the shared leader when one runs),
-Antigravity CLI (`agy -p`); a CLI and an MCP server exposing the same five operations; sender
+In: Codex (shared app-server daemon), Claude Code (`claude -p`), OpenCode 2.x (shared background
+service; 1.x is not supported), Grok CLI (ACP to `grok agent stdio`, through the shared leader
+when one runs), Antigravity CLI (`agy -p`); a CLI and an MCP server exposing the same five operations; sender
 attribution and a provenance header for agent-to-agent traffic; a hop limit.
 
 Out: an agent-talk daemon, GUI, PTY or terminal scraping, remote hosts, worktree management,
@@ -22,7 +22,7 @@ behalf, deleting sessions.
    touching another process's stdio, no binary patching, no edits to agent configuration.
 2. **Observations gate operations, rechecked at execution time.** Each session carries
    observations (§4); a refusal names the observation that blocks it.
-3. **Declare the limits.** `agent-talk caps` prints what the installed CLI and the running daemon
+3. **Declare the limits.** `agent-talk status` prints what the installed CLI and the running daemon
    or service can do. Unsupported cases fail with a stable error code, never a silent downgrade.
 4. **The user's install and login.** Same binaries, same accounts, same permission defaults,
    unless `new --full-access` asks for more.
@@ -158,9 +158,9 @@ for all. agent-talk never accepts.
 
 - Sessions agent-talk started have nobody else to answer, so they must not wait on approvals.
   Where the agent allows it they never ask (Codex `approvalPolicy: never`, Claude
-  `--permission-prompts none`; headless Claude and Antigravity deny on their own), and what still
-  reaches agent-talk is declined (Codex `decline`, OpenCode `reject` with a message, Grok
-  `reject_once`).
+  `--permission-prompts none`, OpenCode session rules that deny what the user's rules would ask;
+  headless Claude and Antigravity deny on their own), and what still reaches agent-talk is
+  declined (Codex `decline`, OpenCode `reject` with a message, Grok `reject_once`).
 - Sessions agent-talk did not start belong to the user: agent-talk never answers there and never
   changes their settings. It records pending requests and lets the deadline pass with
   `state: waiting`.
@@ -234,7 +234,7 @@ versions (Codex sends 2025-06-18, Grok 2025-11-25). Logging is stderr only.
 ## 5. CLI
 
 ```
-agent-talk caps
+agent-talk status
 agent-talk ls [--agent A] [--cwd DIR] [--all] [--limit N] [--cursor C]
 agent-talk new A "prompt" [--cwd DIR] [--name N] [--model M] [--effort E] [--full-access]
     [--wait] [--timeout S] [--from H]
@@ -257,9 +257,11 @@ agent-talk mcp [--caller H]
   Grok and Antigravity, inside the same execution on OpenCode. `--steer` joins the running turn
   (Codex, OpenCode, Grok through a live leader) and is refused when the session is idle.
 - `new --cwd` defaults to the current directory.
-- `new --model` (all) and `--effort` (Codex, Grok, Antigravity) pass through unvalidated in the
-  agent's syntax; Claude and OpenCode refuse `--effort` with `E_UNSUPPORTED`. Sends to a Claude or
-  Antigravity session agent-talk started pass the model (and effort) `new` recorded again.
+- `new --model` and `--effort` pass through unvalidated in the agent's syntax (OpenCode
+  `--model` is `provider/model`). The effort belongs to the session: later sends keep it and
+  cannot change it. Claude and Antigravity take both per process, so sends to a session
+  agent-talk started pass the model and effort `new` recorded again; the other agents store them
+  with the session (§6).
 - `new --name N` stores a title at the agent (Codex thread name, Claude `custom-title` line,
   OpenCode `title`, Grok `_x.ai/session/rename`; Antigravity has no interface outside the TUI and
   refuses). agent-talk keeps no copy. `ls` shows `name` and strips the provenance header from
@@ -417,7 +419,10 @@ next one at Claude's discretion, so there is no steer (`E_NO_STEER`).
 (`result.permission_denials`); nothing pends. agent-talk records these as `denied`, and on
 sessions it started adds `--permission-prompts none`, which also tells the model not to retry.
 `--permission-mode` is not kept across `--resume` (the user's `defaultMode` applies again,
-claude 2.1.291), so every send to a full-access session passes `bypassPermissions`.
+claude 2.1.291), so every send to a full-access session passes `bypassPermissions`. `--effort` is
+not kept across `--resume` either and is passed again like the model; `CLAUDE_CODE_EFFORT_LEVEL`
+in the environment silently overrides `--effort`, so a child given `--effort` runs without it
+(claude 2.1.291).
 `--permission-prompt-tool stdio` would block on a `control_request` until answered on stdin, so it
 is not used.
 
@@ -443,8 +448,14 @@ before submitting and filters on `data.sessionID`.
 
 **Sessions and turns.**
 
-- `new` is `POST /api/session {location: {directory}, model?, title?}` (model
-  `<providerID>/<modelID>[#variant]`), then the first prompt as a queue send.
+- `new` is `POST /api/session {location: {directory}, model?, title?, permissions}` (model
+  `{providerID, id, variant?}` from `--model provider/model`), then the first prompt as a queue
+  send. `--effort` is the model's `variant`, stored with the session (the prompt has no model
+  field); without `--model` it goes with the user's default model, `GET /api/model/default`. An
+  unknown variant is stored, and the first turn then fails at once with no error text
+  (opencode 2.0.23). The service answers a location's first requests before its configuration is
+  applied, with no default model and agents lacking the user's rules (2.0.23), so `new` first
+  calls `GET /api/integration`, which waits for plugin activation (read in source).
 - There is no turn id; execution events carry only the session id. The client may choose the user
   message id (`msg_` prefix) and attach `metadata`, both stored verbatim. agent-talk sends `{id,
   text, delivery, metadata: {"agent-talk": {receipt, from, depth}}}` with an id in the
@@ -478,11 +489,32 @@ lists `GET /api/session/{id}/permission`. An unanswered request blocks with no t
 with a `message` hands the text to the model and the execution continues; a message-less `reject`
 interrupts it (`shutdown`); any `reject` rejects every pending request of the session, so a deny
 that finds its request gone records `resolved`. `always` would save a project-wide rule.
-Full access is the session rule `{action: "*", resource: "*", effect: "allow"}` at creation;
-session rules are evaluated after the agent's, so it overrides the user's rules (verified against
-`edit: ask` on 2.0.23).
-agent-talk sends only `reject` with a message, and only once its own message was delivered
-(earlier requests belong to the execution ahead of it).
+A request is answered by the last rule matching action and resource (`*` and `?` wildcards) in
+the agent's ruleset followed by the session's, and asks when none matches; the agent's ruleset
+already holds the user's configuration (read in source; verified live on 2.0.23: a session
+rule `edit *allowed.txt allow` after `edit * deny` wrote `allowed.txt` and refused
+`denied.txt`). A session agent-talk starts therefore gets session rules at creation, so that the
+service itself refuses what would wait for an answer:
+
+- full access: `{action: "*", resource: "*", effect: "allow"}`, which overrides the user's rules
+  (verified against `edit: ask`);
+- otherwise the rules of the agent a new session runs (the default agent, which `GET /api/agent`
+  lists first) from its first `ask` on, in order, with every `ask` turned into `deny`. Allowed
+  and denied requests keep their answer; one that would ask is refused with nothing pending. The
+  rules before the first `ask` answer the same without the copy and are left out, because
+  sub-sessions of the subagent tool inherit session rules (an `explore` child given the whole
+  copy, which starts with `* * allow`, ran `ls` its own rules deny). Every agent's rules start
+  with `* * allow`, so no request goes unmatched (which would ask);
+- in both cases `question * deny` last: nobody answers the question tool in these sessions.
+
+The model sees a tool denied for every resource (the user's `edit: ask`) as absent from its
+toolset, and a denied call as a tool error `permission.rejected` ("Permission denied: edit"); the
+turn continues (verified on 2.0.23 with `send` without `--wait`). Sessions agent-talk did not
+start keep their rules.
+
+Requests that still reach agent-talk (a plugin hook can turn an answer into `ask`) get `reject`
+with a message, and only once its own message was delivered (earlier requests belong to the
+execution ahead of it).
 
 **Identity.** Shell commands get `OPENCODE_SESSION_ID`, overwriting an inherited value. MCP
 `tools/call` carries `_meta["ai.opencode/sessionID"]`: read in source and docs, never observed
@@ -535,9 +567,16 @@ leader check, since clients of one leader do not exclude each other.
 
 **Turns and sending.**
 
-- `new`: `session/new {cwd, mcpServers: []}`, `_x.ai/session/rename` for `--name`, then
-  `session/prompt {_meta: {promptId}}`; `--effort` becomes `--reasoning-effort`. The client's
-  `promptId` is persisted as `turn_completed.prompt_id`, which makes it the turn id.
+- `new`: `session/new {cwd, mcpServers: []}`, `session/set_config_option {sessionId,
+  configId: "reasoning_effort", value}` for `--effort`, `_x.ai/session/rename` for `--name`, then
+  `session/prompt {_meta: {promptId}}`. The client's `promptId` is persisted as
+  `turn_completed.prompt_id`, which makes it the turn id.
+- The effort is set on the session because a leader proxy ignores `grok agent
+  --reasoning-effort` (it honours `-m`; grok 1.0.46). It is stored in `summary.json` and kept by
+  later loads, direct and through a leader. An unknown value is refused with `-32602 "unknown
+  reasoning_effort value"`; `new` then fails with `E_PRECONDITION` before recording anything, and
+  the error names the new session, which stays on disk without messages and which `grok sessions
+  delete` removes (agent-talk deletes nothing, §7).
 - Queue: `session/load` plus `session/prompt`, through a leader only when `_x.ai/sessions/list`
   there shows the session `resident` (a listed but dormant session may be held in-process by a
   TUI). That list's `activity` and `resident` describe the answering process, so they mean
@@ -686,6 +725,10 @@ servers are configured globally only.
   OpenCode turn lookup searches (older messages report absent) and the ten Codex resume retries.
 - **Shared lifecycle, separate observe loops.** Receipt and approval handling lives once; a generic
   event-loop driver would hide genuinely different end-of-turn authorities behind mode flags.
+- **OpenCode asks become denials by copying the default agent's rules from the first `ask` on**,
+  not by appending a `deny` per `ask` rule, which would override a later, narrower `allow` in the
+  user's configuration, and not by copying them all, which would override sub-agents' rules
+  (§6.3).
 - **Explicit agent knobs, not a generic option map.** Five knobs with clap help beat `--opt k=v`
   with per-adapter parsing. Values pass through unvalidated: the agent owns the enum (Codex
   rejects an unknown effort in the turn, not at submission).
@@ -720,11 +763,16 @@ servers are configured globally only.
   renders a decline from agent-talk is unverified.
 - `agent-talk mcp` ignores rmcp's cancellation; a cancelled call keeps observing until its
   deadline, and server shutdown waits for it.
-- `caps` marks a Codex method unavailable only when the daemon reports it missing; any other
+- `status` marks a Codex method unavailable only when the daemon reports it missing; any other
   refusal of the probe on a dummy thread counts as available.
 - Sender attribution cannot detect a daemon or service started from another agent's shell.
-- A request raised after the sending command stopped observing (an OpenCode `send` without
-  `--wait`, a Grok turn that continues in a leader) waits for another client to answer.
+- A Grok turn that continues in a leader after the sending command stopped observing waits for
+  another client to answer a permission request it raises.
+- OpenCode sessions agent-talk starts: sub-sessions of the subagent tool inherit the session's
+  rules, which decide over the sub-agent's own from the default agent's first `ask` on. The rules
+  are a copy taken at `new`: later changes to the user's configuration do not reach the session,
+  and approvals saved with `always` and plugin permission hooks no longer turn an `ask` into
+  `allow` there.
 - Grok: `reject_once`, an unanswered request and the `session/cancel` at the deadline rest on
   captured frames, not re-verified; whether a TUI renders live a turn another
   leader client ran; leader behaviour with a grok.com subscription login (it may open a relay);

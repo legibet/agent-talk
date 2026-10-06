@@ -70,7 +70,6 @@ pub struct Spawn<'a> {
     /// `--leader-socket`, passed only when `GROK_LEADER_SOCKET` is set.
     pub leader_socket: Option<&'a Path>,
     pub model: Option<&'a str>,
-    pub effort: Option<&'a str>,
 }
 
 pub struct Conn {
@@ -104,9 +103,6 @@ pub async fn spawn(cwd: &str, s: &Spawn<'_>) -> Result<Conn> {
     }
     if let Some(m) = s.model {
         cmd.args(["-m", m]);
-    }
-    if let Some(e) = s.effort {
-        cmd.args(["--reasoning-effort", e]);
     }
     // Its own process group, so that Ctrl-C reaches agent-talk, which then ends the
     // turn itself; kill_on_drop for a command that unwinds without closing.

@@ -63,7 +63,7 @@ impl WaitOpts {
 #[derive(Subcommand)]
 enum Cmd {
     /// What each agent can do now: CLI version, daemon, service or leader, available operations.
-    Caps,
+    Status,
     /// List sessions with observations, paginated.
     Ls {
         /// codex, claude, opencode, grok or antigravity; default: every agent's first page.
@@ -89,15 +89,15 @@ enum Cmd {
         #[arg(long, default_value = ".")]
         cwd: PathBuf,
         /// Model for the session (Codex: model id; Claude: e.g. sonnet; OpenCode:
-        /// provider/model[#variant]; Grok: e.g. grok-4.7; Antigravity: e.g. gemini-3.8-flash).
+        /// provider/model; Grok: e.g. grok-4.7; Antigravity: e.g. gemini-3.8-flash).
         #[arg(long)]
         model: Option<String>,
         /// Title stored with the session by the agent, shown by ls (Codex thread name,
         /// Claude session name, OpenCode title, Grok session title; Antigravity has none).
         #[arg(long)]
         name: Option<String>,
-        /// Reasoning effort for the session (Codex, Grok, Antigravity; the model's values,
-        /// e.g. low | medium | high); default: the agent's.
+        /// Reasoning effort for the session; the values depend on the agent and model;
+        /// default: the agent's.
         #[arg(long)]
         effort: Option<String>,
         /// Give the session every permission, with no sandbox and no approval prompts;
@@ -253,7 +253,7 @@ fn cli_caller(explicit: Option<&str>) -> model::Result<Caller> {
 
 fn request(cmd: Cmd) -> model::Result<Request> {
     Ok(match cmd {
-        Cmd::Caps => Request::Caps {
+        Cmd::Status => Request::Status {
             sender: cli_caller(None)?,
         },
         Cmd::Mcp { .. } => unreachable!("handled in main"),
@@ -355,7 +355,7 @@ fn approval_line(a: &Approval) -> String {
 
 fn print_human(out: &Output) {
     match out {
-        Output::Caps { agents, sender } => {
+        Output::Status { agents, sender } => {
             for p in agents {
                 println!(
                     "{:<12} {}",

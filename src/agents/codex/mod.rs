@@ -6,9 +6,9 @@ pub mod transport;
 use self::protocol::*;
 use self::transport::{Conn, Event, ServerRequest, decode};
 use super::{
-    Agent, ApprovalPolicy, Caps, Check, ListFilter, Operation, ReadPage, ReadRange, SendRequest,
-    StartRequest, WaitTarget, approval_policy, bounded, cli_version, full_access, record, reject,
-    resolve, settle, strip_provenance, wait_receipt,
+    Agent, AgentStatus, ApprovalPolicy, Check, ListFilter, Operation, ReadPage, ReadRange,
+    SendRequest, StartRequest, WaitTarget, approval_policy, bounded, cli_version, full_access,
+    record, reject, resolve, settle, strip_provenance, wait_receipt,
 };
 use crate::model::{
     self, Approval, Error, ErrorCode, Message, Observations, Outcome, Page, Result, Session,
@@ -532,7 +532,7 @@ fn session_state(s: &ThreadStatus) -> &'static str {
 }
 
 impl Agent for Codex<'_> {
-    async fn caps(&self) -> Caps {
+    async fn status(&self) -> AgentStatus {
         let version = cli_version("codex").await.ok();
         let (shared, daemon, queue, steer) = match self.connect().await {
             Ok(conn) => {
@@ -577,7 +577,7 @@ impl Agent for Codex<'_> {
                 (shared.into(), daemon.clone(), daemon.clone(), daemon)
             }
         };
-        Caps {
+        AgentStatus {
             agent: "codex",
             version,
             shared: Some(shared),

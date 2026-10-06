@@ -2,7 +2,8 @@
 //! provenance header, hop limit, agent dispatch, typed output.
 
 use crate::agents::{
-    Adapter, Agent, Caps, ListFilter, ReadRange, SendRequest, StartRequest, WaitTarget, delivered,
+    Adapter, Agent, AgentStatus, ListFilter, ReadRange, SendRequest, StartRequest, WaitTarget,
+    delivered,
 };
 use crate::model::{Caller, Error, ErrorCode, Message, Outcome, Result, Session};
 use crate::store::Store;
@@ -23,7 +24,7 @@ pub const READ_LIMIT: u32 = 20;
 
 pub enum Request {
     /// `sender` is who this shell's `new` and `send` would be attributed to.
-    Caps {
+    Status {
         sender: Caller,
     },
     Ls(LsArgs),
@@ -85,7 +86,10 @@ pub struct WaitArgs {
 #[derive(Serialize)]
 #[serde(untagged)]
 pub enum Output {
-    Caps { agents: Vec<Caps>, sender: Caller },
+    Status {
+        agents: Vec<AgentStatus>,
+        sender: Caller,
+    },
     Sessions(Sessions),
     Read(Read),
     Outcome(Box<Outcome>),
@@ -124,10 +128,10 @@ pub struct Read {
 
 pub async fn run(store: &Store, req: Request) -> Result<Output> {
     match req {
-        Request::Caps { sender } => {
+        Request::Status { sender } => {
             let adapters = Adapter::all(store);
-            let agents = join_all(adapters.iter().map(|p| p.caps())).await;
-            Ok(Output::Caps { agents, sender })
+            let agents = join_all(adapters.iter().map(|p| p.status())).await;
+            Ok(Output::Status { agents, sender })
         }
         Request::Ls(a) => ls(store, a).await,
         Request::New(a) => new(store, a).await,

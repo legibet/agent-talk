@@ -21,9 +21,9 @@ use self::process::{AgentEntry, agents};
 use self::stream::{Run, StreamEvent, System, denial, result_turn};
 use self::transcript::{TurnEnd, head, live_branch, load, slug, transcript_turn, turn_end};
 use super::{
-    Agent, ApprovalPolicy, Caps, Check, ListFilter, Operation, ReadPage, ReadRange, SendRequest,
-    StartRequest, WaitTarget, approval_policy, bounded, cli_version, first_line, lock, pid_alive,
-    record, settle, tail, wait_receipt,
+    Agent, AgentStatus, ApprovalPolicy, Check, ListFilter, Operation, ReadPage, ReadRange,
+    SendRequest, StartRequest, WaitTarget, approval_policy, bounded, cli_version, first_line, lock,
+    pid_alive, record, settle, tail, wait_receipt,
 };
 use crate::model::{
     self, AgentError, Approval, Error, ErrorCode, Observations, Outcome, Page, ReceiptState,
@@ -357,7 +357,7 @@ impl<'a> Claude<'a> {
 }
 
 impl Agent for Claude<'_> {
-    async fn caps(&self) -> Caps {
+    async fn status(&self) -> AgentStatus {
         let version = cli_version("claude").await;
         let cli: Check = version.as_ref().map(|_| ()).map_err(String::clone);
         // `send` refuses unless `claude agents` can tell whether the session is open elsewhere.
@@ -370,7 +370,7 @@ impl Agent for Claude<'_> {
         } else {
             Err(format!("{} does not exist", self.projects.display()))
         };
-        Caps {
+        AgentStatus {
             agent: "claude",
             version: version.ok(),
             shared: None,
@@ -559,17 +559,12 @@ impl Agent for Claude<'_> {
     }
 
     async fn start(&self, req: &StartRequest<'_>, deadline: Option<Instant>) -> Result<Outcome> {
-        if req.effort.is_some() {
-            return Err(Error::new(
-                ErrorCode::Unsupported,
-                "agent-talk does not pass --effort to Claude",
-            ));
-        }
         let id = uuid::Uuid::new_v4().to_string();
         let h = handle(&id);
         let _lock = lock(&h, SECOND_WRITER)?;
         let stored_args = json!({
             "model": req.model,
+            "effort": req.effort,
             "full_access": req.full_access,
         });
         self.store.insert_owned(&h, req.cwd, &stored_args)?;
@@ -588,6 +583,7 @@ impl Agent for Claude<'_> {
         let mut args = process::args(
             ["--session-id", &id],
             req.model,
+            req.effort,
             ApprovalPolicy::Deny,
             req.full_access,
         );
@@ -656,11 +652,12 @@ impl Agent for Claude<'_> {
             from: req.from,
             depth: req.depth,
         })?;
-        // A session agent-talk started keeps the model and permissions `new` gave it.
+        // A session agent-talk started keeps the model, effort and permissions `new` gave it.
         let started = self.store.owned_args(&h)?.unwrap_or_default();
         let args = process::args(
             ["--resume", id],
             started["model"].as_str(),
+            started["effort"].as_str(),
             approval_policy(self.store, &h)?,
             started["full_access"] == true,
         );

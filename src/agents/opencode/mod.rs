@@ -13,9 +13,9 @@ mod transport;
 
 use self::transport::{Events, Service};
 use super::{
-    Agent, ApprovalPolicy, Caps, Check, ListFilter, Operation, ReadPage, ReadRange, SendRequest,
-    StartRequest, WaitTarget, approval_policy, bounded, record, reject, resolve, settle,
-    wait_receipt,
+    Agent, AgentStatus, ApprovalPolicy, Check, ListFilter, Operation, ReadPage, ReadRange,
+    SendRequest, StartRequest, WaitTarget, approval_policy, bounded, record, reject, resolve,
+    settle, wait_receipt,
 };
 use crate::model::{
     self, Approval, Error, ErrorCode, Message, Observations, Outcome, Page, ReceiptState, Result,
@@ -124,23 +124,34 @@ fn new_msg_id() -> String {
     format!("msg_{time:012x}{tail}")
 }
 
-/// `provider/model[#variant]` → `Model.Ref`.
+/// `provider/model` → `Model.Ref`.
 fn model_ref(spec: &str) -> Result<Value> {
-    let (provider, rest) = spec.split_once('/').ok_or_else(|| {
+    let (provider, model) = spec.split_once('/').ok_or_else(|| {
         Error::new(
             ErrorCode::Precondition,
-            format!("--model for OpenCode is <providerID>/<modelID>[#variant], got {spec}"),
+            format!("--model for OpenCode is <providerID>/<modelID>, got {spec}"),
         )
     })?;
-    let (model, variant) = match rest.split_once('#') {
-        Some((m, v)) => (m, Some(v)),
-        None => (rest, None),
-    };
-    let mut r = json!({"providerID": provider, "id": model});
-    if let Some(v) = variant {
-        r["variant"] = json!(v);
-    }
-    Ok(r)
+    Ok(json!({"providerID": provider, "id": model}))
+}
+
+/// Session rules that make the default agent deny what it would ask (DESIGN.md §6.3):
+/// its rules from the first `ask` on, with every `ask` turned into `deny`. The service
+/// evaluates the agent's rules, then the session's, and the last match wins, so every
+/// other answer stays. The rules before the first `ask` decide the same either way and
+/// are left out, so sub-agents, which inherit session rules, keep their own there.
+fn no_asks(agent_rules: &[Value]) -> Vec<Value> {
+    agent_rules
+        .iter()
+        .skip_while(|r| r["effect"] != "ask")
+        .map(|r| {
+            let mut r = r.clone();
+            if r["effect"] == "ask" {
+                r["effect"] = json!("deny");
+            }
+            r
+        })
+        .collect()
 }
 
 /// Everything in history from the user message `msg_id` (inclusive) to the end of its turn.
@@ -677,7 +688,7 @@ impl<'a> OpenCode<'a> {
 }
 
 impl Agent for OpenCode<'_> {
-    async fn caps(&self) -> Caps {
+    async fn status(&self) -> AgentStatus {
         let (version, shared, service): (Option<String>, String, Check) = match self.connect().await
         {
             Ok(s) => (
@@ -693,7 +704,7 @@ impl Agent for OpenCode<'_> {
                 (None, shared.into(), Err(e.message))
             }
         };
-        Caps {
+        AgentStatus {
             agent: "opencode",
             version,
             shared: Some(shared),
@@ -761,25 +772,57 @@ impl Agent for OpenCode<'_> {
     }
 
     async fn start(&self, req: &StartRequest<'_>, deadline: Option<Instant>) -> Result<Outcome> {
-        if req.effort.is_some() {
-            return Err(Error::new(
-                ErrorCode::Unsupported,
-                "OpenCode takes effort as the model variant: --model provider/model#variant",
-            ));
-        }
         let svc = self.connect().await?;
+        let location = [("location[directory]", req.cwd.to_string())];
+        // The service answers a location's first requests before its configuration is
+        // applied: no default model, agents without the user's rules (opencode 2.0.23).
+        // `integration.list` waits for plugin activation, which applies it.
+        svc.get("/api/integration", &location).await?;
         let mut body = json!({"location": {"directory": req.cwd}});
         if let Some(m) = req.model {
             body["model"] = model_ref(m)?;
         }
+        if let Some(e) = req.effort {
+            // The effort is the model's variant, so it needs a model: the user's default.
+            if req.model.is_none() {
+                let default = svc.get("/api/model/default", &location).await?;
+                let (Some(provider), Some(id)) = (
+                    text(&default["data"]["providerID"]),
+                    text(&default["data"]["id"]),
+                ) else {
+                    return Err(Error::new(
+                        ErrorCode::Precondition,
+                        format!(
+                            "OpenCode has no default model for {}; pass --model",
+                            req.cwd
+                        ),
+                    ));
+                };
+                body["model"] = json!({"providerID": provider, "id": id});
+            }
+            body["model"]["variant"] = json!(e);
+        }
         if let Some(n) = req.name {
             body["title"] = json!(n);
         }
-        if req.full_access {
-            // Session rules are evaluated after the agent's, so this overrides the user's
-            // configured rules (OpenCode 2.0.23, DESIGN.md §6.3).
-            body["permissions"] = json!([{"action": "*", "resource": "*", "effect": "allow"}]);
-        }
+        // Session rules, so that the service itself never waits for an answer here
+        // (DESIGN.md §4, §6.3).
+        let mut rules = if req.full_access {
+            vec![json!({"action": "*", "resource": "*", "effect": "allow"})]
+        } else {
+            // A new session runs the default agent, which the service lists first.
+            let agents = svc.get("/api/agent", &location).await?;
+            let Some(rules) = agents["data"][0]["permissions"].as_array() else {
+                return Err(Error::new(
+                    ErrorCode::Transport,
+                    format!("agent.list returned no default agent for {}", req.cwd),
+                ));
+            };
+            no_asks(rules)
+        };
+        // Nobody answers the question tool either.
+        rules.push(json!({"action": "question", "resource": "*", "effect": "deny"}));
+        body["permissions"] = json!(rules);
         let created = svc.post("/api/session", &body).await?;
         let session_id = text(&created["data"]["id"]).ok_or_else(|| {
             Error::new(
@@ -930,11 +973,34 @@ mod tests {
             model_ref("newapi2/deepseek-flash").unwrap(),
             json!({"providerID": "newapi2", "id": "deepseek-flash"})
         );
+        // OpenRouter model ids contain a slash themselves.
         assert_eq!(
-            model_ref("openai/gpt-6.1-sol#high").unwrap(),
-            json!({"providerID": "openai", "id": "gpt-6.1-sol", "variant": "high"})
+            model_ref("openrouter/deepseek/deepseek-v4-flash").unwrap(),
+            json!({"providerID": "openrouter", "id": "deepseek/deepseek-v4-flash"})
         );
         assert!(model_ref("sonnet").is_err());
+    }
+
+    /// What asks is denied, everything else keeps its answer, including a narrower
+    /// allow after an ask; rules before the first ask are left to the agent (shapes from
+    /// `GET /api/agent`, opencode 2.0.23).
+    #[test]
+    fn session_rules_deny_what_would_ask() {
+        let agent = vec![
+            json!({"action": "*", "resource": "*", "effect": "allow"}),
+            json!({"action": "edit", "resource": "*", "effect": "ask"}),
+            json!({"action": "edit", "resource": "src/*", "effect": "allow"}),
+            json!({"action": "browser", "resource": "*", "effect": "deny"}),
+        ];
+        assert_eq!(
+            no_asks(&agent),
+            vec![
+                json!({"action": "edit", "resource": "*", "effect": "deny"}),
+                json!({"action": "edit", "resource": "src/*", "effect": "allow"}),
+                json!({"action": "browser", "resource": "*", "effect": "deny"}),
+            ]
+        );
+        assert!(no_asks(&agent[..1]).is_empty());
     }
 
     /// Shapes observed on opencode 2.0.22.

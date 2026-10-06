@@ -24,7 +24,7 @@ There is no Codex `--full-access` check: with the daemon's default sandbox at
 danger-full-access, as on the maintainer's machine, it could not fail.
 
 The script builds `target/release/agent-talk` first and reads preconditions from
-`agent-talk caps --json`: a tier runs only when `caps` reports `new` and `send` available for its
+`agent-talk status --json`: a tier runs only when `status` reports `new` and `send` available for its
 agent, and otherwise prints `SKIP <agent>: <reason>`. The Grok tier runs direct mode only;
 leader cases need an isolated `GROK_HOME` and a short socket path and are run by hand, never
 against the user's `~/.grok/leader.sock`.

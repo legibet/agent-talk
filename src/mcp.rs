@@ -65,13 +65,14 @@ struct NewParams {
     cwd: String,
     /// First message for the new session.
     prompt: String,
-    /// Model name for the agent (e.g. a Codex model id, `sonnet` for Claude, `grok-4.7`
-    /// for Grok, `gemini-3.8-flash` for Antigravity).
+    /// Model name for the agent (e.g. a Codex model id, `sonnet` for Claude,
+    /// `provider/model` for OpenCode, `grok-4.7` for Grok, `gemini-3.8-flash` for Antigravity).
     model: Option<String>,
     /// Short title for the session, stored by the agent and shown by ls; name it so you
     /// can find it again (Antigravity has no title interface and refuses it).
     name: Option<String>,
-    /// Reasoning effort (Codex, Grok, Antigravity; the model's values, e.g. low, medium, high).
+    /// Reasoning effort for the session; the values depend on the agent and model (default:
+    /// the agent's).
     effort: Option<String>,
     /// Give the session every permission, with no sandbox and no approval prompts (default
     /// false: the agent's own configuration).

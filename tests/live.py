@@ -1012,14 +1012,22 @@ def opencode_tier():
         expect(out["turn"]["final_text"] == reply, "R1 has the same reply as the steer")
 
     def p6():
+        # Under the user's `edit: ask` the service itself refuses the write in a session agent-talk
+        # started, so nothing waits after a send without --wait. A request that still asked would
+        # reach `wait`, which declines it, and show up in its approvals.
         need("O")
+        rules = opencode_api("GET", f"/api/session/{native(st['O'])}")["data"].get("permissions") or []
+        if not any(r["action"] == "edit" and r["effect"] == "deny" for r in rules):
+            raise Inconclusive("the session's rules do not deny edit (the user's rules do not ask for it)")
         target = DIR / "oc-denied.txt"
         target.unlink(missing_ok=True)
-        out = cli("send", st["O"], f"create {target} with your write tool", "--wait")
-        if not out["approvals"]:
-            raise Inconclusive("no approval request")
-        expect(out["approvals"][0]["outcome"] == "declined", "approvals[0].outcome == declined")
+        # Without a write tool the model may reach for the shell, which edit rules do not cover.
+        out = cli(
+            "send", st["O"], f"create {target} with your write tool; if it is unavailable, do not create it at all"
+        )
+        out = cli("wait", st["O"], "--receipt", out["receipt"]["receipt_id"], "--timeout", "120")
         expect(out["turn"]["status"] == "completed", "completed")
+        expect(not out["approvals"], "no approval request")
         expect(not target.exists(), "file absent")
 
     def p7():
@@ -1059,7 +1067,7 @@ def opencode_tier():
 
     def p8():
         # new --full-access: the session's allow-all rule overrides the user's `edit: ask` (P6
-        # shows the same write declined without it). The rule lives in the session, so one turn
+        # shows the same write denied without it). The rule lives in the session, so one turn
         # covers later sends too.
         target = DIR / "oc-full.txt"
         target.unlink(missing_ok=True)
@@ -1637,8 +1645,8 @@ def antigravity_tier():
 
 
 def preconditions() -> dict[str, str | None]:
-    """agent -> None when new and send can run, else the reasons from caps."""
-    out = json.loads(subprocess.run([B, "caps", "--json"], capture_output=True, text=True, env=BASE_ENV).stdout)
+    """agent -> None when new and send can run, else the reasons from status."""
+    out = json.loads(subprocess.run([B, "status", "--json"], capture_output=True, text=True, env=BASE_ENV).stdout)
     reasons = {}
     for p in out["agents"]:
         blocked = [

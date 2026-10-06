@@ -258,13 +258,13 @@ impl<'a> Adapter<'a> {
 }
 
 impl Agent for Adapter<'_> {
-    async fn caps(&self) -> Caps {
+    async fn status(&self) -> AgentStatus {
         match self {
-            Adapter::Codex(p) => p.caps().await,
-            Adapter::Claude(p) => p.caps().await,
-            Adapter::OpenCode(p) => p.caps().await,
-            Adapter::Grok(p) => p.caps().await,
-            Adapter::Antigravity(p) => p.caps().await,
+            Adapter::Codex(p) => p.status().await,
+            Adapter::Claude(p) => p.status().await,
+            Adapter::OpenCode(p) => p.status().await,
+            Adapter::Grok(p) => p.status().await,
+            Adapter::Antigravity(p) => p.status().await,
         }
     }
 
@@ -352,8 +352,9 @@ pub struct StartRequest<'a> {
     /// OpenCode `title`, Grok `_x.ai/session/rename`; Antigravity has none and refuses it);
     /// `ls` shows it as `name`.
     pub name: Option<&'a str>,
-    /// Reasoning effort (Codex `turn/start.effort`, Grok `--reasoning-effort`, Antigravity
-    /// `--effort`; the values are the model's).
+    /// Reasoning effort for the session, passed through unvalidated: Codex
+    /// `turn/start.effort`, Claude and Antigravity `--effort` on every run, OpenCode the
+    /// model `variant`, Grok the `reasoning_effort` config option.
     pub effort: Option<&'a str>,
     /// Every permission, no approval prompts (`new --full-access`, DESIGN.md §4).
     pub full_access: bool,
@@ -392,10 +393,10 @@ pub struct ReadPage {
     pub raw: Vec<Value>,
 }
 
-/// One agent's entry in `caps`: the installed version, the state of the shared process
+/// One agent's entry in `status`: the installed version, the state of the shared process
 /// agent-talk joins, and which operations can run now (DESIGN.md §2).
 #[derive(Serialize)]
-pub struct Caps {
+pub struct AgentStatus {
     pub agent: &'static str,
     /// The agent CLI's `--version` output (OpenCode: the running service's version).
     pub version: Option<String>,
@@ -431,7 +432,7 @@ impl Operation {
 /// return a receipt; a `deadline` makes them observe the resulting turn on the
 /// same connection.
 pub trait Agent {
-    async fn caps(&self) -> Caps;
+    async fn status(&self) -> AgentStatus;
     async fn list(
         &self,
         filter: &ListFilter<'_>,

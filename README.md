@@ -29,7 +29,7 @@ cargo install agent-talk
 | --------------- | ------------------------------------------------------------------ | ------------------------------------------------------ |
 | Codex           | shared app-server daemon                                           | `codex app-server daemon start` before the TUI opens   |
 | Claude Code     | `claude -p`                                                        | none                                                   |
-| OpenCode        | shared background service                                          | an open `opencode` client, or `opencode service start` |
+| OpenCode 2.x    | shared background service                                          | an open `opencode` client, or `opencode service start` |
 | Grok CLI        | ACP to `grok agent stdio`, through the shared leader when one runs | none                                                   |
 | Antigravity CLI | `agy -p`                                                           | none                                                   |
 
@@ -44,7 +44,7 @@ agent-talk new claude --wait "list the failing tests"
 agent-talk send codex:<thread id> --wait "what are you working on?"
 agent-talk read opencode:<session id> --tail 4
 agent-talk wait codex:<thread id> --receipt <receipt id>
-agent-talk caps
+agent-talk status
 ```
 
 Each session is identified by a handle such as `codex:<thread id>`, which `ls` and `new` print.
@@ -64,7 +64,7 @@ A session started with `agent-talk new` runs under the agent's own permission se
 `new --full-access` gives it every permission with no approval prompts. agent-talk never approves
 tool calls. In a session it started, nobody is there to answer approval requests, so the agent is
 told not to ask, and anything that still needs approval is declined. In a session it did not
-start, approval requests are left to the user. `agent-talk caps` prints what the installed CLIs
+start, approval requests are left to the user. `agent-talk status` prints what the installed CLIs
 and running daemons support, and [DESIGN.md](DESIGN.md) describes how each agent is handled.
 
 The exit code is one of:
