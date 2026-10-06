@@ -22,8 +22,8 @@ use self::stream::{Run, StreamEvent, System, denial, result_turn};
 use self::transcript::{TurnEnd, head, live_branch, load, slug, transcript_turn, turn_end};
 use super::{
     Agent, ApprovalPolicy, Caps, Check, ListFilter, Mode, Operation, ReadPage, ReadRange,
-    SendRequest, StartRequest, WaitTarget, bounded, cli_version, first_line, lock, pid_alive,
-    record, settle, tail, wait_receipt,
+    SendRequest, StartRequest, WaitTarget, approval_policy, bounded, cli_version, first_line, lock,
+    pid_alive, record, settle, tail, wait_receipt,
 };
 use crate::model::{
     self, AgentError, Approval, Error, ErrorCode, Observations, Outcome, Page, ReceiptState,
@@ -565,26 +565,19 @@ impl Agent for Claude<'_> {
         Ok(Page { items, next_cursor })
     }
 
-    async fn start(
-        &self,
-        req: &StartRequest<'_>,
-        approvals: Option<ApprovalPolicy>,
-        deadline: Option<Instant>,
-    ) -> Result<Outcome> {
-        if req.approval_policy.is_some() || req.sandbox.is_some() || req.effort.is_some() {
+    async fn start(&self, req: &StartRequest<'_>, deadline: Option<Instant>) -> Result<Outcome> {
+        if req.effort.is_some() {
             return Err(Error::new(
                 ErrorCode::Unsupported,
-                "--approval-policy, --sandbox and --effort are Codex options; Claude uses its own permission and model settings",
+                "agent-talk does not pass --effort to Claude",
             ));
         }
-        let policy = approvals.unwrap_or(ApprovalPolicy::Observe);
         let id = uuid::Uuid::new_v4().to_string();
         let h = handle(&id);
         let _lock = lock(&h, SECOND_WRITER)?;
         let stored_args = json!({
             "model": req.model,
-            "max_turns": req.max_turns,
-            "approvals": format!("{policy:?}").to_lowercase(),
+            "full_access": req.full_access,
         });
         self.store.insert_owned(&h, req.cwd, &stored_args)?;
         let receipt_id = uuid::Uuid::new_v4().to_string();
@@ -600,7 +593,12 @@ impl Agent for Claude<'_> {
             reply_to: None,
             depth: req.depth,
         })?;
-        let mut args = process::args(["--session-id", &id], req.model, req.max_turns, policy);
+        let mut args = process::args(
+            ["--session-id", &id],
+            req.model,
+            ApprovalPolicy::Deny,
+            req.full_access,
+        );
         if let Some(n) = req.name {
             args.extend(["--name".into(), n.into()]);
         }
@@ -619,7 +617,6 @@ impl Agent for Claude<'_> {
         &self,
         id: &str,
         req: &SendRequest<'_>,
-        approvals: Option<ApprovalPolicy>,
         deadline: Option<Instant>,
     ) -> Result<Outcome> {
         check_id(id)?;
@@ -668,11 +665,13 @@ impl Agent for Claude<'_> {
             reply_to: req.reply_to,
             depth: req.depth,
         })?;
+        // A session agent-talk started keeps the model and permissions `new` gave it.
+        let started = self.store.owned_args(&h)?.unwrap_or_default();
         let args = process::args(
             ["--resume", id],
-            req.model,
-            req.max_turns,
-            approvals.unwrap_or(ApprovalPolicy::Observe),
+            started["model"].as_str(),
+            approval_policy(self.store, &h)?,
+            started["full_access"] == true,
         );
         let watch = RunWatch {
             id: id.to_string(),
@@ -743,13 +742,7 @@ impl Agent for Claude<'_> {
         })
     }
 
-    async fn wait(
-        &self,
-        id: &str,
-        target: &WaitTarget,
-        _approvals: Option<ApprovalPolicy>,
-        deadline: Instant,
-    ) -> Result<Outcome> {
+    async fn wait(&self, id: &str, target: &WaitTarget, deadline: Instant) -> Result<Outcome> {
         check_id(id)?;
         let h = handle(id);
         let (turn_id, receipt) = match target {

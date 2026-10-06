@@ -2,9 +2,7 @@
 //!
 //! Each tool builds the same request the CLI builds and runs it through `ops::run`,
 //! so results are exactly what `--json` prints, and refusals are the CLI's error object
-//! returned as a tool error (`isError: true`), not a protocol error. The tool surface
-//! is smaller than the CLI's on purpose: agents get no approval, sandbox or turn-limit
-//! knobs.
+//! returned as a tool error (`isError: true`), not a protocol error.
 
 use crate::agents::{Mode, ReadRange, WaitTarget};
 use crate::model::{self, Caller, Error, ErrorCode, Outcome};
@@ -79,6 +77,9 @@ struct NewParams {
     name: Option<String>,
     /// Reasoning effort (Codex, Grok, Antigravity; the model's values, e.g. low, medium, high).
     effort: Option<String>,
+    /// Give the session every permission, with no sandbox and no approval prompts (default
+    /// false: the agent's own configuration).
+    full_access: Option<bool>,
     /// Wait for the first turn to finish and return it (reply in `turn.final_text`).
     wait: Option<bool>,
     /// Seconds to wait with wait=true (default 600). On timeout the outcome is unknown
@@ -274,10 +275,7 @@ impl Server {
             model: p.model,
             name: p.name,
             effort: p.effort,
-            max_turns: None,
-            approval_policy: None,
-            sandbox: None,
-            approvals: None,
+            full_access: p.full_access.unwrap_or(false),
             wait: wait_for(p.wait, p.timeout_s),
             from: self.sender(&meta),
             max_hops: self.max_hops,
@@ -303,9 +301,6 @@ impl Server {
             mode: p.mode.unwrap_or(Mode::Queue),
             expect_turn: None,
             reply_to: p.reply_to,
-            model: None,
-            max_turns: None,
-            approvals: None,
             wait: wait_for(p.wait, p.timeout_s),
             from: self.sender(&meta),
             max_hops: self.max_hops,
@@ -354,7 +349,6 @@ impl Server {
         self.exec(Request::Wait(WaitArgs {
             handle: p.handle,
             target,
-            approvals: None,
             timeout: p.timeout_s.map_or(DEFAULT_TIMEOUT, Duration::from_secs),
             raw: p.raw.unwrap_or(false),
         }))

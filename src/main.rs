@@ -4,7 +4,7 @@ mod model;
 mod ops;
 mod store;
 
-use agents::{ApprovalPolicy, Mode, ReadRange, WaitTarget};
+use agents::{Mode, ReadRange, WaitTarget};
 use clap::{Args, Parser, Subcommand};
 use model::{Approval, Caller, CallerKind, Outcome, Receipt, Turn};
 use ops::{
@@ -107,20 +107,10 @@ enum Cmd {
         /// e.g. low | medium | high); default: the agent's.
         #[arg(long)]
         effort: Option<String>,
-        /// Agentic turn limit for the first turn (Claude only).
+        /// Give the session every permission, with no sandbox and no approval prompts;
+        /// default: the agent's own configuration.
         #[arg(long)]
-        max_turns: Option<u32>,
-        /// Approval policy for the new thread (Codex only, e.g. on-request); default: the
-        /// daemon's.
-        #[arg(long)]
-        approval_policy: Option<String>,
-        /// Sandbox for the new thread (Codex only): read-only | workspace-write |
-        /// danger-full-access; default: the daemon's.
-        #[arg(long)]
-        sandbox: Option<String>,
-        /// Approval requests reaching agent-talk while it observes the turn.
-        #[arg(long, value_enum)]
-        approvals: Option<ApprovalPolicy>,
+        full_access: bool,
         /// Include the agent's raw record of the turn under `raw` in --json output (large).
         #[arg(long)]
         raw: bool,
@@ -148,16 +138,6 @@ enum Cmd {
         /// Steer only: the running turn id you expect (default: the newest turn).
         #[arg(long)]
         expect_turn: Option<String>,
-        /// Model for the turn this message starts (Claude, Antigravity). Antigravity otherwise
-        /// reuses the model, and always the effort, that `new` recorded.
-        #[arg(long)]
-        model: Option<String>,
-        /// Agentic turn limit for the turn this message starts (Claude only).
-        #[arg(long)]
-        max_turns: Option<u32>,
-        /// Approval requests reaching agent-talk while it observes the turn.
-        #[arg(long, value_enum)]
-        approvals: Option<ApprovalPolicy>,
         /// Include the agent's raw record of the turn under `raw` in --json output (large).
         #[arg(long)]
         raw: bool,
@@ -193,9 +173,6 @@ enum Cmd {
         receipt: Option<String>,
         #[arg(long, default_value_t = DEFAULT_TIMEOUT.as_secs())]
         timeout: u64,
-        /// Approval requests reaching agent-talk while it observes the turn.
-        #[arg(long, value_enum)]
-        approvals: Option<ApprovalPolicy>,
         /// Include the agent's raw record of the turn under `raw` in --json output (large).
         #[arg(long)]
         raw: bool,
@@ -329,10 +306,7 @@ fn request(cmd: Cmd) -> model::Result<Request> {
             model,
             name,
             effort,
-            max_turns,
-            approval_policy,
-            sandbox,
-            approvals,
+            full_access,
             raw,
             wait,
             sender,
@@ -343,10 +317,7 @@ fn request(cmd: Cmd) -> model::Result<Request> {
             model,
             name,
             effort,
-            max_turns,
-            approval_policy,
-            sandbox,
-            approvals,
+            full_access,
             wait: wait.duration(),
             from: cli_caller(sender.from.as_deref())?,
             max_hops: sender.max_hops,
@@ -358,9 +329,6 @@ fn request(cmd: Cmd) -> model::Result<Request> {
             mode,
             reply_to,
             expect_turn,
-            model,
-            max_turns,
-            approvals,
             raw,
             wait,
             sender,
@@ -370,9 +338,6 @@ fn request(cmd: Cmd) -> model::Result<Request> {
             mode,
             expect_turn,
             reply_to,
-            model,
-            max_turns,
-            approvals,
             wait: wait.duration(),
             from: cli_caller(sender.from.as_deref())?,
             max_hops: sender.max_hops,
@@ -397,7 +362,6 @@ fn request(cmd: Cmd) -> model::Result<Request> {
             turn,
             receipt,
             timeout,
-            approvals,
             raw,
         } => Request::Wait(WaitArgs {
             handle,
@@ -406,7 +370,6 @@ fn request(cmd: Cmd) -> model::Result<Request> {
                 (None, Some(r)) => WaitTarget::Receipt(r),
                 (None, None) => unreachable!("clap requires --turn or --receipt"),
             },
-            approvals,
             timeout: Duration::from_secs(timeout),
             raw,
         }),

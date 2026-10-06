@@ -192,18 +192,17 @@ pub async fn tail(
     }
 }
 
-/// How agent-talk treats approval requests that reach it while it observes a turn.
-/// Every subscribed client receives them, and any answer resolves them for all.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+/// How agent-talk treats approval requests that reach it while it observes a turn
+/// (DESIGN.md §4). Every subscribed client receives them, and any answer resolves them for
+/// all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApprovalPolicy {
-    /// Never answer; record the request and report it as pending. Default on sessions
-    /// agent-talk did not start, and on every Claude, Grok and Antigravity session (their CLIs
-    /// apply the user's own permission configuration, which agent-talk inherits).
+    /// Never answer; record the request and report it as pending. Sessions agent-talk did
+    /// not start: the user answers in their own client.
     Observe,
     /// Decline, never accept: Codex answers `decline`, OpenCode `reject` with a message,
-    /// Claude gets `--permission-prompts none`, Grok `yoloMode: false` plus `reject_once`;
-    /// Antigravity has nothing to answer. This changes the shared turn, including for a
-    /// TUI attached to it. Default on Codex and OpenCode sessions agent-talk started.
+    /// Claude gets `--permission-prompts none`, Grok `reject_once`; Antigravity has nothing
+    /// to answer. Sessions agent-talk started, where nobody else would answer.
     Deny,
 }
 
@@ -278,18 +277,13 @@ impl Agent for Adapter<'_> {
         }
     }
 
-    async fn start(
-        &self,
-        req: &StartRequest<'_>,
-        approvals: Option<ApprovalPolicy>,
-        deadline: Option<Instant>,
-    ) -> Result<Outcome> {
+    async fn start(&self, req: &StartRequest<'_>, deadline: Option<Instant>) -> Result<Outcome> {
         match self {
-            Adapter::Codex(p) => p.start(req, approvals, deadline).await,
-            Adapter::Claude(p) => p.start(req, approvals, deadline).await,
-            Adapter::OpenCode(p) => p.start(req, approvals, deadline).await,
-            Adapter::Grok(p) => p.start(req, approvals, deadline).await,
-            Adapter::Antigravity(p) => p.start(req, approvals, deadline).await,
+            Adapter::Codex(p) => p.start(req, deadline).await,
+            Adapter::Claude(p) => p.start(req, deadline).await,
+            Adapter::OpenCode(p) => p.start(req, deadline).await,
+            Adapter::Grok(p) => p.start(req, deadline).await,
+            Adapter::Antigravity(p) => p.start(req, deadline).await,
         }
     }
 
@@ -297,15 +291,14 @@ impl Agent for Adapter<'_> {
         &self,
         id: &str,
         req: &SendRequest<'_>,
-        approvals: Option<ApprovalPolicy>,
         deadline: Option<Instant>,
     ) -> Result<Outcome> {
         match self {
-            Adapter::Codex(p) => p.send(id, req, approvals, deadline).await,
-            Adapter::Claude(p) => p.send(id, req, approvals, deadline).await,
-            Adapter::OpenCode(p) => p.send(id, req, approvals, deadline).await,
-            Adapter::Grok(p) => p.send(id, req, approvals, deadline).await,
-            Adapter::Antigravity(p) => p.send(id, req, approvals, deadline).await,
+            Adapter::Codex(p) => p.send(id, req, deadline).await,
+            Adapter::Claude(p) => p.send(id, req, deadline).await,
+            Adapter::OpenCode(p) => p.send(id, req, deadline).await,
+            Adapter::Grok(p) => p.send(id, req, deadline).await,
+            Adapter::Antigravity(p) => p.send(id, req, deadline).await,
         }
     }
 
@@ -319,19 +312,13 @@ impl Agent for Adapter<'_> {
         }
     }
 
-    async fn wait(
-        &self,
-        id: &str,
-        target: &WaitTarget,
-        approvals: Option<ApprovalPolicy>,
-        deadline: Instant,
-    ) -> Result<Outcome> {
+    async fn wait(&self, id: &str, target: &WaitTarget, deadline: Instant) -> Result<Outcome> {
         match self {
-            Adapter::Codex(p) => p.wait(id, target, approvals, deadline).await,
-            Adapter::Claude(p) => p.wait(id, target, approvals, deadline).await,
-            Adapter::OpenCode(p) => p.wait(id, target, approvals, deadline).await,
-            Adapter::Grok(p) => p.wait(id, target, approvals, deadline).await,
-            Adapter::Antigravity(p) => p.wait(id, target, approvals, deadline).await,
+            Adapter::Codex(p) => p.wait(id, target, deadline).await,
+            Adapter::Claude(p) => p.wait(id, target, deadline).await,
+            Adapter::OpenCode(p) => p.wait(id, target, deadline).await,
+            Adapter::Grok(p) => p.wait(id, target, deadline).await,
+            Adapter::Antigravity(p) => p.wait(id, target, deadline).await,
         }
     }
 }
@@ -371,13 +358,11 @@ pub struct StartRequest<'a> {
     /// Reasoning effort (Codex `turn/start.effort`, Grok `--reasoning-effort`, Antigravity
     /// `--effort`; the values are the model's).
     pub effort: Option<&'a str>,
-    pub approval_policy: Option<&'a str>,
-    pub sandbox: Option<&'a str>,
+    /// Every permission, no approval prompts (`new --full-access`, DESIGN.md §4).
+    pub full_access: bool,
     pub from: &'a Caller,
     /// Hop depth of the first prompt (`Store::hop_depth`).
     pub depth: u32,
-    /// Agentic turn limit (Claude `--max-turns`).
-    pub max_turns: Option<u32>,
 }
 
 pub struct SendRequest<'a> {
@@ -392,10 +377,6 @@ pub struct SendRequest<'a> {
     pub depth: u32,
     /// Steer only: the active turn id the caller expects; defaults to the newest turn.
     pub expect_turn: Option<&'a str>,
-    /// Model for the turn this message starts (agents that take it per turn).
-    pub model: Option<&'a str>,
-    /// Agentic turn limit (Claude `--max-turns`).
-    pub max_turns: Option<u32>,
 }
 
 /// Which part of the history `read` returns.
@@ -462,44 +443,36 @@ pub trait Agent {
         limit: u32,
         cursor: Option<&str>,
     ) -> Result<Page<Session>>;
-    /// `approvals: None` means the agent default.
-    async fn start(
-        &self,
-        req: &StartRequest<'_>,
-        approvals: Option<ApprovalPolicy>,
-        deadline: Option<Instant>,
-    ) -> Result<Outcome>;
+    async fn start(&self, req: &StartRequest<'_>, deadline: Option<Instant>) -> Result<Outcome>;
     async fn send(
         &self,
         id: &str,
         req: &SendRequest<'_>,
-        approvals: Option<ApprovalPolicy>,
         deadline: Option<Instant>,
     ) -> Result<Outcome>;
     async fn read(&self, id: &str, range: ReadRange) -> Result<ReadPage>;
-    async fn wait(
-        &self,
-        id: &str,
-        target: &WaitTarget,
-        approvals: Option<ApprovalPolicy>,
-        deadline: Instant,
-    ) -> Result<Outcome>;
+    async fn wait(&self, id: &str, target: &WaitTarget, deadline: Instant) -> Result<Outcome>;
 }
 
 // Receipt and approval lifecycle shared by every adapter. The semantics are agent-talk's
 // (DESIGN.md §4), not an agent's, so they live here and the adapters only supply agent plumbing.
 
-/// Explicit policy wins; otherwise deny only on sessions agent-talk started.
-pub fn approval_policy(
-    store: &Store,
-    handle: &str,
-    explicit: Option<ApprovalPolicy>,
-) -> Result<ApprovalPolicy> {
-    Ok(match explicit {
-        Some(p) => p,
-        None if store.is_owned(handle)? => ApprovalPolicy::Deny,
-        None => ApprovalPolicy::Observe,
+/// Deny on sessions agent-talk started, observe on the others.
+pub fn approval_policy(store: &Store, handle: &str) -> Result<ApprovalPolicy> {
+    Ok(if store.is_owned(handle)? {
+        ApprovalPolicy::Deny
+    } else {
+        ApprovalPolicy::Observe
     })
+}
+
+/// Whether `new --full-access` started this session. Codex loses the sandbox when a thread
+/// unloads, and Claude and Antigravity take permissions per process, so later sends apply it
+/// again (DESIGN.md §4).
+pub fn full_access(store: &Store, handle: &str) -> Result<bool> {
+    Ok(store
+        .owned_args(handle)?
+        .is_some_and(|a| a["full_access"] == true))
 }
 
 /// The submission failed. An agent response is a definitive refusal: `rejected`. A lost

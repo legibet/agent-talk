@@ -29,7 +29,7 @@ use tokio::time::Instant;
 /// How many history pages (newest first) `span` scans for a user message. An older
 /// message counts as not in history, so `wait` on it ends with `E_PRECONDITION`.
 const SPAN_PAGES: usize = 40;
-const DENY_MESSAGE: &str = "Declined by agent-talk (--approvals deny): it never approves tool calls on anyone's behalf. If this action is needed, ask the person in their own OpenCode client.";
+const DENY_MESSAGE: &str = "Declined by agent-talk: nobody answers approval requests in a session agent-talk started. Continue without this action, or report that it needs approval.";
 
 pub struct OpenCode<'a> {
     store: &'a Store,
@@ -499,7 +499,6 @@ impl<'a> OpenCode<'a> {
         svc: &Service,
         session_id: &str,
         req: &SendRequest<'_>,
-        approvals: Option<ApprovalPolicy>,
         deadline: Option<Instant>,
     ) -> Result<Outcome> {
         let handle = handle(session_id);
@@ -508,7 +507,7 @@ impl<'a> OpenCode<'a> {
         let mut w = Watch::new(
             session_id,
             &msg_id,
-            approval_policy(self.store, &handle, approvals)?,
+            approval_policy(self.store, &handle)?,
             false,
         );
         let work = async {
@@ -767,22 +766,11 @@ impl Agent for OpenCode<'_> {
         })
     }
 
-    async fn start(
-        &self,
-        req: &StartRequest<'_>,
-        approvals: Option<ApprovalPolicy>,
-        deadline: Option<Instant>,
-    ) -> Result<Outcome> {
-        if req.approval_policy.is_some() || req.sandbox.is_some() || req.effort.is_some() {
+    async fn start(&self, req: &StartRequest<'_>, deadline: Option<Instant>) -> Result<Outcome> {
+        if req.effort.is_some() {
             return Err(Error::new(
                 ErrorCode::Unsupported,
-                "--approval-policy, --sandbox and --effort are Codex options; OpenCode sessions run under the user's agent permission rules, and effort is the model variant (--model provider/model#variant)",
-            ));
-        }
-        if req.max_turns.is_some() {
-            return Err(Error::new(
-                ErrorCode::Unsupported,
-                "--max-turns is a Claude option; OpenCode has no per-turn limit",
+                "OpenCode takes effort as the model variant: --model provider/model#variant",
             ));
         }
         let svc = self.connect().await?;
@@ -792,6 +780,11 @@ impl Agent for OpenCode<'_> {
         }
         if let Some(n) = req.name {
             body["title"] = json!(n);
+        }
+        if req.full_access {
+            // Session rules are evaluated after the agent's, so this overrides the user's
+            // configured rules (OpenCode 2.0.23, DESIGN.md §6.3).
+            body["permissions"] = json!([{"action": "*", "resource": "*", "effect": "allow"}]);
         }
         let created = svc.post("/api/session", &body).await?;
         let session_id = text(&created["data"]["id"]).ok_or_else(|| {
@@ -810,32 +803,16 @@ impl Agent for OpenCode<'_> {
             reply_to: None,
             depth: req.depth,
             expect_turn: None,
-            model: None,
-            max_turns: None,
         };
-        self.submit(&svc, &session_id, &send, approvals, deadline)
-            .await
+        self.submit(&svc, &session_id, &send, deadline).await
     }
 
     async fn send(
         &self,
         session_id: &str,
         req: &SendRequest<'_>,
-        approvals: Option<ApprovalPolicy>,
         deadline: Option<Instant>,
     ) -> Result<Outcome> {
-        if req.model.is_some() {
-            return Err(Error::new(
-                ErrorCode::Unsupported,
-                "OpenCode takes the model per session; set it with `agent-talk new --model <provider>/<model>`",
-            ));
-        }
-        if req.max_turns.is_some() {
-            return Err(Error::new(
-                ErrorCode::Unsupported,
-                "--max-turns is a Claude option; OpenCode has no per-turn limit",
-            ));
-        }
         if req.expect_turn.is_some() {
             return Err(Error::new(
                 ErrorCode::Unsupported,
@@ -843,8 +820,7 @@ impl Agent for OpenCode<'_> {
             ));
         }
         let svc = self.connect().await?;
-        self.submit(&svc, session_id, req, approvals, deadline)
-            .await
+        self.submit(&svc, session_id, req, deadline).await
     }
 
     async fn read(&self, session_id: &str, range: ReadRange) -> Result<ReadPage> {
@@ -906,7 +882,6 @@ impl Agent for OpenCode<'_> {
         &self,
         session_id: &str,
         target: &WaitTarget,
-        approvals: Option<ApprovalPolicy>,
         deadline: Instant,
     ) -> Result<Outcome> {
         let handle = handle(session_id);
@@ -922,7 +897,7 @@ impl Agent for OpenCode<'_> {
         let mut w = Watch::new(
             session_id,
             &msg_id,
-            approval_policy(self.store, &handle, approvals)?,
+            approval_policy(self.store, &handle)?,
             true,
         );
         w.unaccepted = receipt

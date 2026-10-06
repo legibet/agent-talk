@@ -7,8 +7,8 @@ use self::protocol::*;
 use self::transport::{Conn, Event, ServerRequest, decode};
 use super::{
     Agent, ApprovalPolicy, Caps, Check, ListFilter, Mode, Operation, ReadPage, ReadRange,
-    SendRequest, StartRequest, WaitTarget, approval_policy, bounded, cli_version, record, reject,
-    resolve, settle, strip_provenance, wait_receipt,
+    SendRequest, StartRequest, WaitTarget, approval_policy, bounded, cli_version, full_access,
+    record, reject, resolve, settle, strip_provenance, wait_receipt,
 };
 use crate::model::{
     self, Approval, Error, ErrorCode, Message, Observations, Outcome, Page, Result, Session,
@@ -134,16 +134,19 @@ impl<'a> Codex<'a> {
     /// `RESUME_RETRIES` times, within the caller's deadline. A thread another app-server
     /// process holds is `E_FOREIGN_LIVE` (`resume_error`).
     async fn subscribe(&self, conn: &Conn, thread_id: &str) -> Result<ThreadResumeResponse> {
+        let mut params = resume_latest_turn(thread_id);
+        if full_access(self.store, &handle(thread_id))? {
+            // A thread that unloaded comes back with the user's sandbox; the approval
+            // policy survives (observed on codex 0.160.1, DESIGN.md §6.1).
+            params["sandbox"] = json!("danger-full-access");
+        }
         for _ in 0..RESUME_RETRIES {
-            match conn
-                .call("thread/resume", resume_latest_turn(thread_id))
-                .await
-            {
+            match conn.call("thread/resume", params.clone()).await {
                 Err(e) if history_not_ready(&e) => tokio::time::sleep(Duration::from_secs(1)).await,
                 r => return r.map_err(resume_error),
             }
         }
-        conn.call("thread/resume", resume_latest_turn(thread_id))
+        conn.call("thread/resume", params)
             .await
             .map_err(resume_error)
     }
@@ -670,29 +673,16 @@ impl Agent for Codex<'_> {
         })
     }
 
-    async fn start(
-        &self,
-        req: &StartRequest<'_>,
-        approvals: Option<ApprovalPolicy>,
-        deadline: Option<Instant>,
-    ) -> Result<Outcome> {
-        if req.max_turns.is_some() {
-            return Err(Error::new(
-                ErrorCode::Unsupported,
-                "--max-turns is a Claude option; Codex has no per-thread turn limit",
-            ));
-        }
+    async fn start(&self, req: &StartRequest<'_>, deadline: Option<Instant>) -> Result<Outcome> {
         let mut conn = self.connect().await?;
-        // Omitted settings fall back to the daemon's defaults.
-        let mut params = json!({"cwd": req.cwd});
-        for (key, value) in [
-            ("model", req.model),
-            ("approvalPolicy", req.approval_policy),
-            ("sandbox", req.sandbox),
-        ] {
-            if let Some(v) = value {
-                params[key] = json!(v);
-            }
+        // Nobody answers approvals on a thread agent-talk started: what needs one fails
+        // and the model is told. The sandbox and model fall back to the daemon's defaults.
+        let mut params = json!({"cwd": req.cwd, "approvalPolicy": "never"});
+        if let Some(m) = req.model {
+            params["model"] = json!(m);
+        }
+        if req.full_access {
+            params["sandbox"] = json!("danger-full-access");
         }
         let started: ThreadStartResponse = conn.call("thread/start", params).await?;
         let thread_id = started.thread.id;
@@ -709,11 +699,10 @@ impl Agent for Codex<'_> {
         let args = json!({
             "model": req.model,
             "effort": req.effort,
-            "approvalPolicy": req.approval_policy,
-            "sandbox": req.sandbox,
+            "full_access": req.full_access,
         });
         self.store.insert_owned(&handle, req.cwd, &args)?;
-        let mut w = Watch::new(&thread_id, approval_policy(self.store, &handle, approvals)?);
+        let mut w = Watch::new(&thread_id, ApprovalPolicy::Deny);
         let receipt_id = uuid::Uuid::new_v4().to_string();
         let client_msg_id = uuid::Uuid::new_v4().to_string();
         // Set once the agent accepted the submission.
@@ -764,25 +753,12 @@ impl Agent for Codex<'_> {
         &self,
         thread_id: &str,
         req: &SendRequest<'_>,
-        approvals: Option<ApprovalPolicy>,
         deadline: Option<Instant>,
     ) -> Result<Outcome> {
-        if req.model.is_some() {
-            return Err(Error::new(
-                ErrorCode::Unsupported,
-                "Codex queue and steer take no per-message model; set it with `agent-talk new --model`",
-            ));
-        }
-        if req.max_turns.is_some() {
-            return Err(Error::new(
-                ErrorCode::Unsupported,
-                "--max-turns is a Claude option; Codex has no per-turn limit",
-            ));
-        }
         let handle = handle(thread_id);
         let receipt_id = uuid::Uuid::new_v4().to_string();
         let client_msg_id = uuid::Uuid::new_v4().to_string();
-        let mut w = Watch::new(thread_id, approval_policy(self.store, &handle, approvals)?);
+        let mut w = Watch::new(thread_id, approval_policy(self.store, &handle)?);
         let mut conn = self.connect().await?;
         // Set once the agent accepted the submission.
         let mut target = None;
@@ -944,7 +920,6 @@ impl Agent for Codex<'_> {
         &self,
         thread_id: &str,
         target: &WaitTarget,
-        approvals: Option<ApprovalPolicy>,
         deadline: Instant,
     ) -> Result<Outcome> {
         let handle = handle(thread_id);
@@ -968,7 +943,7 @@ impl Agent for Codex<'_> {
                 (target, Some(r.clone()))
             }
         };
-        let mut w = Watch::new(thread_id, approval_policy(self.store, &handle, approvals)?);
+        let mut w = Watch::new(thread_id, approval_policy(self.store, &handle)?);
         let mut conn = self.connect().await?;
         let work = async {
             // History first: the turn may already be complete.

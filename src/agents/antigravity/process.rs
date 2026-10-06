@@ -13,8 +13,13 @@ use tokio::process::Child;
 
 /// `agy -p` arguments for one turn. `--model` without `--effort` is refused by agy
 /// for its model aliases (`--model gemini-3.8-flash requires --effort`), so both pass through
-/// as given.
-pub fn args(conversation: Option<&str>, model: Option<&str>, effort: Option<&str>) -> Vec<String> {
+/// as given. Nothing here persists across runs, so every turn passes it again.
+pub fn args(
+    conversation: Option<&str>,
+    model: Option<&str>,
+    effort: Option<&str>,
+    full_access: bool,
+) -> Vec<String> {
     let mut args: Vec<String> = [
         "-p",
         "",
@@ -30,6 +35,9 @@ pub fn args(conversation: Option<&str>, model: Option<&str>, effort: Option<&str
     }
     if let Some(e) = effort {
         args.extend(["--effort".into(), e.into()]);
+    }
+    if full_access {
+        args.push("--dangerously-skip-permissions".into());
     }
     if let Some(c) = conversation {
         args.extend(["--conversation".into(), c.into()]);

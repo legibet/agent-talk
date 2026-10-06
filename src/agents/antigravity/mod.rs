@@ -27,9 +27,9 @@ use self::transcript::{
     ends_with_reply, load, messages, preview, span_reply, turn_span, user_input,
 };
 use super::{
-    Agent, ApprovalPolicy, Caps, Check, ListFilter, Mode, Operation, ReadPage, ReadRange,
-    SendRequest, StartRequest, WaitTarget, bounded, cli_version, lock, pid_alive, record, settle,
-    tail, wait_receipt,
+    Agent, Caps, Check, ListFilter, Mode, Operation, ReadPage, ReadRange, SendRequest,
+    StartRequest, WaitTarget, bounded, cli_version, lock, pid_alive, record, settle, tail,
+    wait_receipt,
 };
 use crate::model::{
     self, Approval, Error, ErrorCode, Observations, Outcome, Page, ReceiptState, Result, Session,
@@ -606,27 +606,20 @@ impl Agent for Antigravity<'_> {
         Ok(Page { items, next_cursor })
     }
 
-    async fn start(
-        &self,
-        req: &StartRequest<'_>,
-        _approvals: Option<ApprovalPolicy>,
-        deadline: Option<Instant>,
-    ) -> Result<Outcome> {
+    async fn start(&self, req: &StartRequest<'_>, deadline: Option<Instant>) -> Result<Outcome> {
         if req.name.is_some() {
             return Err(Error::new(
                 ErrorCode::Unsupported,
                 "Antigravity has no title interface outside its TUI (/rename); start without --name",
             ));
         }
-        if req.approval_policy.is_some() || req.sandbox.is_some() || req.max_turns.is_some() {
-            return Err(Error::new(
-                ErrorCode::Unsupported,
-                "--approval-policy and --sandbox are Codex options and --max-turns is Claude's; agy uses the user's own permission settings",
-            ));
-        }
         let receipt_id = uuid::Uuid::new_v4().to_string();
         let log = self.log_path(&receipt_id);
-        let mut child = spawn(req.cwd, &args(None, req.model, req.effort), &log)?;
+        let mut child = spawn(
+            req.cwd,
+            &args(None, req.model, req.effort, req.full_access),
+            &log,
+        )?;
         // The conversation id exists only once agy reports it; the intent is written then,
         // before the message is.
         let id = match bounded(deadline, wait_init(&mut child, &log)).await {
@@ -650,7 +643,7 @@ impl Agent for Antigravity<'_> {
         let stored_args = json!({
             "model": req.model,
             "effort": req.effort,
-            "approvals": "observe",
+            "full_access": req.full_access,
         });
         self.store.insert_owned(&h, req.cwd, &stored_args)?;
         self.store.insert_intent(&NewIntent {
@@ -677,7 +670,6 @@ impl Agent for Antigravity<'_> {
         &self,
         id: &str,
         req: &SendRequest<'_>,
-        _approvals: Option<ApprovalPolicy>,
         deadline: Option<Instant>,
     ) -> Result<Outcome> {
         check_id(id)?;
@@ -685,12 +677,6 @@ impl Agent for Antigravity<'_> {
             return Err(Error::new(
                 ErrorCode::NoSteer,
                 "Antigravity conversations cannot be steered (a line written during a turn becomes the next turn); send with --mode queue",
-            ));
-        }
-        if req.max_turns.is_some() {
-            return Err(Error::new(
-                ErrorCode::Unsupported,
-                "--max-turns is a Claude option",
             ));
         }
         let h = handle(id);
@@ -718,9 +704,15 @@ impl Agent for Antigravity<'_> {
                 }
             },
         };
+        // A conversation agent-talk started keeps the model, effort and permissions `new`
+        // gave it.
         let started = self.store.owned_args(&h)?.unwrap_or_default();
-        let model = req.model.or(started["model"].as_str());
-        let effort = started["effort"].as_str();
+        let args = args(
+            Some(id),
+            started["model"].as_str(),
+            started["effort"].as_str(),
+            started["full_access"] == true,
+        );
         let receipt_id = uuid::Uuid::new_v4().to_string();
         self.store.insert_intent(&NewIntent {
             receipt_id: &receipt_id,
@@ -733,7 +725,7 @@ impl Agent for Antigravity<'_> {
             depth: req.depth,
         })?;
         let log = self.log_path(&receipt_id);
-        let child = match spawn(&cwd, &args(Some(id), model, effort), &log) {
+        let child = match spawn(&cwd, &args, &log) {
             Ok(c) => c,
             Err(e) => {
                 self.store
@@ -817,13 +809,7 @@ impl Agent for Antigravity<'_> {
         })
     }
 
-    async fn wait(
-        &self,
-        id: &str,
-        target: &WaitTarget,
-        _approvals: Option<ApprovalPolicy>,
-        deadline: Instant,
-    ) -> Result<Outcome> {
+    async fn wait(&self, id: &str, target: &WaitTarget, deadline: Instant) -> Result<Outcome> {
         check_id(id)?;
         let h = handle(id);
         let (turn_id, receipt) = match target {

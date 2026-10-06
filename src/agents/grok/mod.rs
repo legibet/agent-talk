@@ -21,8 +21,8 @@ use self::acp::{Conn, Event, Reply, ServerRequest, Spawn};
 use self::updates::{History, first_prompt};
 use super::{
     Agent, ApprovalPolicy, Caps, Check, ListFilter, Mode, Operation, ReadPage, ReadRange,
-    SendRequest, StartRequest, WaitTarget, bounded, cli_version, first_line, lock, pid_alive,
-    record, reject, settle, strip_provenance, wait_receipt,
+    SendRequest, StartRequest, WaitTarget, approval_policy, bounded, cli_version, first_line,
+    full_access, lock, pid_alive, record, reject, settle, strip_provenance, wait_receipt,
 };
 use crate::model::{
     self, Approval, Error, ErrorCode, Observations, Outcome, Page, ReceiptState, Result, Session,
@@ -735,15 +735,13 @@ impl<'a> Grok<'a> {
         conn: &mut Conn,
         id: &str,
         cwd: &str,
-        deny: bool,
+        full_access: bool,
     ) -> Result<Value> {
         let mut params = json!({"sessionId": id, "cwd": cwd, "mcpServers": []});
-        if deny {
-            // Turns the user's always-approve off for this process's session, as on
-            // session/new (verified: `_x.ai/sessions/list` then shows `yolo: false`;
-            // without it the loaded session is `yolo: true` under permission_mode
-            // always-approve; DESIGN.md §6.4).
-            params["_meta"] = json!({"yoloMode": false});
+        if full_access {
+            // As on session/new: `_meta.yoloMode` on session/load sets yolo for this
+            // process's session (DESIGN.md §6.4).
+            params["_meta"] = json!({"yoloMode": true});
         }
         let r = conn.request("session/load", params).await?;
         conn.discard_notifications();
@@ -1042,27 +1040,16 @@ impl Agent for Grok<'_> {
         Ok(Page { items, next_cursor })
     }
 
-    async fn start(
-        &self,
-        req: &StartRequest<'_>,
-        approvals: Option<ApprovalPolicy>,
-        deadline: Option<Instant>,
-    ) -> Result<Outcome> {
-        if req.approval_policy.is_some() || req.sandbox.is_some() || req.max_turns.is_some() {
-            return Err(Error::new(
-                ErrorCode::Unsupported,
-                "--approval-policy, --sandbox and --max-turns are Codex and Claude options; Grok uses its own permission configuration",
-            ));
-        }
-        let policy = approvals.unwrap_or(ApprovalPolicy::Observe);
+    async fn start(&self, req: &StartRequest<'_>, deadline: Option<Instant>) -> Result<Outcome> {
+        let policy = ApprovalPolicy::Deny;
         let leader = self.leader()?;
         let mut conn = self
             .connect(req.cwd, leader.is_some(), req.model, req.effort)
             .await?;
         let res = async {
             let mut params = json!({"cwd": req.cwd, "mcpServers": []});
-            if policy == ApprovalPolicy::Deny {
-                params["_meta"] = json!({"yoloMode": false});
+            if req.full_access {
+                params["_meta"] = json!({"yoloMode": true});
             }
             let created = conn.request("session/new", params).await?;
             let id = created["sessionId"].as_str().ok_or_else(|| {
@@ -1080,7 +1067,7 @@ impl Agent for Grok<'_> {
             let stored_args = json!({
                 "model": req.model,
                 "effort": req.effort,
-                "approvals": format!("{policy:?}").to_lowercase(),
+                "full_access": req.full_access,
                 "leader": leader.is_some(),
             });
             self.store.insert_owned(&h, req.cwd, &stored_args)?;
@@ -1113,16 +1100,9 @@ impl Agent for Grok<'_> {
         &self,
         id: &str,
         req: &SendRequest<'_>,
-        approvals: Option<ApprovalPolicy>,
         deadline: Option<Instant>,
     ) -> Result<Outcome> {
         check_id(id)?;
-        if req.model.is_some() || req.max_turns.is_some() {
-            return Err(Error::new(
-                ErrorCode::Unsupported,
-                "Grok takes the model per session (agent-talk new --model); --max-turns is a Claude option",
-            ));
-        }
         let h = handle(id);
         let dir = self.require(id)?;
         let path = dir.join("summary.json");
@@ -1150,7 +1130,7 @@ impl Agent for Grok<'_> {
                 ));
             }
         };
-        let policy = approvals.unwrap_or(ApprovalPolicy::Observe);
+        let policy = approval_policy(self.store, &h)?;
         if req.mode == Mode::Steer {
             return self.steer(id, &cwd, req, policy, deadline).await;
         }
@@ -1183,12 +1163,10 @@ impl Agent for Grok<'_> {
             }
         };
         let res = async {
-            // Deny through the leader: yoloMode is not sent; on a resident session it has
-            // no effect (verified: `yolo` stayed true for every client after such a load),
-            // and the shared session is not agent-talk's to reconfigure. reject_once
-            // answers still apply to this prompt's requests.
-            let deny = policy == ApprovalPolicy::Deny && leader.is_none();
-            self.session_load(&mut conn, id, &cwd, deny).await?;
+            // Not through the leader: on a resident session yoloMode has no effect
+            // (verified: `yolo` stayed unchanged for every client after such a load).
+            let yolo = leader.is_none() && full_access(self.store, &h)?;
+            self.session_load(&mut conn, id, &cwd, yolo).await?;
             let receipt_id = uuid::Uuid::new_v4().to_string();
             let prompt_id = uuid::Uuid::new_v4().to_string();
             let intent = NewIntent {
@@ -1264,13 +1242,7 @@ impl Agent for Grok<'_> {
         })
     }
 
-    async fn wait(
-        &self,
-        id: &str,
-        target: &WaitTarget,
-        _approvals: Option<ApprovalPolicy>,
-        deadline: Instant,
-    ) -> Result<Outcome> {
+    async fn wait(&self, id: &str, target: &WaitTarget, deadline: Instant) -> Result<Outcome> {
         check_id(id)?;
         let h = handle(id);
         let (turn_id, receipt) = match target {

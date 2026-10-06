@@ -298,7 +298,7 @@ pub fn resume_error(e: Error) -> Error {
     }
 }
 
-/// `--approvals deny` answer for a server request: a schema-valid refusal that
+/// The deny answer for a server request: a schema-valid refusal that
 /// lets the turn continue (never `accept`, never `cancel`). `None` for requests
 /// that are not approvals; those are never answered.
 pub fn deny_response(method: &str) -> Option<Value> {

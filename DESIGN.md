@@ -24,7 +24,8 @@ behalf, deleting sessions.
    observations (§4); a refusal names the observation that blocks it.
 3. **Declare the limits.** `agent-talk caps` prints what the installed CLI and the running daemon
    or service can do. Unsupported cases fail with a stable error code, never a silent downgrade.
-4. **The user's install and login.** Same binaries, same accounts, same permission defaults.
+4. **The user's install and login.** Same binaries, same accounts, same permission defaults,
+   unless `new --full-access` asks for more.
 5. **Thin.** Normalize only conversation-level events (text, role, phase, turn boundaries,
    approval requests). Everything else passes through as raw agent JSON behind `--raw`.
 6. **Receipts, not assumptions.** Every mutation returns a receipt stating what was accepted. A
@@ -153,13 +154,29 @@ that turn.
 ### Approvals
 
 Agents fan approval requests out to every subscribed client, and any one answer resolves them
-for all. agent-talk never accepts. `--approvals observe` records and surfaces pending requests and
-lets the deadline pass with `state: waiting`; it is the default on sessions agent-talk did not
-start. `--approvals deny` declines (Codex `decline`, OpenCode `reject` with a message, Claude
-`--permission-prompts none`, Grok `yoloMode: false` plus `reject_once`); it is the default on
-owned Codex and OpenCode sessions. Claude, Grok and Antigravity default to `observe` on every
-session, because their CLIs apply the user's own permission configuration. Requests answered by
-someone else become `resolved`; denials made by the agent CLI itself are recorded as `denied`.
+for all. agent-talk never accepts.
+
+- Sessions agent-talk started have nobody else to answer, so they must not wait on approvals.
+  Where the agent allows it they never ask (Codex `approvalPolicy: never`, Claude
+  `--permission-prompts none`; headless Claude and Antigravity deny on their own), and what still
+  reaches agent-talk is declined (Codex `decline`, OpenCode `reject` with a message, Grok
+  `reject_once`).
+- Sessions agent-talk did not start belong to the user: agent-talk never answers there and never
+  changes their settings. It records pending requests and lets the deadline pass with
+  `state: waiting`.
+
+Requests answered by someone else become `resolved`; denials made by the agent CLI itself are
+recorded as `denied`.
+
+### Full access
+
+`new --full-access` (MCP `full_access`) gives a new session every permission and no approval
+prompts: Codex `sandbox: danger-full-access`, Claude `--permission-mode bypassPermissions`,
+OpenCode a session rule allowing every action, Grok `_meta.yoloMode: true`, Antigravity
+`--dangerously-skip-permissions`. Without it the session runs under the agent's own
+configuration. The choice is stored with the owned session and applied again on every send,
+because Claude and Antigravity take it per process, a resumed Codex thread falls back to the
+daemon's sandbox once it has unloaded, and a direct-mode Grok load starts a new process.
 
 ### Provenance and loops (best-effort)
 
@@ -200,8 +217,8 @@ text and records the delivered one. All of this is attribution, not authenticate
 `agent-talk mcp [--caller H] [--max-hops N]` is an ordinary stdio MCP server that the user
 configures once, globally; agent-talk never writes agent configuration or injects itself into
 sessions. It serves `ls / new / send / read / wait` with the JSON the CLI prints under `--json`;
-refusals are tool errors (`isError`), not protocol errors. Agents get no approval policy, sandbox
-or turn-limit knobs; approvals follow the default policy.
+refusals are tool errors (`isError`), not protocol errors. `new` takes `full_access` as on the
+CLI.
 
 Code-mode clients (Codex for its gpt-6 models, OpenCode, pi) call tools from a script and pass
 results on without the model reading them, so every tool declares an `outputSchema` generated
@@ -216,13 +233,12 @@ versions (Codex sends 2025-06-18, Grok 2025-11-25). Logging is stderr only.
 ```
 agent-talk caps
 agent-talk ls [--agent A] [--cwd DIR] [--all] [--limit N] [--cursor C] [--raw]
-agent-talk new A "prompt" --cwd DIR [--name N] [--model M] [--effort E] [--max-turns N]
-    [--approval-policy X] [--sandbox X] [--approvals observe|deny] [--wait] [--timeout S]
-    [--from H] [--max-hops N] [--raw]
-agent-talk send H "text" [--mode queue|steer] [--expect-turn T] [--reply-to R] [--model M]
-    [--max-turns N] [--approvals observe|deny] [--wait] [--timeout S] [--from H] [--max-hops N] [--raw]
+agent-talk new A "prompt" --cwd DIR [--name N] [--model M] [--effort E] [--full-access]
+    [--wait] [--timeout S] [--from H] [--max-hops N] [--raw]
+agent-talk send H "text" [--mode queue|steer] [--expect-turn T] [--reply-to R] [--wait]
+    [--timeout S] [--from H] [--max-hops N] [--raw]
 agent-talk read H [--tail N | --since CURSOR [--limit N]] [--raw]
-agent-talk wait H (--turn ID | --receipt R) [--timeout S] [--approvals observe|deny] [--raw]
+agent-talk wait H (--turn ID | --receipt R) [--timeout S] [--raw]
 agent-talk mcp [--caller H] [--max-hops N]
 ```
 
@@ -239,10 +255,9 @@ agent-talk mcp [--caller H] [--max-hops N]
   Antigravity, inside the same execution on OpenCode. `--mode steer` joins the running turn
   (Codex, OpenCode, Grok through a live leader) and is refused when the session is idle.
   `--expect-turn` is accepted only with steer, and OpenCode refuses it (no expected-turn check).
-- Agent knobs, passed through unvalidated in the agent's syntax: `--model` on `new` (all) and `send`
-  (Claude, Antigravity); `--effort` (Codex, Grok, Antigravity); `--approval-policy` and
-  `--sandbox` (Codex); `--max-turns` on `new` and `send` (Claude). Others refuse a knob with
-  `E_UNSUPPORTED`.
+- `new --model` (all) and `--effort` (Codex, Grok, Antigravity) pass through unvalidated in the
+  agent's syntax; Claude and OpenCode refuse `--effort` with `E_UNSUPPORTED`. Sends to a Claude or
+  Antigravity session agent-talk started pass the model (and effort) `new` recorded again.
 - `new --name N` stores a title at the agent (Codex thread name, Claude `custom-title` line,
   OpenCode `title`, Grok `_x.ai/session/rename`; Antigravity has no interface outside the TUI and
   refuses). agent-talk keeps no copy. `ls` shows `name` and strips the provenance header from
@@ -296,7 +311,11 @@ intent; `wait` leaves its receipt as it was).
 
 **Threads and history.**
 
-- `thread/start` inherits the daemon's approval policy, sandbox, MCP servers and hooks. It has no
+- `thread/start` inherits the daemon's sandbox, MCP servers and hooks; agent-talk sets
+  `approvalPolicy: never`, and `sandbox: danger-full-access` for full access. After about 60 s
+  without a subscriber an idle thread unloads, and a `thread/resume` without parameters then
+  restores the daemon's sandbox but keeps the approval policy (codex 0.160.1), so every resume of
+  a full-access thread passes the sandbox again. `thread/queue/add` takes neither. It has no
   effort parameter but accepts `config.model_reasoning_effort`; agent-talk sends `--effort` as
   `turn/start.effort` instead (a model-specific string), which also applies to the thread's later
   turns. An invalid value is accepted and fails the turn with the model's enum error.
@@ -349,7 +368,9 @@ intent; `wait` leaves its receipt as it was).
 observed. Closing a connection is not an answer; a later `thread/resume` replays the request.
 Declined command items appear only in live events, not in history. Only the command `decline` was
 exercised; the deny answers for other request kinds follow the schema. Requests still buffered
-when a command ends are answered per policy before the connection closes.
+when a command ends are answered per policy before the connection closes. Under `never`, what
+would need approval fails and the model is told; MCP tools then work only from servers that set
+`default_tools_approval_mode = "approve"` (below).
 
 **Identity.** MCP `tools/call` carries `params._meta.threadId` and the turn id (verified for threads
 started over the daemon socket only); MCP server environments carry no `CODEX_*` variable. Shell
@@ -393,8 +414,10 @@ an agent-talk child, `E_LOCKED` for one that is (pid alive, no `result` in its r
 next one at Claude's discretion, so there is no steer (`E_NO_STEER`).
 
 **Approvals.** In `-p` Claude denies a tool that would prompt and tells the model
-(`result.permission_denials`); nothing pends. agent-talk records these as `denied`; `--approvals
-deny` adds `--permission-prompts none`, which also tells the model not to retry.
+(`result.permission_denials`); nothing pends. agent-talk records these as `denied`, and on
+sessions it started adds `--permission-prompts none`, which also tells the model not to retry.
+`--permission-mode` is not kept across `--resume` (the user's `defaultMode` applies again,
+claude 2.1.291), so every send to a full-access session passes `bypassPermissions`.
 `--permission-prompt-tool stdio` would block on a `control_request` until answered on stdin, so it
 is not used.
 
@@ -455,6 +478,9 @@ lists `GET /api/session/{id}/permission`. An unanswered request blocks with no t
 with a `message` hands the text to the model and the execution continues; a message-less `reject`
 interrupts it (`shutdown`); any `reject` rejects every pending request of the session, so a deny
 that finds its request gone records `resolved`. `always` would save a project-wide rule.
+Full access is the session rule `{action: "*", resource: "*", effect: "allow"}` at creation;
+session rules are evaluated after the agent's, so it overrides the user's rules (verified against
+`edit: ask` on 2.0.23).
 agent-talk sends only `reject` with a message, and only once its own message was delivered
 (earlier requests belong to the execution ahead of it).
 
@@ -533,11 +559,11 @@ leader check, since clients of one leader do not exclude each other.
 - `wait` on a turn agent-talk is not running polls `updates.jsonl` for its `turn_completed`; a
   direct child that exited without one leaves the turn `interrupted` or `unknown`.
 
-**Approvals.** The user's `permission_mode = "always-approve"` applies to ACP sessions, and
-agent-talk inherits it, so the policy is `observe` on every Grok session. `--approvals deny` sends
-`_meta.yoloMode: false` on `session/new` and on a direct-mode `session/load` (it has no effect on
-a session resident in a leader) and answers `reject_once` to this prompt's requests, matched by
-`toolCallId`. `session/request_permission` goes to every attached client with one id; the first
+**Approvals.** The user's `permission_mode` (`always-approve` on this machine) applies to ACP
+sessions, and agent-talk keeps it. On sessions it started agent-talk answers `reject_once` to this
+prompt's requests, matched by `toolCallId`. Full access sends `_meta.yoloMode: true` on
+`session/new` and on a direct-mode `session/load`; it has no effect on a session resident in a
+leader. `session/request_permission` goes to every attached client with one id; the first
 answer wins, `reject_once` ends the turn `cancelled`. An unanswered request was still pending after
 25 s. Which commands prompt with yolo off varied between runs on 1.0.46, and later runs provoked
 none, so the deny and observe paths rest on frames captured earlier.
@@ -584,7 +610,7 @@ no way to join a conversation another process holds.
   stdin. The intent is written once `init` names the conversation, before the message, so a
   deadline before `init` leaves no receipt and possibly an empty conversation.
 - `--model <alias>` without `--effort` fails before `init`, and a resumed conversation forgets its
-  model, so `send` reuses the model and effort `new` recorded (`--model` overrides one run).
+  model, so `send` reuses the model and effort `new` recorded.
 - `--conversation <unknown id>` silently starts a new conversation, so `send` checks that the
   conversation exists and that `init` returns the same id.
 - The stream has no client message id and no turn id. The `user_input` step update is the first
@@ -617,10 +643,11 @@ held by anything but a recorded live agent-talk child and `E_LOCKED` for such a 
 error other than contention is an error, not "held".
 
 **Approvals.** Headless agy denies every tool not allow-listed in the user's `settings.json` and
-ends the turn (`denied_actions` in `result`, naming only the action; exit 0). Nothing pends, so the
-policy is `observe`, denials are recorded as `denied`, and `--approvals deny` changes nothing. A
-denied step is absent from the transcript on 1.2.16 and written as `GENERIC` `ERROR` on 1.2.17.
-`--dangerously-skip-permissions` is never passed.
+ends the turn (`denied_actions` in `result`, naming only the action; exit 0). Nothing pends, and
+denials are recorded as `denied`. A denied step is absent from the transcript on 1.2.16 and
+written as `GENERIC` `ERROR` on 1.2.17. Full access passes `--dangerously-skip-permissions` on
+every run, because a resumed conversation falls back to the user's `toolPermission` (1.2.17).
+`--mode plan` and `--sandbox` change nothing in headless runs.
 
 **Identity.** MCP `tools/call` carries `_meta["antigravity.google/conversation_id"]`; the server's
 environment has no `ANTIGRAVITY_*` variable. Shell commands get `ANTIGRAVITY_CONVERSATION_ID`. MCP
@@ -635,10 +662,14 @@ servers are configured globally only.
   needed, goes into the per-session `agent-talk mcp` process.
 - **The user configures the MCP server globally.** agent-talk never injects itself into a session
   or edits agent configuration, even where the agent's API allows per-thread servers.
-- **Never approve.** `deny` is the strongest answer; `once`, `always` and `accept` are never sent,
-  so agent-talk cannot widen what a model may do.
-- **Observe by default on sessions agent-talk did not start.** Declining changes a turn the user's
-  TUI is also attached to; that needs an explicit flag.
+- **Never approve.** `deny` is the strongest answer; `once`, `always` and `accept` are never sent.
+- **Sessions agent-talk did not start are the user's.** agent-talk never answers their approval
+  requests and never changes their settings; declining would change a turn the user's TUI is
+  attached to.
+- **Permissions: the agent's own, or full access.** Restricted levels (read-only, workspace write)
+  were tested on 2026-10-06 and left out: only Claude could enforce one with web tools allowed,
+  Codex loses the sandbox when a thread unloads and the queue path cannot carry it, OpenCode's
+  shell bypasses its edit rules, and Grok and Antigravity have no per-session control.
 - **Delete nothing.** No session, conversation or agent file is ever deleted, on any agent.
 - **Agent multi-client processes are joined, never started.** Codex daemon, OpenCode service,
   Grok leader: agent-talk connects when they are live and takes the agent's single-process path
@@ -693,8 +724,10 @@ servers are configured globally only.
 - `caps` marks a Codex method unavailable only when the daemon reports it missing; any other
   refusal of the probe on a dummy thread counts as available.
 - Sender attribution cannot detect a daemon or service started from another agent's shell.
-- Grok: `--approvals deny`, an unanswered request under `observe` and the `session/cancel` at the
-  deadline rest on captured frames, not re-verified; whether a TUI renders live a turn another
+- A request raised after the sending command stopped observing (an OpenCode `send` without
+  `--wait`, a Grok turn that continues in a leader) waits for another client to answer.
+- Grok: `reject_once`, an unanswered request and the `session/cancel` at the deadline rest on
+  captured frames, not re-verified; whether a TUI renders live a turn another
   leader client ran; leader behaviour with a grok.com subscription login (it may open a relay);
   the lock path of a custom leader socket is assumed.
 - Antigravity: a TUI that switched conversations can overwrite steps an agent-talk `send`

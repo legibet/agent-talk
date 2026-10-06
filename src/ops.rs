@@ -2,8 +2,8 @@
 //! provenance header, hop limit, agent dispatch, typed output.
 
 use crate::agents::{
-    Adapter, Agent, ApprovalPolicy, Caps, ListFilter, Mode, ReadRange, SendRequest, StartRequest,
-    WaitTarget, delivered,
+    Adapter, Agent, Caps, ListFilter, Mode, ReadRange, SendRequest, StartRequest, WaitTarget,
+    delivered,
 };
 use crate::model::{Caller, Error, ErrorCode, Message, Outcome, Result, Session};
 use crate::store::Store;
@@ -54,13 +54,7 @@ pub struct NewArgs {
     /// Title the agent stores for the new session.
     pub name: Option<String>,
     pub effort: Option<String>,
-    /// Claude only.
-    pub max_turns: Option<u32>,
-    /// Codex only.
-    pub approval_policy: Option<String>,
-    /// Codex only.
-    pub sandbox: Option<String>,
-    pub approvals: Option<ApprovalPolicy>,
+    pub full_access: bool,
     /// Observe the first turn for this long; `None` returns once the agent accepted it.
     pub wait: Option<Duration>,
     pub from: Caller,
@@ -76,10 +70,6 @@ pub struct SendArgs {
     /// Steer only: the running turn the caller expects.
     pub expect_turn: Option<String>,
     pub reply_to: Option<String>,
-    pub model: Option<String>,
-    /// Claude only.
-    pub max_turns: Option<u32>,
-    pub approvals: Option<ApprovalPolicy>,
     /// Observe the turn for this long; `None` returns once the agent accepted the message.
     pub wait: Option<Duration>,
     pub from: Caller,
@@ -98,7 +88,6 @@ pub struct ReadArgs {
 pub struct WaitArgs {
     pub handle: String,
     pub target: WaitTarget,
-    pub approvals: Option<ApprovalPolicy>,
     pub timeout: Duration,
     /// Keep the agent's raw record of the turn (`turn.raw`) in the output.
     pub raw: bool,
@@ -233,13 +222,11 @@ async fn new(store: &Store, a: NewArgs) -> Result<Output> {
         model: a.model.as_deref(),
         name: a.name.as_deref(),
         effort: a.effort.as_deref(),
-        approval_policy: a.approval_policy.as_deref(),
-        sandbox: a.sandbox.as_deref(),
+        full_access: a.full_access,
         depth: hop_depth(store, &a.from, None, a.max_hops)?,
         from: &a.from,
-        max_turns: a.max_turns,
     };
-    let mut o = agent.start(&req, a.approvals, a.wait.map(deadline)).await?;
+    let mut o = agent.start(&req, a.wait.map(deadline)).await?;
     o.from = Some(a.from);
     Ok(outcome(o, a.raw))
 }
@@ -262,12 +249,8 @@ async fn send(store: &Store, a: SendArgs) -> Result<Output> {
         from: &a.from,
         reply_to: a.reply_to.as_deref(),
         expect_turn: a.expect_turn.as_deref(),
-        model: a.model.as_deref(),
-        max_turns: a.max_turns,
     };
-    let mut o = agent
-        .send(id, &req, a.approvals, a.wait.map(deadline))
-        .await?;
+    let mut o = agent.send(id, &req, a.wait.map(deadline)).await?;
     o.from = Some(a.from);
     Ok(outcome(o, a.raw))
 }
@@ -286,7 +269,7 @@ async fn read(store: &Store, a: ReadArgs) -> Result<Output> {
 async fn wait(store: &Store, a: WaitArgs) -> Result<Output> {
     let (name, id) = split_handle(&a.handle)?;
     let o = Adapter::named(store, name)?
-        .wait(id, &a.target, a.approvals, deadline(a.timeout))
+        .wait(id, &a.target, deadline(a.timeout))
         .await?;
     Ok(outcome(o, a.raw))
 }

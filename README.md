@@ -59,10 +59,12 @@ not verified. To prevent agents from forwarding messages to each other indefinit
 refuses a send whose reply chain is longer than `--max-hops` (3 by default) with the error
 `E_MAX_HOPS`.
 
-agent-talk never approves tool calls. With `--approvals observe` it reports pending approval
-requests, and with `--approvals deny` it declines them. `agent-talk caps` prints what the
-installed CLIs and running daemons support, and [DESIGN.md](DESIGN.md) describes how each agent
-is handled.
+A session started with `agent-talk new` runs under the agent's own permission settings, and
+`new --full-access` gives it every permission with no approval prompts. agent-talk never approves
+tool calls. In a session it started, nobody is there to answer approval requests, so the agent is
+told not to ask, and anything that still needs approval is declined. In a session it did not
+start, approval requests are left to the user. `agent-talk caps` prints what the installed CLIs
+and running daemons support, and [DESIGN.md](DESIGN.md) describes how each agent is handled.
 
 The exit code is one of:
 

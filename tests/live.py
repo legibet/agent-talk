@@ -16,6 +16,7 @@ and passed.
 """
 
 import base64
+import contextlib
 import json
 import os
 import signal
@@ -38,7 +39,7 @@ T = tempfile.mkdtemp(prefix="agent-talk-live-")
 
 CODEX_MODEL = os.environ.get("LIVE_CODEX_MODEL", "gpt-6-luna")
 CLAUDE_MODEL = os.environ.get("LIVE_CLAUDE_MODEL", "sonnet")
-OPENCODE_MODEL = os.environ.get("LIVE_OPENCODE_MODEL", "opencode/big-pickle")
+OPENCODE_MODEL = os.environ.get("LIVE_OPENCODE_MODEL", "deepseek/deepseek-flash")
 GROK_MODEL = os.environ.get("LIVE_GROK_MODEL", "grok-4.7")
 ANTIGRAVITY_MODEL = os.environ.get("LIVE_ANTIGRAVITY_MODEL", "gemini-3.8-flash")
 
@@ -66,6 +67,7 @@ RESULTS: list[tuple[str, str]] = []  # (status, name)
 LAST: dict = {}  # last agent-talk command, for FAIL output
 st: dict = {}  # state shared between checks (handles, receipts, turn ids)
 created = {
+    "codex": [],
     "opencode": [],
     "claude_sessions": [],
     "grok": [],
@@ -117,29 +119,40 @@ def env_with(extra: dict | None) -> dict:
     return e
 
 
-def cli(*args, env=None, expect_exit=0) -> dict:
-    """Run `agent-talk <args> --json`, parse stdout, assert the exit code (int or tuple)."""
+def cli(*args, env=None, expect_exit=0, during=None) -> dict:
+    """Run `agent-talk <args> --json`, parse stdout, assert the exit code (int or tuple).
+    `during` is called repeatedly while the command runs."""
     cmd = [B, *args, "--json"]
+    p = subprocess.Popen(cmd, env=env_with(env), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    end = time.monotonic() + CMD_TIMEOUT
+    while True:
+        try:
+            stdout, stderr = p.communicate(timeout=0.5 if during else CMD_TIMEOUT)
+            break
+        except subprocess.TimeoutExpired:
+            if time.monotonic() > end:
+                p.kill()
+                p.communicate()
+                raise Fail(f"no exit within {CMD_TIMEOUT}s: {' '.join(cmd[1:])}") from None
+            during()
     try:
-        p = subprocess.run(cmd, env=env_with(env), capture_output=True, text=True, timeout=CMD_TIMEOUT)
-    except subprocess.TimeoutExpired:
-        raise Fail(f"no exit within {CMD_TIMEOUT}s: {' '.join(cmd[1:])}") from None
-    try:
-        out = json.loads(p.stdout) if p.stdout.strip() else {}
+        out = json.loads(stdout) if stdout.strip() else {}
     except json.JSONDecodeError:
-        out = {"_stdout": p.stdout[-1000:]}
+        out = {"_stdout": stdout[-1000:]}
     LAST.clear()
     LAST.update(
         cmd=" ".join(([f"{k}={v}" for k, v in (env or {}).items()]) + cmd[1:]),
         exit=p.returncode,
         out=out,
-        stderr=p.stderr[-500:],
+        stderr=stderr[-500:],
     )
     # remember the run logs the harness created
     for r in (out.get("receipt"), (out.get("error") or {}).get("receipt")):
         agent = str(r.get("handle", "")).split(":", 1)[0] if r else ""
         if agent in ("claude", "antigravity") and args and args[0] in ("new", "send"):
             created[f"{agent}_receipts"].append(r["receipt_id"])
+        if agent == "codex" and args and args[0] == "new":
+            created["codex"].append(native(r["handle"]))
     allowed = expect_exit if isinstance(expect_exit, tuple) else (expect_exit,)
     if p.returncode not in allowed:
         raise Fail(f"exit {p.returncode}, expected {expect_exit}")
@@ -367,37 +380,73 @@ def codex_new(prompt: str, *extra) -> dict:
     return cli("new", "codex", "--cwd", str(DIR), "--model", CODEX_MODEL, *extra, prompt)
 
 
-def codex_interrupt(thread_id: str, turn_id: str) -> dict:
-    """`turn/interrupt` from a raw connection to the Codex daemon socket (WebSocket over
-    AF_UNIX, as agent-talk's transport), subscribed first as the TUI would be; returns the
-    response. Retried for a few seconds while the new thread is not resumable yet or the
-    turn not yet active."""
-    sock = Path.home() / ".codex/app-server-control/app-server-control.sock"
-    with unix_connect(str(sock), uri="ws://localhost/") as ws:
-        ids = iter(range(1, 1000))
+class CodexDaemon:
+    """A raw connection to the Codex daemon socket (WebSocket over AF_UNIX, as agent-talk's
+    transport). Server requests and notifications that arrive meanwhile are kept in `seen`;
+    nothing here answers a server request."""
 
-        def call(method, params):
-            rid = next(ids)
-            ws.send(json.dumps({"id": rid, "method": method, "params": params}))
-            while "method" in (msg := json.loads(ws.recv(timeout=60))) or msg.get("id") != rid:
-                pass
-            LAST.update(cmd=f"daemon {method} {json.dumps(params)}", exit="-", out=msg)
-            return msg
-
-        call(
+    def __init__(self):
+        sock = Path.home() / ".codex/app-server-control/app-server-control.sock"
+        self.stack = contextlib.ExitStack()
+        self.ws = self.stack.enter_context(unix_connect(str(sock), uri="ws://localhost/"))
+        self.next_id = 0
+        self.seen: list[dict] = []
+        self.call(
             "initialize",
             {"clientInfo": {"name": "agent-talk-live", "version": "0"}, "capabilities": {"experimentalApi": True}},
         )
-        ws.send(json.dumps({"method": "initialized", "params": {}}))
+        self.ws.send(json.dumps({"method": "initialized", "params": {}}))
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.stack.close()
+
+    def call(self, method: str, params: dict) -> dict:
+        self.next_id += 1
+        rid = self.next_id
+        self.ws.send(json.dumps({"id": rid, "method": method, "params": params}))
+        while "method" in (msg := json.loads(self.ws.recv(timeout=60))) or msg.get("id") != rid:
+            if "method" in msg:
+                self.seen.append(msg)
+        LAST.update(cmd=f"daemon {method} {json.dumps(params)}", exit="-", out=msg)
+        return msg
+
+    def drain(self, secs: float = 0.2):
+        """Read what the daemon pushes for `secs`, so a subscribed connection never backs up."""
+        end = time.monotonic() + secs
+        while (left := end - time.monotonic()) > 0:
+            try:
+                self.seen.append(json.loads(self.ws.recv(timeout=left)))
+            except TimeoutError:
+                return
+
+
+def codex_interrupt(thread_id: str, turn_id: str) -> dict:
+    """`turn/interrupt` from the daemon socket, subscribed first as the TUI would be; returns
+    the response. Retried for a few seconds while the new thread is not resumable yet or the
+    turn not yet active."""
+    with CodexDaemon() as d:
         for method, params in (
             ("thread/resume", {"threadId": thread_id, "excludeTurns": True}),
             ("turn/interrupt", {"threadId": thread_id, "turnId": turn_id}),
         ):
             for _ in range(10):
-                if "error" not in (resp := call(method, params)):
+                if "error" not in (resp := d.call(method, params)):
                     break
                 time.sleep(1)
         return resp
+
+
+def codex_turn_context(thread_id: str, turn_id: str) -> dict:
+    """The settings a turn ran with, from the rollout's `turn_context` line (codex 0.160)."""
+    for path in (Path.home() / ".codex/sessions").glob(f"*/*/*/rollout-*-{thread_id}.jsonl"):
+        for line in path.read_text().splitlines():
+            rec = json.loads(line)
+            if rec.get("type") == "turn_context" and rec["payload"].get("turn_id") == turn_id:
+                return rec["payload"]
+    raise Fail(f"no turn_context for turn {turn_id} in the rollout of {thread_id}")
 
 
 def turn_unfinished(handle: str, turn: str) -> bool:
@@ -411,9 +460,7 @@ def turn_unfinished(handle: str, turn: str) -> bool:
 
 def codex_main():
     def c1():
-        out = codex_new(
-            "reply with the single word kumquat", "--sandbox", "read-only", "--approval-policy", "never", "--wait"
-        )
+        out = codex_new("reply with the single word kumquat", "--wait")
         st["A"] = out["handle"]
         r, t = out["receipt"], out["turn"]
         expect(r["state"] == "accepted", "receipt accepted")
@@ -421,6 +468,10 @@ def codex_main():
         expect(t["status"] == "completed", "turn completed")
         expect("kumquat" in final(out), "final ~ kumquat")
         st["A_turn1"] = t["turn_id"]
+        ctx = codex_turn_context(native(st["A"]), t["turn_id"])
+        expect(
+            ctx["approval_policy"] == "never", f"owned thread runs with approval never, got {ctx['approval_policy']}"
+        )
 
     def c2():
         need("A")
@@ -444,13 +495,7 @@ def codex_main():
         expect(msgs[1]["role"] == "assistant", "messages[1] is assistant")
 
     def c3():
-        out = codex_new(
-            "run `sleep 15` with your shell tool, then reply done",
-            "--sandbox",
-            "read-only",
-            "--approval-policy",
-            "never",
-        )
+        out = codex_new("run `sleep 15` with your shell tool, then reply done")
         st["B"], st["T0"] = out["handle"], out["receipt"]["turn_id"]
         expect(st["T0"], "receipt has turn id")
 
@@ -520,63 +565,65 @@ def codex_main():
         expect(err(out).get("code") == "E_MAX_HOPS", "E_MAX_HOPS")
 
     def c4():
-        out = codex_new(ESCALATION_PROMPT, "--approval-policy", "on-request", "--sandbox", "read-only", "--wait")
-        st["P"] = out["handle"]
-        if not out["approvals"]:
-            raise Inconclusive("no approval request (model did not escalate)")
-        expect(out["approvals"][0]["outcome"] == "declined", "approvals[0].outcome == declined")
-        expect(out["turn"]["status"] == "completed", "completed")
-
-    def c5():
-        need("P")
-        # A reworded command: with the same prompt the model often answers "declined" from C4's context.
-        prompt = "Try again with a new command: " + ESCALATION_PROMPT.replace("approval-test", "approval-test-2")
-        out = cli("send", st["P"], prompt, "--approvals", "observe", "--wait", "--timeout", "25", expect_exit=(0, 3))
-        if not err(out) and not out.get("approvals"):
-            raise Inconclusive("turn completed without an approval request")
-        expect(err(out).get("code") == "E_TIMEOUT", "E_TIMEOUT")
-        if not err(out).get("approvals"):
-            raise Inconclusive("no approval request within 25 s")
-        expect(err(out).get("state") == "waiting", "error.state == waiting")
-        expect(err(out)["approvals"][0]["outcome"] == "pending", "approval pending")
-        receipt = err(out)["receipt"]["receipt_id"]
-        bg = subprocess.Popen(
-            [B, "wait", st["P"], "--receipt", receipt, "--approvals", "observe", "--timeout", "60", "--json"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            env=BASE_ENV,
-        )
-        time.sleep(2)  # let the observer subscribe before the decline
-        out = cli("wait", st["P"], "--receipt", receipt, "--approvals", "deny")
-        expect(out["turn"]["status"] == "completed", "foreground completed")
-        expect(any(a["outcome"] == "declined" for a in out["approvals"]), "foreground declined the approval")
-        stdout, stderr = bg.communicate(timeout=90)
-        bg_out = json.loads(stdout) if stdout.strip() else {}
-        LAST.update(
-            cmd=f"(background) agent-talk wait {st['P']} --receipt {receipt} --approvals observe --timeout 60",
-            exit=bg.returncode,
-            out=bg_out,
-            stderr=stderr[-500:],
-        )
-        expect(bg.returncode == 0, "background exit 0")
-        expect(all(a["outcome"] != "pending" for a in bg_out.get("approvals", [])), "background approval not pending")
+        # A thread agent-talk did not start, created over the daemon with approvals on: agent-talk
+        # reports its approval request as pending and answers it neither on send nor on wait.
+        with CodexDaemon() as d:
+            resp = d.call(
+                "thread/start",
+                {
+                    "cwd": str(DIR),
+                    "model": CODEX_MODEL,
+                    "approvalPolicy": "on-request",
+                    "approvalsReviewer": "user",
+                    "sandbox": "read-only",
+                },
+            )
+            expect("error" not in resp, "thread/start over the daemon")
+            tid = resp["result"]["thread"]["id"]
+            created["codex"].append(tid)
+            st["P"] = f"codex:{tid}"
+            # A thread without a turn has no rollout and cannot be resumed; give it one.
+            first = [{"type": "text", "text": "reply with the single word ok", "text_elements": []}]
+            expect("error" not in d.call("turn/start", {"threadId": tid, "input": first}), "turn/start over the daemon")
+            end = time.monotonic() + 120
+            while not any(m.get("method") == "turn/completed" for m in d.seen) and time.monotonic() < end:
+                d.drain(1)
+            expect(any(m.get("method") == "turn/completed" for m in d.seen), "first turn completed within 120 s")
+            out = cli(
+                "send", st["P"], ESCALATION_PROMPT, "--wait", "--timeout", "40", expect_exit=(0, 3), during=d.drain
+            )
+            if not err(out):
+                raise Inconclusive("turn completed without an approval request (model did not escalate)")
+            expect(err(out).get("code") == "E_TIMEOUT", "E_TIMEOUT")
+            if not err(out).get("approvals"):
+                raise Inconclusive("no approval request within 40 s")
+            expect(err(out).get("state") == "waiting", "error.state == waiting")
+            expect(err(out)["approvals"][0]["outcome"] == "pending", "send: approval pending")
+            receipt = err(out)["receipt"]["receipt_id"]
+            out = cli("wait", st["P"], "--receipt", receipt, "--timeout", "3", expect_exit=3, during=d.drain)
+            expect(err(out).get("state") == "waiting", "wait: error.state == waiting")
+            expect(all(a["outcome"] == "pending" for a in err(out).get("approvals", [])), "wait: approval pending")
+            d.drain(1)
+            requests = [m for m in d.seen if "id" in m and m["method"].endswith("requestApproval")]
+            LAST.update(cmd="daemon connection: messages seen", exit="-", out=[m.get("method") for m in d.seen])
+            expect(requests, "the harness connection received the approval request")
+            expect(
+                not any(m.get("method") == "serverRequest/resolved" for m in d.seen),
+                "nobody answered the request (no serverRequest/resolved)",
+            )
+            # End the turn without answering the request.
+            turn = requests[0]["params"]["turnId"]
+            expect("error" not in d.call("turn/interrupt", {"threadId": tid, "turnId": turn}), "turn/interrupt")
 
     def c8a():
         # Thread for C8 (codex_c6), created early so it is unloaded by then.
-        out = codex_new("reply with the single word ok", "--sandbox", "read-only", "--wait")
+        out = codex_new("reply with the single word ok", "--wait")
         st["W"] = out["handle"]
 
     def c9():
         # After turn/interrupt a queued submission stays dormant until thread/queue/start;
         # `send` starts it when no turn starts on its own (design 6.1).
-        out = codex_new(
-            "run `sleep 20` with your shell tool, then reply done",
-            "--sandbox",
-            "read-only",
-            "--approval-policy",
-            "never",
-        )
+        out = codex_new("run `sleep 20` with your shell tool, then reply done")
         h, t0 = out["handle"], out["receipt"]["turn_id"]
         expect("error" not in codex_interrupt(native(h), t0), "turn/interrupt accepted")
         out = cli("wait", h, "--turn", t0, "--timeout", "30")
@@ -618,7 +665,6 @@ def codex_main():
         ("C3h", c3h),
         ("C3i", c3i),
         ("C4", c4),
-        ("C5", c5),
         ("C7", c7),
         ("C9", c9),
     ):
@@ -642,6 +688,8 @@ def codex_c6():
         out = cli("wait", st["A"], "--receipt", r, "--timeout", "120")
         expect(out["turn"]["status"] == "completed", "completed")
         expect("plum" in final(out), "final ~ plum")
+        ctx = codex_turn_context(native(st["A"]), out["turn"]["turn_id"])
+        expect(ctx["approval_policy"] == "never", f"approval never after the cold resume, got {ctx['approval_policy']}")
 
     def c8():
         # A thread held by another app-server process (here a standalone stdio `codex
@@ -708,6 +756,18 @@ def claude_transcript(session_id: str) -> Path | None:
     return hits[0] if hits else None
 
 
+def run_init(agent: str, receipt_id: str) -> dict:
+    """The init event of the run log of a Claude or Antigravity receipt."""
+    log = Path.home() / f".agent-talk/{agent}-runs/{receipt_id}.ndjson"
+    for line in log.read_text().splitlines() if log.exists() else []:
+        ev = json.loads(line)
+        if agent == "claude" and ev.get("type") == "system" and ev.get("subtype") == "init":
+            return ev
+        if agent == "antigravity" and ev.get("event") == "init":
+            return ev["init"]
+    raise Fail(f"no init event in {log}")
+
+
 def claude_tier():
     def l1():
         out = cli(
@@ -719,6 +779,7 @@ def claude_tier():
         expect(out["turn"]["status"] == "completed", "completed")
         expect("pong" in final(out), "final ~ pong")
         expect(out["turn"].get("basis"), "turn.basis present")
+        st["S_model"] = run_init("claude", out["receipt"]["receipt_id"]).get("model")
 
     def l2():
         need("S")
@@ -727,6 +788,8 @@ def claude_tier():
         )
         expect(out["from"].get("session") == "codex:harness", "from.session == codex:harness")
         expect("kiwi" in final(out), "final ~ kiwi")
+        model = run_init("claude", out["receipt"]["receipt_id"]).get("model")
+        expect(model == st.get("S_model"), f"send runs new's model {st.get('S_model')}, got {model}")
         turn = out["receipt"]["turn_id"]
         out = cli("read", st["S"], "--tail", "2")
         m0 = out["messages"][0]
@@ -751,12 +814,42 @@ def claude_tier():
         need("S")
         target = DIR / "denied.txt"
         target.unlink(missing_ok=True)
-        out = cli("send", st["S"], f"create the file {target} using Bash touch", "--approvals", "deny", "--wait")
+        out = cli("send", st["S"], f"create the file {target} using Bash touch", "--wait")
         expect(out["turn"]["status"] == "completed", "completed")
         if not out["approvals"]:
+            if target.exists():
+                raise Inconclusive("the user's permission mode allowed the touch (nothing was denied)")
             raise Inconclusive("no approval recorded (model did not try Bash)")
         expect(any(a["outcome"] == "denied" for a in out["approvals"]), "some approval denied")
         expect(not target.exists(), "file absent")
+
+    def l6():
+        # full_access through MCP new: bypassPermissions on the first process and again on a
+        # later send (`--permission-mode` does not survive --resume).
+        m = Mcp()
+        try:
+            is_err, out = m.call(
+                "new",
+                {
+                    "agent": "claude",
+                    "cwd": str(DIR),
+                    "model": CLAUDE_MODEL,
+                    "prompt": "reply with the single word pong",
+                    "full_access": True,
+                    "wait": True,
+                },
+            )
+        finally:
+            m.close()
+        expect(not is_err, "isError false")
+        h = out["handle"]
+        created["claude_sessions"].append(native(h))
+        created["claude_receipts"].append(out["receipt"]["receipt_id"])
+        mode = run_init("claude", out["receipt"]["receipt_id"]).get("permissionMode")
+        expect(mode == "bypassPermissions", f"new: permissionMode bypassPermissions, got {mode}")
+        out = cli("send", h, "reply with the single word two", "--wait")
+        mode = run_init("claude", out["receipt"]["receipt_id"]).get("permissionMode")
+        expect(mode == "bypassPermissions", f"send: permissionMode bypassPermissions, got {mode}")
 
     def l5():
         f = str(uuid.uuid4())
@@ -813,11 +906,28 @@ def claude_tier():
         out = cli("wait", handle, "--turn", u, "--timeout", "10")
         expect(out["turn"]["status"] == "completed", "completed after F exits")
 
-    for name, fn in (("L1", l1), ("L2", l2), ("L3", l3), ("L4", l4), ("L5", l5)):
+    for name, fn in (("L1", l1), ("L2", l2), ("L3", l3), ("L4", l4), ("L5", l5), ("L6", l6)):
         check("claude", name, fn)
 
 
 # ---------------------------------------------------------------- opencode
+
+
+def opencode_api(method: str, path: str, body: dict | None = None) -> dict:
+    """A request to the user's OpenCode service; the password is read from service.json each time."""
+    state = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "opencode/service.json"
+    reg = json.loads(state.read_text())
+    auth = base64.b64encode(f"opencode:{reg['password']}".encode()).decode()
+    req = urllib.request.Request(
+        f"{reg['url']}{path}",
+        method=method,
+        data=None if body is None else json.dumps(body).encode(),
+        headers={"Authorization": f"Basic {auth}", "Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=10) as r:
+        data = r.read()
+    LAST.update(cmd=f"opencode {method} {path}", exit="-", out=data[:1000].decode(errors="replace"))
+    return json.loads(data) if data.strip() else {}
 
 
 def opencode_tier():
@@ -913,29 +1023,59 @@ def opencode_tier():
         expect(not target.exists(), "file absent")
 
     def p7():
-        need("O")
-        target = DIR / "oc-denied.txt"
-        target.unlink(missing_ok=True)
-        out = cli(
-            "send",
-            st["O"],
-            f"create {target} with your write tool",
-            "--approvals",
-            "observe",
-            "--wait",
-            "--timeout",
-            "15",
-            expect_exit=(0, 3),
+        # A session agent-talk did not start, created over the service API under the user's
+        # `edit: ask`: agent-talk reports its approval request as pending and does not answer it.
+        provider, model = OPENCODE_MODEL.split("/", 1)
+        created_ = opencode_api(
+            "POST",
+            "/api/session",
+            {"location": {"directory": str(DIR)}, "model": {"providerID": provider, "id": model}},
         )
+        sid = created_["data"]["id"]
+        created["opencode"].append(sid)
+        h = f"opencode:{sid}"
+        target = DIR / "oc-foreign.txt"
+        target.unlink(missing_ok=True)
+        out = cli("send", h, f"create {target} with your write tool", "--wait", "--timeout", "30", expect_exit=(0, 3))
         if not err(out):
             raise Inconclusive("turn completed without an approval request")
         expect(err(out).get("code") == "E_TIMEOUT", "E_TIMEOUT")
         expect(err(out).get("state") == "waiting", "error.state == waiting")
-        expect(err(out).get("approvals") and err(out)["approvals"][0]["outcome"] == "pending", "approval pending")
-        out = cli("wait", st["O"], "--receipt", err(out)["receipt"]["receipt_id"], "--approvals", "deny")
-        expect(out["turn"]["status"] == "completed", "completed")
-        expect(any(a["outcome"] == "declined" for a in out["approvals"]), "declined")
+        expect(err(out).get("approvals") and err(out)["approvals"][0]["outcome"] == "pending", "send: approval pending")
+        receipt = err(out)["receipt"]["receipt_id"]
+        out = cli("wait", h, "--receipt", receipt, "--timeout", "3", expect_exit=3)
+        expect(err(out).get("state") == "waiting", "wait: error.state == waiting")
+        pending = opencode_api("GET", f"/api/session/{sid}/permission").get("data") or []
+        expect(pending, "the request is still pending at the service")
+        # End the turn with a reject, the only answer agent-talk's harness gives.
+        opencode_api(
+            "POST",
+            f"/api/session/{sid}/permission/{pending[0]['id']}/reply",
+            {"decision": "reject", "message": "agent-talk live harness"},
+        )
+        out = cli("wait", h, "--receipt", receipt, "--timeout", "120")
+        expect(out["turn"]["status"] == "completed", "completed after the harness rejected")
         expect(not target.exists(), "file absent")
+
+    def p8():
+        # new --full-access: the session's allow-all rule overrides the user's `edit: ask` (P6
+        # shows the same write declined without it). The rule lives in the session, so one turn
+        # covers later sends too.
+        target = DIR / "oc-full.txt"
+        target.unlink(missing_ok=True)
+        out = cli(
+            "new",
+            "opencode",
+            "--cwd",
+            str(DIR),
+            "--model",
+            OPENCODE_MODEL,
+            "--full-access",
+            "--wait",
+            f"create {target} with your write tool, then reply done",
+        )
+        created["opencode"].append(native(out["handle"]))
+        expect(not out["approvals"] and target.exists(), "file written without an approval request")
 
     def m1():
         need("O")
@@ -957,7 +1097,17 @@ def opencode_tier():
         expect((user.get("from") or {}).get("session") == "opencode:ses_harnesscaller", "user from.session")
         expect(user["text"].startswith("[from opencode:ses_harnesscaller "), "text starts with header")
 
-    for name, fn in (("P1", p1), ("P2", p2), ("P3", p3), ("P4", p4), ("P5", p5), ("P6", p6), ("P7", p7), ("M1", m1)):
+    for name, fn in (
+        ("P1", p1),
+        ("P2", p2),
+        ("P3", p3),
+        ("P4", p4),
+        ("P5", p5),
+        ("P6", p6),
+        ("P7", p7),
+        ("P8", p8),
+        ("M1", m1),
+    ):
         check("opencode", name, fn)
 
 
@@ -978,6 +1128,13 @@ def grok_user_lines(session_id: str, text: str, home: Path | None = None) -> int
         if u.get("sessionUpdate") == "user_message_chunk" and (u.get("content") or {}).get("text", "").endswith(text):
             n += 1
     return n
+
+
+def grok_yolo(session_id: str, home: Path) -> list:
+    """`yolo_mode` of each turn_started in the session's events.jsonl, in order."""
+    hits = list((home / "sessions").glob(f"*/{session_id}/events.jsonl"))
+    lines = hits[0].read_text().splitlines() if hits else []
+    return [e.get("yolo_mode") for e in map(json.loads, lines) if e.get("type") == "turn_started"]
 
 
 def grok_tier():
@@ -1127,6 +1284,7 @@ def grok_tier():
         out = cli("new", "grok", "--cwd", str(DIR), "--model", GROK_MODEL, "reply with the single word one", env=env)
         sid = native(out["handle"])
         created["grok"].append((sid, home))
+        st["G7"] = sid
         expect(grok_updates(sid, home) is not None and grok_updates(sid) is None, "session stored under GROK_HOME only")
         sleeper = subprocess.Popen(["sleep", "300"])
         try:
@@ -1147,7 +1305,35 @@ def grok_tier():
         out = cli("send", f"grok:{sid}", "reply with the single word two", "--wait", env=env)
         expect(out["turn"]["status"] == "completed", "stale row (dead pid) is not foreign: completed")
 
-    for name, fn in (("G1", g1), ("G2", g2), ("G3", g3), ("G4", g4), ("G5", g5), ("G6", g6), ("G7", g7)):
+    def g8():
+        # new --full-access: yolo on session/new and again on the direct-mode session/load of a
+        # later send. In an isolated GROK_HOME, where G7's session shows the default (yolo off);
+        # the user's always-approve would make every session yolo.
+        need("G7")
+        home = Path(T) / "ghome"
+        env = {"GROK_HOME": str(home)}
+        control = grok_yolo(st["G7"], home)
+        if not control or any(control):
+            raise Inconclusive(f"G7's session in the isolated GROK_HOME is not yolo off: {control}")
+        out = cli(
+            "new",
+            "grok",
+            "--cwd",
+            str(DIR),
+            "--model",
+            GROK_MODEL,
+            "--full-access",
+            "--wait",
+            "reply with the single word one",
+            env=env,
+        )
+        sid = native(out["handle"])
+        created["grok"].append((sid, home))
+        cli("send", out["handle"], "reply with the single word two", "--wait", env=env)
+        yolo = grok_yolo(sid, home)
+        expect(yolo == [True, True], f"yolo_mode on both turns, got {yolo}")
+
+    for name, fn in (("G1", g1), ("G2", g2), ("G3", g3), ("G4", g4), ("G5", g5), ("G6", g6), ("G7", g7), ("G8", g8)):
         check("grok", name, fn)
 
 
@@ -1244,6 +1430,8 @@ def antigravity_tier():
         expect(user is not None, "the user message is in the tail")
         expect((user.get("from") or {}).get("session") == f"antigravity:{caller}", "read: user from.session")
         expect(user["text"].startswith(f"[from antigravity:{caller} "), "text starts with the provenance header")
+        model = run_init("antigravity", out["receipt"]["receipt_id"]).get("model")
+        expect(model == ANTIGRAVITY_MODEL, f"send runs new's model {ANTIGRAVITY_MODEL}, got {model}")
         again = cli("wait", st["AG"], "--turn", turn, "--timeout", "10")
         expect(again["turn"]["final_text"] == out["turn"]["final_text"], "wait --turn returns the same final_text")
         expect(
@@ -1412,7 +1600,27 @@ def antigravity_tier():
             "wait --receipt recovers the denials",
         )
 
-    for name, fn in (("A1", a1), ("A2", a2), ("A3", a3), ("A4", a4), ("A5", a5), ("A6", a6), ("A7", a7), ("A8", a8)):
+    def a9():
+        # new --full-access: --dangerously-skip-permissions on the first run and again on a later
+        # send (agy keeps no permission mode across runs).
+        out = agy_new("reply with the single word pong", "--full-access", "--wait")
+        mode = run_init("antigravity", out["receipt"]["receipt_id"]).get("permission_mode")
+        expect(mode == "always-proceed", f"new: permission_mode always-proceed, got {mode}")
+        out = cli("send", out["handle"], "reply with the single word two", "--wait")
+        mode = run_init("antigravity", out["receipt"]["receipt_id"]).get("permission_mode")
+        expect(mode == "always-proceed", f"send: permission_mode always-proceed, got {mode}")
+
+    for name, fn in (
+        ("A1", a1),
+        ("A2", a2),
+        ("A3", a3),
+        ("A4", a4),
+        ("A5", a5),
+        ("A6", a6),
+        ("A7", a7),
+        ("A8", a8),
+        ("A9", a9),
+    ):
         check("antigravity", name, fn)
 
 
@@ -1434,15 +1642,17 @@ def preconditions() -> dict[str, str | None]:
 
 
 def cleanup():
+    if created["codex"]:
+        try:
+            with CodexDaemon() as d:
+                for tid in created["codex"]:
+                    resp = d.call("thread/archive", {"threadId": tid})
+                    print(f"cleanup: archive codex thread {tid}: {(resp.get('error') or {}).get('message', 'ok')}")
+        except Exception as e:  # report and continue with the rest
+            print(f"cleanup: could not archive codex threads: {e}")
     for sid in created["opencode"]:
         try:
-            state = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "opencode/service.json"
-            reg = json.loads(state.read_text())
-            auth = base64.b64encode(f"opencode:{reg['password']}".encode()).decode()
-            req = urllib.request.Request(
-                f"{reg['url']}/api/session/{sid}", method="DELETE", headers={"Authorization": f"Basic {auth}"}
-            )
-            urllib.request.urlopen(req, timeout=10).close()
+            opencode_api("DELETE", f"/api/session/{sid}")
             print(f"cleanup: deleted opencode session {sid}")
         except Exception as e:  # report and continue with the rest
             print(f"cleanup: could not delete opencode session {sid}: {e}")
@@ -1523,8 +1733,7 @@ def main():
             proc.wait()
         if keep:
             print(
-                f"--keep: left {created['opencode']} {created['claude_sessions']} and codex threads "
-                f"{[st[k] for k in ('A', 'B', 'P', 'W') if k in st]}"
+                f"--keep: left {created['opencode']} {created['claude_sessions']} and codex threads {created['codex']}"
             )
         else:
             cleanup()

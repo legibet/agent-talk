@@ -12,12 +12,12 @@ use std::process::Stdio;
 use tokio::process::Child;
 
 /// `claude -p` arguments for one turn; `session` is `--session-id <id>` or
-/// `--resume <id>`.
+/// `--resume <id>`. Nothing here persists across `--resume`, so every turn passes it again.
 pub fn args(
     session: [&str; 2],
     model: Option<&str>,
-    max_turns: Option<u32>,
     policy: ApprovalPolicy,
+    full_access: bool,
 ) -> Vec<String> {
     let mut args: Vec<String> = [
         "-p",
@@ -34,8 +34,8 @@ pub fn args(
     if let Some(m) = model {
         args.extend(["--model".into(), m.into()]);
     }
-    if let Some(n) = max_turns {
-        args.extend(["--max-turns".into(), n.to_string()]);
+    if full_access {
+        args.extend(["--permission-mode".into(), "bypassPermissions".into()]);
     }
     match policy {
         // Claude's default: it denies whatever would prompt, tells the model, and
