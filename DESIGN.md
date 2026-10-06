@@ -112,11 +112,11 @@ through stays untyped JSON.
 
 ### Observations
 
-| observation | values                                                                                                                                   | learned from                                                                                                                                                                             |
-| ----------- | ---------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `history`   | `visible` / `none` / `unknown`                                                                                                           | the agent's history listing or files                                                                                                                                                     |
-| `loaded`    | `yes` / `no` / `unknown`                                                                                                                 | Codex `thread/loaded/list`; Claude `claude agents` (pid present); OpenCode `yes` while the service answers; Grok own child, live TUI row or leader `resident`; Antigravity presence lock |
-| `origin`    | agent label (`codex-tui`, `codex_exec`, `claude-interactive`, `opencode agent build`, `headless`, ...), `agent-talk` for owned sessions  | agent metadata; the `owned` table                                                                                                                                                        |
+| observation | values                                                                                                                                  | learned from                                                                                                                                                                             |
+| ----------- | --------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `history`   | `visible` / `none` / `unknown`                                                                                                          | the agent's history listing or files                                                                                                                                                     |
+| `loaded`    | `yes` / `no` / `unknown`                                                                                                                | Codex `thread/loaded/list`; Claude `claude agents` (pid present); OpenCode `yes` while the service answers; Grok own child, live TUI row or leader `resident`; Antigravity presence lock |
+| `origin`    | agent label (`codex-tui`, `codex_exec`, `claude-interactive`, `opencode agent build`, `headless`, ...), `agent-talk` for owned sessions | agent metadata; the `owned` table                                                                                                                                                        |
 
 Declared blind spot: for Codex, "not loaded" cannot distinguish a stopped thread from a live
 standalone `codex exec` or `--no-daemon` run. agent-talk proceeds through the daemon.
@@ -782,8 +782,6 @@ servers are configured globally only.
   `thread/resume`, and `ls` does not show which process holds it. Only `send` starts a dormant
   queued item; `wait --receipt` on one left dormant earlier reports it `pending`. How a terminal TUI
   renders a decline from agent-talk is unverified.
-- `agent-talk mcp` ignores rmcp's cancellation; a cancelled call keeps observing until its
-  deadline, and server shutdown waits for it.
 - `status` marks a Codex method unavailable only when the daemon reports it missing; any other
   refusal of the probe on a dummy thread counts as available.
 - Sender attribution cannot detect a daemon or service started from another agent's shell.
