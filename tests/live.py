@@ -966,7 +966,7 @@ def claude_tier():
         out = cli("send", st["S"], "reply with the single word kept", "--wait")
         model = run_init("claude", out["receipt"]["receipt_id"]).get("model") or ""
         expect("haiku" in model, f"a later send keeps haiku, got {model}")
-        out = cli("send", st["S"], "x", "--steer", "--effort", "low", expect_exit=2)
+        out = cli("send", st["S"], "x", "--steer", "--effort", "medium", expect_exit=2)
         expect(err(out).get("code") == "E_PRECONDITION", "--steer with a setting: E_PRECONDITION")
 
     for name, fn in (("L1", l1), ("L2", l2), ("L3", l3), ("L4", l4), ("L5", l5), ("L6", l6), ("L7", l7)):
