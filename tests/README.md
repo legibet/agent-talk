@@ -1,43 +1,39 @@
 # Live regression harness
 
-`tests/live.py` runs the release `agent-talk` against the real agents and checks the behavior in
-`DESIGN.md`: receipts and their recovery, turn correlation, queue/steer, timeouts, approvals, model,
-effort and `--full-access` on `new` and changed by `send`, sender attribution, hop limits, paging,
-foreign-session refusals, MCP over stdio. The unit tests (`cargo test`) cover the parsing rules;
-this covers what only the agents can show.
+`tests/live.py` runs the release `agent-talk` against the real agents and checks agent-talk's own
+end-to-end behaviour: receipts and their recovery, turn correlation, queue and steer, refusals,
+foreign holders, approvals, settings, paging and MCP. Facts about the agents themselves belong
+in the findings, and the parsing rules in the unit tests (`cargo test`).
 
     uv run tests/live.py (offline|codex|claude|opencode|grok|antigravity|pi ... | all) [--keep]
 
-Every tier but `offline` makes real model calls, so name the tiers you need: the one for the adapter
-you changed, `offline` always, `all` before a release. The Grok and Antigravity tiers are the
-expensive ones (grok-4.7 and gemini-3.8-flash have no cheaper sibling). Default models are
-gpt-6-luna, sonnet, deepseek/deepseek-flash, grok-4.7, gemini-3.8-flash and deepseek/deepseek-flash;
-override them with `LIVE_CODEX_MODEL`, `LIVE_CLAUDE_MODEL`, `LIVE_OPENCODE_MODEL`,
-`LIVE_GROK_MODEL`, `LIVE_ANTIGRAVITY_MODEL`, `LIVE_PI_MODEL`. A full run takes about 8 minutes,
-including a deliberate ~65 s idle wait before C6.
+Every agent runs the same three checks, `start`, `converse` and `recover`, driven by its entry in
+`AGENTS`; the checks that only one agent has follow in its tier. A check belongs here when it
+covers behaviour of agent-talk that can break, through the CLI or MCP, and passes or fails the
+same way on any machine with the agent installed and logged in: no dependence on the user's
+permission rules, sandbox or other configuration. Grok runs in a `GROK_HOME` of its own for that
+reason; prompts that must outlast a deadline count numbers instead of calling tools, except on
+Codex, where `sleep` runs under any sandbox.
 
-Approval checks on sessions agent-talk did not start (Codex C4, OpenCode P7) create those sessions
-themselves, over the Codex daemon socket and the OpenCode service API, with approvals on; the
-harness ends the pending request with `turn/interrupt` (Codex) or `reject` (OpenCode), never an
-approval. G8 runs in an isolated `GROK_HOME`, because the user's always-approve would make every
-session yolo. C5's full-access step cannot fail where the daemon's default sandbox is already
-danger-full-access, as on the maintainer's machine.
+Every tier but `offline` makes real model calls, so name the tiers you need: the one for the
+adapter you changed, `offline` always, `all` before a release. Default models are gpt-6-luna,
+sonnet, deepseek/deepseek-flash, grok-4.7, gemini-3.8-flash and deepseek/deepseek-flash; override
+them with `LIVE_CODEX_MODEL`, `LIVE_CLAUDE_MODEL`, `LIVE_OPENCODE_MODEL`, `LIVE_GROK_MODEL`,
+`LIVE_ANTIGRAVITY_MODEL`, `LIVE_PI_MODEL`. Codex's `foreign-writer` runs last, once its thread has
+unloaded (about 60 s after its last use).
 
-The script builds `target/release/agent-talk` first and reads preconditions from `agent-talk status
---json`: a tier runs only when `status` reports `new` and `send` available for its agent, and
-otherwise prints `SKIP <agent>: <reason>`. The Grok tier runs direct mode only; leader cases need an
-isolated `GROK_HOME` and a short socket path and are run by hand, never against the user's
-`~/.grok/leader.sock`.
+The script builds `target/release/agent-talk` first and runs a tier only when `agent-talk status`
+reports `new` and `send` available for its agent; otherwise it prints `SKIP <agent>: <reason>`.
+Approval checks on sessions agent-talk did not start create those sessions themselves, with
+approvals on, and end the request with `turn/interrupt` (Codex) or `reject` (OpenCode), never an
+approval. Grok leader cases are not covered: they need a leader, which the harness never starts.
 
-All sessions use `target/live-work`. Cleanup deletes only what the run created: its OpenCode
-sessions, its Claude transcripts, its pi session files, its Grok sessions (`grok sessions delete`)
-and its `~/.agent-talk/*-runs` logs, and archives its Codex threads (`thread/archive`). Files the
-checks write stay under `target/live-work`. agy has no delete command, so Antigravity conversations
-stay and are printed at the end; intents stay in `~/.agent-talk/store.db`. The run also spawns and
-kills its own foreign test processes: a `claude -p`, an `agy -p` holding a presence lock, a
-standalone `codex app-server` holding a thread's writer lock.
+Cleanup removes only what the run created: Codex threads are archived, OpenCode and Grok sessions
+deleted through the agent, Claude and pi session files and agent-talk's run logs unlinked. agy has
+no delete command, so Antigravity conversations stay and are printed at the end; intents stay in
+`~/.agent-talk/store.db`; files the checks write stay under `target/live-work`.
 
 Each check prints `PASS|FAIL|SKIP|INCONCLUSIVE <agent>/<name> <secs>s`. INCONCLUSIVE means the
-model or the agent did not do what the check needs (did not run `sleep`, did not request an
-approval, was killed before agy marked the run RUNNING), so the behavior under test was not
-exercised. The exit status is 0 only when every requested check ran and passed.
+model did not do what the check needs (ended a turn before its deadline, made no approval
+request), so the behaviour under test was not exercised. The exit status is 0 only when every
+requested check ran and passed.
