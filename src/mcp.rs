@@ -24,10 +24,15 @@ use serde_json::json;
 use std::path::PathBuf;
 use std::time::Duration;
 
-const INSTRUCTIONS: &str = "Tools to talk to other agent sessions on this machine (Codex, \
-Claude Code, OpenCode, Grok CLI, Antigravity CLI): ls finds one, new starts one, send messages \
-it (wait=true returns the reply), read shows its conversation, wait waits for a turn, models \
-lists what new can start on. Messages carry your own session as the sender.";
+const INSTRUCTIONS: &str = "Tools for sending messages to sessions of other agents on this \
+machine and reading their replies. The agents are codex (Codex), claude (Claude Code), opencode \
+(OpenCode), grok (Grok CLI) and antigravity (Antigravity CLI). A session is identified by a \
+handle, <agent>:<id>, which new and ls return. A turn can take minutes. If new or send times \
+out or loses its connection, the message may already have been delivered. Resending can \
+duplicate it. When the error includes a receipt, use its receipt_id with wait to check the \
+outcome. Without a receipt, use ls to locate the session and read to inspect its history. \
+A successful tool call can return a failed or interrupted turn. turn.status reports the \
+outcome, and approvals records permission requests and denials.";
 
 #[derive(Clone)]
 pub struct Server {
@@ -46,7 +51,7 @@ pub struct Server {
 struct ModelsParams {
     /// `codex`, `claude`, `opencode`, `grok` or `antigravity`.
     agent: String,
-    /// Only models whose id contains this text, e.g. a provider or a family name.
+    /// Filter model IDs by a case-insensitive substring.
     query: Option<String>,
     /// Models per page (default 50).
     limit: Option<usize>,
@@ -56,13 +61,13 @@ struct ModelsParams {
 
 #[derive(Deserialize, JsonSchema)]
 struct LsParams {
-    /// Only this agent: `codex`, `claude`, `opencode`, `grok` or `antigravity`.
+    /// Filter by agent: `codex`, `claude`, `opencode`, `grok` or `antigravity`. Lists all agents when omitted.
     agent: Option<String>,
-    /// Only sessions in this working directory (absolute path).
+    /// Only sessions in this directory, given as an absolute path.
     cwd: Option<String>,
-    /// Sessions per page (default 25).
+    /// Sessions per agent per page. Defaults to 25.
     limit: Option<u32>,
-    /// `next_cursor` of a previous page; needs agent.
+    /// The value of `next_cursors[agent]` from the previous response. Requires the same agent.
     cursor: Option<String>,
 }
 
@@ -70,24 +75,21 @@ struct LsParams {
 struct NewParams {
     /// `codex`, `claude`, `opencode`, `grok` or `antigravity`.
     agent: String,
-    /// Working directory of the new session (absolute path).
+    /// Working directory of the session, given as an absolute path.
     cwd: String,
-    /// First message for the new session.
+    /// The first message.
     prompt: String,
-    /// Model id as listed by `models` (default: the agent's).
+    /// A model ID returned by `models`. The agent's default applies when omitted.
     model: Option<String>,
-    /// Title shown by ls, to find the session again; Antigravity has none.
+    /// A title that ls shows. Antigravity does not support titles.
     name: Option<String>,
-    /// Reasoning effort, one of the model's values listed by `models` (default: the
-    /// agent's).
+    /// An effort value returned by `models` for the selected model. Defaults to the agent's setting. Antigravity requires this when model is supplied.
     effort: Option<String>,
-    /// Let the session act without asking for permission (default false: the agent's own
-    /// permissions).
+    /// Allow file edits, commands and network access without approval prompts. Defaults to false, which uses the agent's own permissions. The session runs unattended, so actions requiring approval are denied by the agent or declined by agent-talk.
     full_access: Option<bool>,
-    /// Wait for the first turn to finish and return it; the reply is `turn.final_text`.
+    /// Wait for the first turn to end and include its result. Defaults to false.
     wait: Option<bool>,
-    /// Seconds to wait with wait=true (default 600). On timeout the outcome is unknown
-    /// and the receipt is kept; use `wait` with the receipt id later.
+    /// Seconds to wait when wait=true. Defaults to 600. Use a shorter limit than the client's tool timeout to leave time for a response. On Grok without a leader, this timeout cancels a running turn.
     timeout_s: Option<u64>,
 }
 
@@ -102,13 +104,11 @@ struct SendParams {
     handle: String,
     /// The message.
     text: String,
-    /// Deliver into the running turn instead of after it; refused when the session is idle
-    /// (default false).
+    /// Add the message to the running turn. Defaults to false. Supported on Codex, OpenCode and Grok through a live leader. Refused when the session is idle.
     steer: Option<bool>,
-    /// Wait for the reply and return the finished turn; the reply is `turn.final_text`.
+    /// Wait for the turn to end and include its result. Defaults to false.
     wait: Option<bool>,
-    /// Seconds to wait with wait=true (default 600). On timeout the outcome is unknown and
-    /// the receipt is kept; use `wait` with the receipt id later.
+    /// Seconds to wait when wait=true. Defaults to 600. Use a shorter limit than the client's tool timeout to leave time for a response. On Grok without a leader, this timeout cancels a running turn.
     timeout_s: Option<u64>,
 }
 
@@ -118,10 +118,9 @@ struct ReadParams {
     handle: String,
     /// Messages per page (default 20).
     limit: Option<usize>,
-    /// `next_cursor` of a previous read, for the messages before that page.
+    /// `next_cursor` of a previous page, for older messages.
     cursor: Option<String>,
-    /// Every message, including intermediate text and tool calls; by default only what was
-    /// sent and the final replies.
+    /// Include intermediate text and tool calls. Defaults to false.
     all: Option<bool>,
 }
 
@@ -129,11 +128,11 @@ struct ReadParams {
 struct WaitParams {
     /// Session handle.
     handle: String,
-    /// Turn id to wait for.
+    /// The turn ID. Mutually exclusive with receipt.
     turn: Option<String>,
-    /// Receipt id from a send or new, to wait for the turn that consumed it.
+    /// The receipt_id returned by new or send. Mutually exclusive with turn.
     receipt: Option<String>,
-    /// Seconds to wait (default 600).
+    /// Seconds to wait. Defaults to 600. Use a shorter limit than the client's tool timeout to leave time for a response.
     timeout_s: Option<u64>,
 }
 
@@ -232,7 +231,7 @@ impl Server {
         title = "List models",
         output_schema = schema_for_type::<Models>(),
         annotations(read_only_hint = true, open_world_hint = false),
-        description = "List the models an agent can start a session on (new's model) with the effort values each takes (new's effort), sorted by id, one page per call. Pass a query to narrow by id, e.g. a provider or family name; OpenCode lists every model of every configured provider, so query it. Pass next_cursor back as cursor for the next page."
+        description = "List model IDs and their supported effort values for the model and effort parameters of new. Results are sorted by model ID. OpenCode includes every configured provider, so a query can narrow the results by provider or model family. Pass next_cursor as cursor to get the next page."
     )]
     async fn models(&self, Parameters(p): Parameters<ModelsParams>) -> CallToolResult {
         self.exec(Request::Models(ModelsArgs {
@@ -248,7 +247,7 @@ impl Server {
         title = "List sessions",
         output_schema = schema_for_type::<Sessions>(),
         annotations(read_only_hint = true, open_world_hint = false),
-        description = "List agent sessions on this machine: handle, agent, cwd, state and a preview of the first prompt. Pass a handle to send or read."
+        description = "List sessions on this machine, newest first for each agent. Each entry includes a handle, working directory, state and a preview of the first message. Each agent has a separate cursor in next_cursors. To get its next page, pass next_cursors[agent] as cursor and select that agent."
     )]
     async fn ls(&self, Parameters(p): Parameters<LsParams>) -> CallToolResult {
         self.exec(Request::Ls(LsArgs {
@@ -266,7 +265,7 @@ impl Server {
         title = "New session",
         output_schema = schema_for_type::<Outcome>(),
         annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = false),
-        description = "Start an agent session in a directory with a first prompt, e.g. to hand a task to a fresh agent; give it a name to find it again. Returns its handle and a receipt; with wait=true also the finished first turn, whose reply is turn.final_text. The prompt is delivered with a header naming your session."
+        description = "Start an agent session in cwd and send its first message. The session does not inherit the caller's conversation history. Returns a handle and a receipt. With wait=true, waits for the first turn to end and includes its result, with the reply in turn.final_text. With wait=false, Codex and OpenCode return after accepting the message. Claude Code, Grok and Antigravity still wait for the turn to end."
     )]
     async fn new_session(
         &self,
@@ -291,7 +290,7 @@ impl Server {
         title = "Send message",
         output_schema = schema_for_type::<Outcome>(),
         annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = false),
-        description = "Send a message to an agent session. With wait=true, returns the reply as turn.final_text (on OpenCode the reply of the run that took the message, which may also cover other queued messages; read shows them). Without wait, returns a receipt once the message is accepted; Claude, Grok and Antigravity run the whole turn before returning either way. The message is delivered with a header naming your session. A refusal is an error with a code and is final: E_FOREIGN_LIVE (the session is open in a process agent-talk did not start), E_LOCKED (another agent-talk command is running it); E_TIMEOUT means the outcome is unknown, use wait with the receipt id."
+        description = "Continue an existing session by sending a message. On Codex, OpenCode and Grok through a live leader, a message sent during a turn is queued by default. Returns a receipt. With wait=true, waits for the turn to end and includes its result, with the reply in turn.final_text. With wait=false, Codex and OpenCode return after accepting the message. Claude Code, Grok and Antigravity still wait for the turn to end. One OpenCode reply can cover several queued messages. Use read to see them in the conversation."
     )]
     async fn send(
         &self,
@@ -312,7 +311,7 @@ impl Server {
         title = "Read history",
         output_schema = schema_for_type::<Read>(),
         annotations(read_only_hint = true, open_world_hint = false),
-        description = "Read another agent session's conversation: its newest messages, oldest first, by default only what was sent to it and its final replies, each with its turn id and, for messages sent through agent-talk, who sent them (from). Pass next_cursor back as cursor for older messages; all=true includes intermediate text and tool calls."
+        description = "Read a session's newest messages, oldest first. By default these are the messages sent to it and its final replies. Pass next_cursor as cursor to get older messages."
     )]
     async fn read(&self, Parameters(p): Parameters<ReadParams>) -> CallToolResult {
         self.exec(Request::Read(ReadArgs {
@@ -331,7 +330,7 @@ impl Server {
         title = "Wait for turn",
         output_schema = schema_for_type::<Outcome>(),
         annotations(read_only_hint = true, open_world_hint = false),
-        description = "Wait for a turn to finish and return it, the reply in turn.final_text: pass the receipt from a send or new, or a turn id. Returns at once if the turn already finished."
+        description = "Retrieve the result of a turn, waiting if it is still running or queued. Provide exactly one of receipt or turn, together with the session handle. Returns the turn with its reply in turn.final_text. A turn that has already ended returns immediately. After E_TIMEOUT, call wait again with the same arguments to continue observing."
     )]
     async fn wait(&self, Parameters(p): Parameters<WaitParams>) -> CallToolResult {
         let target = match (p.turn, p.receipt) {

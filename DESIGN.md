@@ -786,6 +786,15 @@ servers are configured globally only.
 - `status` marks a Codex method unavailable only when the daemon reports it missing; any other
   refusal of the probe on a dummy thread counts as available.
 - Sender attribution cannot detect a daemon or service started from another agent's shell.
+- MCP clients have their own tool timeout. Codex documents a 60 s default for
+  [`tool_timeout_sec`](https://learn.chatgpt.com/docs/config-file/config-reference).
+  Claude Code, Grok and Antigravity `new` and `send` wait for the turn even with `wait=false`,
+  so the client can time out before receiving the handle and receipt. From source, MCP
+  operations run in `spawn_blocking` without forwarding the client's cancellation to the
+  adapter, so an operation may continue after the client stops waiting. Client timeout and
+  server shutdown behaviour have not been tested here. Neither implies that a turn completed.
+  `timeout_s` with `wait=true` is a separate deadline: in direct Grok mode it cancels the turn
+  (§6.4). `ls` can recover a session handle, but does not recover the lost receipt.
 - A Grok turn that continues in a leader after the sending command stopped observing waits for
   another client to answer a permission request it raises.
 - OpenCode sessions agent-talk starts: sub-sessions of the subagent tool inherit the session's
