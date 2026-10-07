@@ -15,9 +15,11 @@ use std::fs::{File, OpenOptions, TryLockError};
 use std::future::Future;
 use std::path::Path;
 use std::process::ExitStatus;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::io::AsyncBufReadExt;
 use tokio::process::{Child, Command};
+use tokio::signal::unix::{SignalKind, signal};
 use tokio::time::Instant;
 
 /// The text delivered for `text` from `from`: agent senders get a one-line provenance
@@ -659,8 +661,38 @@ pub fn settle(
     }
 }
 
-/// Run `fut` until it finishes, the deadline passes, or Ctrl-C arrives. Without a
-/// deadline only Ctrl-C ends it early.
+/// Whether Ctrl-C and SIGTERM end observation. Once tokio listens for a signal, its default
+/// action never returns for the life of the process, so only the CLI, which exits after one
+/// operation, listens; `agent-talk mcp` keeps the default actions (DESIGN.md §4).
+static INTERRUPTIBLE: AtomicBool = AtomicBool::new(false);
+
+/// Let Ctrl-C and SIGTERM end observation in this process.
+pub fn interrupt_on_signals() {
+    INTERRUPTIBLE.store(true, Ordering::Relaxed);
+}
+
+/// Resolves on Ctrl-C or SIGTERM (Claude Code's Bash tool sends SIGTERM when it stops a
+/// background command); never when signals are not enabled for this process.
+async fn interrupted() {
+    if !INTERRUPTIBLE.load(Ordering::Relaxed) {
+        return std::future::pending().await;
+    }
+    let term = async {
+        match signal(SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(_) => std::future::pending().await,
+        }
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = term => {}
+    }
+}
+
+/// Run `fut` until it finishes, the deadline passes, or Ctrl-C or SIGTERM arrives. Without a
+/// deadline only a signal ends it early.
 pub async fn bounded<T>(
     deadline: Option<Instant>,
     fut: impl Future<Output = Result<T>>,
@@ -677,7 +709,7 @@ pub async fn bounded<T>(
             ErrorCode::Timeout,
             "deadline passed before the turn completed; outcome unknown, receipt retained",
         )),
-        _ = tokio::signal::ctrl_c() => Err(Error::new(
+        _ = interrupted() => Err(Error::new(
             ErrorCode::Interrupted,
             "interrupted; outcome unknown, receipt retained",
         )),

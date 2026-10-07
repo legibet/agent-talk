@@ -82,11 +82,12 @@ Exit code 0 can still accompany a failed turn. The turn status reports `complete
 `approval declined` or `approval denied` line identifies an action that did not run. On OpenCode,
 one reply can cover several queued messages; `read` shows the conversation containing them.
 
-Exit code 3 means a timeout or interrupt left the outcome unknown. Use the receipt printed with
-the error to check the result with `wait`; resending may duplicate the message. If `new` did not
-print a handle, `ls` identifies sessions it created with `origin=agent-talk`. Grok without a
-leader cancels its turn when the command times out or is interrupted; `wait` reports how that
-turn ended and does not restart it.
+Exit code 3 means a timeout or an interrupt (Ctrl-C, or SIGTERM when a background job is
+stopped) left the outcome unknown. Use the receipt printed with the error to check the result
+with `wait`; resending may duplicate the message. If `new` did not print a handle, `ls`
+identifies sessions it created with `origin=agent-talk`. Grok without a leader cancels its turn
+when the command times out or is interrupted; `wait` reports how that turn ended and does not
+restart it.
 
 Exit code 2 reports a refused request with an `E_*` code and an explanation of the cause. Exit
 code 4 reports a transport failure, which can occur before or after delivery. If the error

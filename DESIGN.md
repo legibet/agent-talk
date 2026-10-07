@@ -144,10 +144,10 @@ the agent runtime injected (task notifications, system messages).
 
 `new` and `send` write the intent, submit, and mark the receipt `accepted` with the agent's ids.
 An agent refusal marks it `rejected` (also later, when a run log proves the message was never
-taken). When observation ends without a result (deadline, Ctrl-C, transport loss, HTTP 5xx) a
-`pending` receipt becomes `unknown`; the error carries the receipt, the approvals seen so far, and
-a `state`: `pending` (queued, not running), `running`, `waiting` (an approval is unanswered) or
-`unknown`. `rejected` and `unknown` are reachable only from `pending`; any later proof of delivery
+taken). When observation ends without a result (deadline, Ctrl-C or SIGTERM, transport loss,
+HTTP 5xx) a `pending` receipt becomes `unknown`; the error carries the receipt, the approvals seen
+so far, and a `state`: `pending` (queued, not running), `running`, `waiting` (an approval is
+unanswered) or `unknown`. `rejected` and `unknown` are reachable only from `pending`; any later proof of delivery
 (history, queue, inbox, run log) moves a receipt to `accepted` and fills in its ids. `wait
 --receipt R` or `wait --turn T` resolves it later; both attach the receipt when one exists for
 that turn.
@@ -234,6 +234,10 @@ additive, not idempotent). Through rmcp 3.5 the server speaks protocol 2026-07-2
 `server/discover`, used by Claude Code and Antigravity) and the `initialize` handshake of earlier
 versions (Codex sends 2025-06-18, Grok 2025-11-25). Logging is stderr only.
 
+Only the CLI ends observation on Ctrl-C or SIGTERM. Once tokio listens for a signal, its default
+action never returns for the life of the process, so the server keeps the default actions: a
+signal stops the server and the requests it is running.
+
 ## 5. CLI
 
 ```
@@ -249,8 +253,8 @@ agent-talk mcp [--caller H]
 ```
 
 - `--json` on every command; default output is for humans. Exit codes: 0 ok, 2 refused with a
-  stable error code, 3 unknown outcome (timeout or Ctrl-C after an accepted intent), 4 transport
-  failure.
+  stable error code, 3 unknown outcome (timeout, Ctrl-C or SIGTERM after an accepted intent),
+  4 transport failure.
 - `send` without `--wait` promises only that the agent accepted the message. Claude, Grok and
   Antigravity sends still run the turn to its end, because the turn lives in the child.
 - `send --wait` subscribes, persists the intent, submits, correlates and observes on one
@@ -300,7 +304,7 @@ E_FOREIGN_LIVE  held by a process agent-talk cannot talk to (Claude TUI, Grok TU
 E_NO_STEER      agent cannot steer (Claude, Antigravity, Grok without a live leader)
 E_MAX_HOPS      hop depth exceeded
 E_TIMEOUT       deadline passed; outcome unknown, receipt retained
-E_INTERRUPTED   Ctrl-C while observing; outcome unknown, receipt retained
+E_INTERRUPTED   Ctrl-C or SIGTERM while observing; outcome unknown, receipt retained
 E_TRANSPORT     connection failed or dropped, or a live service unreachable (sandbox); outcome
                 unknown if an intent was sent
 E_UNSUPPORTED   option or method absent in this agent
@@ -611,9 +615,9 @@ leader check, since clients of one leader do not exclude each other.
   Grok starts a fallback turn (`interject-fallback-...`) that the receipt then names.
 - In direct mode the turn dies with the child (closing stdin ends it within about two seconds,
   with no `turn_completed`), and a `session/cancel` sent before `runningPromptId` names the prompt
-  is ignored. So the command runs until the turn ends even without `--wait`; when a deadline or
-  Ctrl-C ends it, agent-talk waits up to 10 s for the prompt to run, sends `session/cancel` and
-  waits for the `cancelled` response. Through a leader the turn continues after the command.
+  is ignored. So the command runs until the turn ends even without `--wait`; when a deadline,
+  Ctrl-C or SIGTERM ends it, agent-talk waits up to 10 s for the prompt to run, sends
+  `session/cancel` and waits for the `cancelled` response. Through a leader the turn continues after the command.
 - `wait` on a turn agent-talk is not running polls `updates.jsonl` for its `turn_completed`; a
   direct child that exited without one leaves the turn `interrupted` or `unknown`.
 
@@ -785,7 +789,8 @@ servers are configured globally only.
   renders a decline from agent-talk is unverified.
 - `status` marks a Codex method unavailable only when the daemon reports it missing; any other
   refusal of the probe on a dummy thread counts as available.
-- Sender attribution cannot detect a daemon or service started from another agent's shell.
+- Sender attribution cannot detect a daemon or service started from another agent's shell; the
+  message is then attributed to that agent's session, and its hop depth counted from there.
 - MCP clients have their own tool timeout. Codex documents a 60 s default for
   [`tool_timeout_sec`](https://learn.chatgpt.com/docs/config-file/config-reference).
   Claude Code, Grok and Antigravity `new` and `send` wait for the turn even with `wait=false`,

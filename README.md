@@ -73,8 +73,8 @@ The exit code is one of:
 - 0: success.
 - 2: the request was refused, with a stable `E_*` error code.
 - 3: the outcome is unknown. The agent accepted the message, but the command stopped waiting
-  because of a timeout or Ctrl-C. agent-talk does not resend the message, and `wait --receipt`
-  reports what happened to it.
+  because of a timeout, Ctrl-C or SIGTERM. agent-talk does not resend the message, and
+  `wait --receipt` reports what happened to it.
 - 4: transport failure.
 
 ## Sessions open in a TUI or app

@@ -210,6 +210,7 @@ fn main() -> ExitCode {
             }
         };
     }
+    agents::interrupt_on_signals();
     let res = rt.block_on(async {
         let store = Store::open()?;
         ops::run(&store, request(cli.cmd)?).await
