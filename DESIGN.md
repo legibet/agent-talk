@@ -9,7 +9,7 @@ heading; facts only read in agent source or documentation are marked as such.
 
 In: Codex (shared app-server daemon), Claude Code (`claude -p`), OpenCode 2.x (shared background
 service; 1.x is not supported), Grok CLI (ACP to `grok agent stdio`, through the shared leader
-when one runs), Antigravity CLI (`agy -p`); a CLI and an MCP server exposing the same five operations; sender
+when one runs), Antigravity CLI (`agy -p`); a CLI and an MCP server exposing the same operations; sender
 attribution and a provenance header for agent-to-agent traffic; a hop limit.
 
 Out: an agent-talk daemon, GUI, PTY or terminal scraping, remote hosts, worktree management,
@@ -82,7 +82,7 @@ child session's messages would be attributed to agent-talk's caller.
 ```
 src/
   main.rs              clap definitions, sender from the shell environment, human output, exit codes
-  mcp.rs               the five operations as MCP tools (rmcp over stdio); sender from _meta / env
+  mcp.rs               the operations as MCP tools (rmcp over stdio); sender from _meta / env
   ops.rs               the operations: handles, provenance header, hop limit, dispatch, typed output
   model.rs             agent-neutral types and error codes
   store.rs             SQLite (rusqlite, bundled)
@@ -93,6 +93,7 @@ src/
   agents/grok/         adapter, ACP client of a grok agent child, updates.jsonl rules
   agents/antigravity/  adapter (summaries db, presence lock), transcript, stream, process
 tests/live.py          regression harness against the real agents; see tests/README.md
+skills/agent-talk/     the skill that teaches agents the CLI (installed with `npx skills add`)
 ```
 
 The receipt and approval lifecycle (default policy, reject on agent refusal, record approvals,
@@ -221,14 +222,14 @@ delivered one. All of this is attribution, not authenticated identity.
 
 `agent-talk mcp [--caller H]` is an ordinary stdio MCP server that the user
 configures once, globally; agent-talk never writes agent configuration or injects itself into
-sessions. It serves `ls / new / send / read / wait` with the JSON the CLI prints under `--json`;
+sessions. It serves `models / ls / new / send / read / wait` with the JSON the CLI prints under `--json`;
 refusals are tool errors (`isError`), not protocol errors. `new` takes `full_access` as on the
 CLI, and requires `cwd`, because the server's working directory is not the caller's.
 
 Code-mode clients (Codex for its gpt-6 models, OpenCode, pi) call tools from a script and pass
 results on without the model reading them, so every tool declares an `outputSchema` generated
 from the CLI's types, returns the JSON as `structuredContent` and as text, and carries a `title`
-and behaviour annotations (`ls`, `read`, `wait` read-only and closed-world; `new`, `send`
+and behaviour annotations (`models`, `ls`, `read`, `wait` read-only and closed-world; `new`, `send`
 additive, not idempotent). Through rmcp 3.5 the server speaks protocol 2026-07-28 (stateless,
 `server/discover`, used by Claude Code and Antigravity) and the `initialize` handshake of earlier
 versions (Codex sends 2025-06-18, Grok 2025-11-25). Logging is stderr only.

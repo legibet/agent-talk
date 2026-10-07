@@ -98,34 +98,22 @@ agent's own TUI or app depends on the agent.
   send, but the TUI still holds the old conversation in memory. If the user returns to it with
   `/resume`, the TUI overwrites the messages that agent-talk added.
 
-## MCP
+## Skill
 
-`agent-talk mcp` runs agent-talk as an MCP server. It provides the tools `models`, `ls`, `new`,
-`send`, `read` and `wait`, which correspond to the CLI commands of the same name and return the
-same JSON as `--json`. Register it with the absolute path of the binary.
-
-For Claude Code, run:
+The repository includes a skill that teaches agents to use the CLI. Install it with
+[skills](https://github.com/vercel-labs/skills):
 
 ```sh
-claude mcp add --scope user talk -- /abs/path/agent-talk mcp
+npx skills add legibet/agent-talk -g
 ```
 
-Grok CLI reads MCP servers from `~/.claude.json`, so this registration also applies to Grok.
+## MCP
 
-For Codex, add the server to `~/.codex/config.toml`. The `default_tools_approval_mode` line is
-required, because without it MCP calls fail under the approval policy `never`.
+`agent-talk mcp` serves `models`, `ls`, `new`, `send`, `read` and `wait` as MCP tools over stdio.
+They return the same JSON as `--json`. Register it with your agent, for example:
 
-```toml
-[mcp_servers.talk]
-command = "/abs/path/agent-talk"
-args = ["mcp"]
-default_tools_approval_mode = "approve"
-```
-
-For OpenCode, add it to `~/.config/opencode/opencode.json`:
-
-```json
-{ "mcp": { "servers": { "talk": { "type": "local", "command": ["/abs/path/agent-talk", "mcp"] } } } }
+```sh
+claude mcp add --scope user talk -- "$(command -v agent-talk)" mcp
 ```
 
 ## License
