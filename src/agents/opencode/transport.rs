@@ -163,6 +163,11 @@ impl Service {
             .await
     }
 
+    pub async fn patch(&self, path: &str, body: &Value) -> Result<Value> {
+        self.send(self.request(reqwest::Method::PATCH, path).json(body))
+            .await
+    }
+
     pub async fn events(&self) -> Result<Events> {
         let resp = self
             .request(reqwest::Method::GET, "/api/event")

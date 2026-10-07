@@ -4,7 +4,7 @@ mod model;
 mod ops;
 mod store;
 
-use agents::{ReadQuery, WaitTarget};
+use agents::{ReadQuery, Settings, WaitTarget};
 use clap::{Args, Parser, Subcommand};
 use model::{Approval, Caller, CallerKind, Outcome, Receipt, Turn};
 use ops::{
@@ -38,6 +38,32 @@ struct SenderOpts {
     /// known.
     #[arg(long)]
     from: Option<String>,
+}
+
+/// A session's model, effort and permissions.
+#[derive(Args)]
+struct SettingsOpts {
+    /// Model id as listed by models; default: the agent's on new, unchanged on send.
+    #[arg(long)]
+    model: Option<String>,
+    /// Reasoning effort, one of the model's values listed by models; default: the agent's
+    /// on new, unchanged on send.
+    #[arg(long)]
+    effort: Option<String>,
+    /// Let the session act without asking for permission, from then on; default: the agent's
+    /// own permissions.
+    #[arg(long)]
+    full_access: bool,
+}
+
+impl SettingsOpts {
+    fn settings(self) -> Settings {
+        Settings {
+            model: self.model,
+            effort: self.effort,
+            full_access: self.full_access,
+        }
+    }
 }
 
 #[derive(Args)]
@@ -104,27 +130,19 @@ enum Cmd {
         /// Working directory of the session.
         #[arg(long, default_value = ".")]
         cwd: PathBuf,
-        /// Model id as listed by models; default: the agent's.
-        #[arg(long)]
-        model: Option<String>,
         /// Title shown by ls; Antigravity has none.
         #[arg(long)]
         name: Option<String>,
-        /// Reasoning effort, one of the model's values listed by models; default: the
-        /// agent's.
-        #[arg(long)]
-        effort: Option<String>,
-        /// Let the session act without asking for permission; default: the agent's own
-        /// permissions.
-        #[arg(long)]
-        full_access: bool,
+        #[command(flatten)]
+        settings: SettingsOpts,
         #[command(flatten)]
         wait: WaitOpts,
         #[command(flatten)]
         sender: SenderOpts,
     },
     /// Send a message to a session; returns once it is accepted, or with --wait once the
-    /// reply is in.
+    /// reply is in. --model, --effort and --full-access change the session's settings
+    /// from this message on, only on sessions agent-talk started.
     Send {
         /// Session handle from ls or new.
         handle: String,
@@ -134,6 +152,8 @@ enum Cmd {
         /// idle.
         #[arg(long)]
         steer: bool,
+        #[command(flatten)]
+        settings: SettingsOpts,
         #[command(flatten)]
         wait: WaitOpts,
         #[command(flatten)]
@@ -301,20 +321,16 @@ fn request(cmd: Cmd) -> model::Result<Request> {
             agent,
             prompt,
             cwd,
-            model,
             name,
-            effort,
-            full_access,
+            settings,
             wait,
             sender,
         } => Request::New(NewArgs {
             agent,
             cwd,
             prompt,
-            model,
             name,
-            effort,
-            full_access,
+            settings: settings.settings(),
             wait: wait.duration(),
             from: cli_caller(sender.from.as_deref())?,
         }),
@@ -322,12 +338,14 @@ fn request(cmd: Cmd) -> model::Result<Request> {
             handle,
             text,
             steer,
+            settings,
             wait,
             sender,
         } => Request::Send(SendArgs {
             handle,
             text,
             steer,
+            settings: settings.settings(),
             wait: wait.duration(),
             from: cli_caller(sender.from.as_deref())?,
         }),

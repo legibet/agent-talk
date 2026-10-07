@@ -642,7 +642,12 @@ impl Agent for Antigravity<'_> {
         let log = self.log_path(&receipt_id);
         let mut child = spawn(
             req.cwd,
-            &args(None, req.model, req.effort, req.full_access),
+            &args(
+                None,
+                req.settings.model.as_deref(),
+                req.settings.effort.as_deref(),
+                req.settings.full_access,
+            ),
             &log,
         )?;
         // The conversation id exists only once agy reports it; the intent is written then,
@@ -665,12 +670,7 @@ impl Agent for Antigravity<'_> {
         check_id(&id)?;
         let h = handle(&id);
         let _lock = lock(&h, SECOND_WRITER)?;
-        let stored_args = json!({
-            "model": req.model,
-            "effort": req.effort,
-            "full_access": req.full_access,
-        });
-        self.store.insert_owned(&h, req.cwd, &stored_args)?;
+        self.store.insert_owned(&h, req.cwd, req.settings)?;
         self.store.insert_intent(&NewIntent {
             receipt_id: &receipt_id,
             handle: &h,
@@ -728,14 +728,13 @@ impl Agent for Antigravity<'_> {
                 }
             },
         };
-        // A conversation agent-talk started keeps the model, effort and permissions `new`
-        // gave it.
-        let started = self.store.owned_args(&h)?.unwrap_or_default();
+        // A resumed conversation keeps none of its settings, so they all pass again.
+        let settings = req.settings.cloned().unwrap_or_default();
         let args = args(
             Some(id),
-            started["model"].as_str(),
-            started["effort"].as_str(),
-            started["full_access"] == true,
+            settings.model.as_deref(),
+            settings.effort.as_deref(),
+            settings.full_access,
         );
         let receipt_id = uuid::Uuid::new_v4().to_string();
         self.store.insert_intent(&NewIntent {

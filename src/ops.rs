@@ -2,10 +2,12 @@
 //! provenance header, hop limit, agent dispatch, typed output.
 
 use crate::agents::{
-    Adapter, Agent, AgentStatus, ListFilter, ReadQuery, SendRequest, StartRequest, WaitTarget,
-    delivered,
+    Adapter, Agent, AgentStatus, ListFilter, ReadQuery, SendRequest, Settings, StartRequest,
+    WaitTarget, delivered,
 };
-use crate::model::{Caller, Error, ErrorCode, Message, Model, Outcome, Result, Session};
+use crate::model::{
+    Caller, Error, ErrorCode, Message, Model, Outcome, ReceiptState, Result, Session,
+};
 use crate::store::Store;
 use futures_util::future::join_all;
 use schemars::JsonSchema;
@@ -60,11 +62,9 @@ pub struct NewArgs {
     pub agent: String,
     pub cwd: PathBuf,
     pub prompt: String,
-    pub model: Option<String>,
     /// Title the agent stores for the new session.
     pub name: Option<String>,
-    pub effort: Option<String>,
-    pub full_access: bool,
+    pub settings: Settings,
     /// Observe the first turn for this long; `None` returns once the agent accepted it.
     pub wait: Option<Duration>,
     pub from: Caller,
@@ -75,6 +75,9 @@ pub struct SendArgs {
     pub text: String,
     /// Into the running turn instead of queued after it.
     pub steer: bool,
+    /// Settings wanted before the message; only on a session agent-talk started, where the
+    /// values that differ from the session's are changed.
+    pub settings: Settings,
     /// Observe the turn for this long; `None` returns once the agent accepted the message.
     pub wait: Option<Duration>,
     pub from: Caller,
@@ -218,10 +221,8 @@ async fn new(store: &Store, a: NewArgs) -> Result<Output> {
         cwd: &cwd,
         prompt: &a.prompt,
         delivered: &delivered,
-        model: a.model.as_deref(),
         name: a.name.as_deref(),
-        effort: a.effort.as_deref(),
-        full_access: a.full_access,
+        settings: &a.settings,
         depth: hop_depth(store, &a.from)?,
         from: &a.from,
     };
@@ -233,15 +234,52 @@ async fn new(store: &Store, a: NewArgs) -> Result<Output> {
 async fn send(store: &Store, a: SendArgs) -> Result<Output> {
     let (name, id) = split_handle(&a.handle)?;
     let agent = Adapter::named(store, name)?;
+    // Settings change only on sessions agent-talk started, and for a turn of their own
+    // (DESIGN.md §4). The change is recorded first and taken back if the agent refused the
+    // message, so a refused value is not passed again.
+    let current = store.settings(&a.handle)?;
+    let change = match &current {
+        Some(c) => c.change_to(&a.settings),
+        None if a.settings.is_empty() => Settings::default(),
+        None => {
+            return Err(Error::new(
+                ErrorCode::Precondition,
+                "model, effort and full access can be changed only on sessions agent-talk started",
+            ));
+        }
+    };
+    if a.steer && !change.is_empty() {
+        return Err(Error::new(
+            ErrorCode::Precondition,
+            "--steer delivers into the running turn; send the change without it",
+        ));
+    }
+    let settings = current.as_ref().map(|c| c.with(&change));
+    if let Some(s) = &settings
+        && !change.is_empty()
+    {
+        store.set_settings(&a.handle, s)?;
+    }
     let delivered = delivered(&a.from, &a.text);
     let req = SendRequest {
         text: &a.text,
         delivered: &delivered,
         steer: a.steer,
+        change: &change,
+        settings: settings.as_ref(),
         depth: hop_depth(store, &a.from)?,
         from: &a.from,
     };
-    let mut o = agent.send(id, &req, a.wait.map(deadline)).await?;
+    let res = agent.send(id, &req, a.wait.map(deadline)).await;
+    if let (Err(e), Some(c)) = (&res, &current)
+        && !change.is_empty()
+        && e.receipt
+            .as_ref()
+            .is_none_or(|r| r.state == ReceiptState::Rejected)
+    {
+        store.set_settings(&a.handle, c)?;
+    }
+    let mut o = res?;
     o.from = Some(a.from);
     Ok(Output::Outcome(Box::new(o)))
 }

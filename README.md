@@ -62,12 +62,16 @@ see who sent it and answers in its final response, which the sender reads with `
 agent-talk refuses a message more than three hops down an agent-to-agent chain with the error
 `E_MAX_HOPS`.
 
-A session started with `agent-talk new` runs under the agent's own permission settings, and
-`new --full-access` gives it every permission with no approval prompts. agent-talk never approves
-tool calls. In a session it started, nobody is there to answer approval requests, so the agent is
-told not to ask, and anything that still needs approval is declined. In a session it did not
-start, approval requests are left to the user. `agent-talk status` prints what the installed CLIs
-and running daemons support, and [DESIGN.md](DESIGN.md) describes how each agent is handled.
+`new --model` and `--effort` choose a session's model and reasoning effort. Without
+`--full-access` the session runs under the agent's own permission settings; with it, the session
+has every permission and no approval prompts. `send` takes the same three options to change them
+from that message on, but only on sessions agent-talk started.
+
+agent-talk never approves tool calls. In a session it started, nobody is there to answer approval
+requests, so the agent is told not to ask, and anything that still needs approval is declined. In
+a session it did not start, approval requests are left to the user. `agent-talk status` prints
+what the installed CLIs and running daemons support, and [DESIGN.md](DESIGN.md) describes how
+each agent is handled.
 
 The exit code is one of:
 

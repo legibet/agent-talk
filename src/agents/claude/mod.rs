@@ -578,12 +578,7 @@ impl Agent for Claude<'_> {
         let id = uuid::Uuid::new_v4().to_string();
         let h = handle(&id);
         let _lock = lock(&h, SECOND_WRITER)?;
-        let stored_args = json!({
-            "model": req.model,
-            "effort": req.effort,
-            "full_access": req.full_access,
-        });
-        self.store.insert_owned(&h, req.cwd, &stored_args)?;
+        self.store.insert_owned(&h, req.cwd, req.settings)?;
         let receipt_id = uuid::Uuid::new_v4().to_string();
         // The input line's uuid: becomes the transcript user.uuid, i.e. the turn id.
         let client_msg_id = uuid::Uuid::new_v4().to_string();
@@ -598,10 +593,10 @@ impl Agent for Claude<'_> {
         })?;
         let mut args = process::args(
             ["--session-id", &id],
-            req.model,
-            req.effort,
+            req.settings.model.as_deref(),
+            req.settings.effort.as_deref(),
             ApprovalPolicy::Deny,
-            req.full_access,
+            req.settings.full_access,
         );
         if let Some(n) = req.name {
             args.extend(["--name".into(), n.into()]);
@@ -668,14 +663,15 @@ impl Agent for Claude<'_> {
             from: req.from,
             depth: req.depth,
         })?;
-        // A session agent-talk started keeps the model, effort and permissions `new` gave it.
-        let started = self.store.owned_args(&h)?.unwrap_or_default();
+        // Claude restores the model from the transcript, so only a change passes it; effort
+        // and permission mode are per process and come from the session's settings.
+        let settings = req.settings.cloned().unwrap_or_default();
         let args = process::args(
             ["--resume", id],
-            started["model"].as_str(),
-            started["effort"].as_str(),
+            req.change.model.as_deref(),
+            settings.effort.as_deref(),
             approval_policy(self.store, &h)?,
-            started["full_access"] == true,
+            settings.full_access,
         );
         let watch = RunWatch {
             id: id.to_string(),

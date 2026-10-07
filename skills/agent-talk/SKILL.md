@@ -40,10 +40,13 @@ agent-talk ls --cwd <directory> --agent <agent>
 agent-talk send <handle> "<text>" --wait
 ```
 
-`ls` lists matching sessions with their handles, states and message previews. Omit `--agent` to
-list all six agents. `send` continues the selected session with its history, including sessions
-created outside agent-talk. Sessions created by agent-talk retain their model, effort and
-`--full-access` setting on subsequent sends.
+`ls` lists matching sessions with their handles, states and message previews. Omit `--agent` to list
+all six agents. `send` continues the selected session with its history, including sessions created
+outside agent-talk. Sessions created by agent-talk keep their model, effort and `--full-access`
+setting on later sends, and `send --model`, `--effort` and `--full-access` change them from that
+message on. These options are refused on sessions created outside agent-talk and together with
+`--steer`. On Codex such a send is refused while a turn is running, and full access cannot be given
+to a Grok session held by its leader.
 
 On Codex, OpenCode and Grok through a live leader, `send` queues the message after the current
 reply. `--steer` adds it to the running turn instead and is refused when the session is idle.
@@ -76,9 +79,9 @@ agent-talk wait <handle> --receipt <receipt-id>
 If the turn has finished, `wait` returns its result immediately. Otherwise, it waits up to 600
 seconds by default; `--timeout <seconds>` sets a different limit.
 
-Claude Code, Grok, Antigravity and pi run the turn to its end even without `--wait`. For parallel work
-with these agents, run each command as a separate background job and keep `--wait` to include the
-reply in its output.
+Claude Code, Grok, Antigravity and pi run the turn to its end even without `--wait`. For parallel
+work with these agents, run each command as a separate background job and keep `--wait` to
+include the reply in its output.
 
 Exit code 0 can still accompany a failed turn. The turn status reports `completed`, `failed`,
 `interrupted` or `unknown`; a reply from an unfinished or failed turn may be partial. Each

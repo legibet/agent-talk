@@ -10,7 +10,7 @@ use crate::model::{
     ReceiptState, Result, Session, Turn,
 };
 use crate::store::Store;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs::{File, OpenOptions, TryLockError};
 use std::future::Future;
@@ -365,23 +365,59 @@ pub struct ListFilter<'a> {
     pub all: bool,
 }
 
+/// A session's `--model`, `--effort` and `--full-access`, passed through unvalidated in the
+/// agent's syntax (DESIGN.md §4). `new` chooses them; agent-talk stores them for the sessions
+/// it started, where a later `send` may change them. Each adapter passes again only what its
+/// agent does not keep between turns (DESIGN.md §6). As a change, an absent field keeps the
+/// current value; full access is only ever turned on.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Settings {
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub full_access: bool,
+}
+
+impl Settings {
+    pub fn is_empty(&self) -> bool {
+        *self == Settings::default()
+    }
+
+    /// The change from these settings to `wanted`: its values that differ.
+    pub fn change_to(&self, wanted: &Settings) -> Settings {
+        Settings {
+            model: wanted
+                .model
+                .clone()
+                .filter(|m| self.model.as_ref() != Some(m)),
+            effort: wanted
+                .effort
+                .clone()
+                .filter(|e| self.effort.as_ref() != Some(e)),
+            full_access: wanted.full_access && !self.full_access,
+        }
+    }
+
+    /// These settings with `change` applied.
+    pub fn with(&self, change: &Settings) -> Settings {
+        Settings {
+            model: change.model.clone().or_else(|| self.model.clone()),
+            effort: change.effort.clone().or_else(|| self.effort.clone()),
+            full_access: self.full_access || change.full_access,
+        }
+    }
+}
+
 pub struct StartRequest<'a> {
     pub cwd: &'a str,
     /// The caller's text, as recorded in the intent.
     pub prompt: &'a str,
     /// What reaches the agent: `prompt`, with a provenance header for agent senders.
     pub delivered: &'a str,
-    pub model: Option<&'a str>,
     /// Title the agent stores for the session (Codex `thread/name/set`, Claude `--name`,
     /// OpenCode `title`, Grok `_x.ai/session/rename`; Antigravity has none and refuses it);
     /// `ls` shows it as `name`.
     pub name: Option<&'a str>,
-    /// Reasoning effort for the session, passed through unvalidated: Codex
-    /// `turn/start.effort`, Claude and Antigravity `--effort` on every run, OpenCode the
-    /// model `variant`, Grok the `reasoning_effort` config option.
-    pub effort: Option<&'a str>,
-    /// Every permission, no approval prompts (`new --full-access`, DESIGN.md §4).
-    pub full_access: bool,
+    pub settings: &'a Settings,
     pub from: &'a Caller,
     /// Hop depth of the first prompt (`Store::hop_depth`).
     pub depth: u32,
@@ -394,6 +430,11 @@ pub struct SendRequest<'a> {
     pub delivered: &'a str,
     /// Into the running turn (`send --steer`) instead of queued after it.
     pub steer: bool,
+    /// What this send changes; empty unless the session is one agent-talk started.
+    pub change: &'a Settings,
+    /// The session's settings, `change` included; `None` for a session agent-talk did not
+    /// start, which runs as the agent has it.
+    pub settings: Option<&'a Settings>,
     pub from: &'a Caller,
     /// Hop depth of this message (`Store::hop_depth`).
     pub depth: u32,
@@ -562,15 +603,6 @@ pub fn approval_policy(store: &Store, handle: &str) -> Result<ApprovalPolicy> {
     } else {
         ApprovalPolicy::Observe
     })
-}
-
-/// Whether `new --full-access` started this session. Codex loses the sandbox when a thread
-/// unloads, and Claude and Antigravity take permissions per process, so later sends apply it
-/// again (DESIGN.md §4).
-pub fn full_access(store: &Store, handle: &str) -> Result<bool> {
-    Ok(store
-        .owned_args(handle)?
-        .is_some_and(|a| a["full_access"] == true))
 }
 
 /// The submission failed. An agent response is a definitive refusal: `rejected`. A lost

@@ -4,7 +4,7 @@
 //! so results are exactly what `--json` prints, and refusals are the CLI's error object
 //! returned as a tool error (`isError: true`), not a protocol error.
 
-use crate::agents::{ReadQuery, WaitTarget};
+use crate::agents::{ReadQuery, Settings, WaitTarget};
 use crate::model::{self, Caller, Error, ErrorCode, Outcome};
 use crate::ops::{
     self, DEFAULT_TIMEOUT, LS_LIMIT, LsArgs, MODELS_LIMIT, Models, ModelsArgs, NewArgs, READ_LIMIT,
@@ -106,6 +106,12 @@ struct SendParams {
     text: String,
     /// Add the message to the running turn. Defaults to false. Supported on Codex, OpenCode and Grok through a live leader. Refused when the session is idle.
     steer: Option<bool>,
+    /// Switch the session to this model ID (from `models`) from this message on. Only on sessions created by agent-talk.
+    model: Option<String>,
+    /// Switch the session to this effort value (from `models`) from this message on. Only on sessions created by agent-talk.
+    effort: Option<String>,
+    /// Give the session file edits, commands and network access without approval prompts, from this message on. Only on sessions created by agent-talk. Cannot be turned off again.
+    full_access: Option<bool>,
     /// Wait for the turn to end and include its result. Defaults to false.
     wait: Option<bool>,
     /// Seconds to wait when wait=true. Defaults to 600. Use a shorter limit than the client's tool timeout to leave time for a response. On Grok without a leader, this timeout cancels a running turn.
@@ -276,10 +282,12 @@ impl Server {
             agent: p.agent,
             cwd: PathBuf::from(p.cwd),
             prompt: p.prompt,
-            model: p.model,
             name: p.name,
-            effort: p.effort,
-            full_access: p.full_access.unwrap_or(false),
+            settings: Settings {
+                model: p.model,
+                effort: p.effort,
+                full_access: p.full_access.unwrap_or(false),
+            },
             wait: wait_for(p.wait, p.timeout_s),
             from: self.sender(&meta),
         }))
@@ -290,7 +298,7 @@ impl Server {
         title = "Send message",
         output_schema = schema_for_type::<Outcome>(),
         annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = false),
-        description = "Continue an existing session by sending a message. On Codex, OpenCode and Grok through a live leader, a message sent during a turn is queued by default. Returns a receipt. With wait=true, waits for the turn to end and includes its result, with the reply in turn.final_text. With wait=false, Codex and OpenCode return after accepting the message. Claude Code, Grok and Antigravity still wait for the turn to end. One OpenCode reply can cover several queued messages. Use read to see them in the conversation."
+        description = "Continue an existing session by sending a message. On Codex, OpenCode and Grok through a live leader, a message sent during a turn is queued by default. model, effort and full_access change the session's settings first; they work only on sessions created by agent-talk and not with steer. Returns a receipt. With wait=true, waits for the turn to end and includes its result, with the reply in turn.final_text. With wait=false, Codex and OpenCode return after accepting the message. Claude Code, Grok and Antigravity still wait for the turn to end. One OpenCode reply can cover several queued messages. Use read to see them in the conversation."
     )]
     async fn send(
         &self,
@@ -301,6 +309,11 @@ impl Server {
             handle: p.handle,
             text: p.text,
             steer: p.steer.unwrap_or(false),
+            settings: Settings {
+                model: p.model,
+                effort: p.effort,
+                full_access: p.full_access.unwrap_or(false),
+            },
             wait: wait_for(p.wait, p.timeout_s),
             from: self.sender(&meta),
         }))

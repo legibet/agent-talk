@@ -9,8 +9,9 @@ heading; facts only read in agent source or documentation are marked as such.
 
 In: Codex (shared app-server daemon), Claude Code (`claude -p`), OpenCode 2.x (shared background
 service; 1.x is not supported), Grok CLI (ACP to `grok agent stdio`, through the shared leader
-when one runs), Antigravity CLI (`agy -p`); a CLI and an MCP server exposing the same operations; sender
-attribution and a provenance header for agent-to-agent traffic; a hop limit.
+when one runs), Antigravity CLI (`agy -p`), pi (`pi --mode json`); a CLI and an MCP server
+exposing the same operations; sender attribution and a provenance header for agent-to-agent
+traffic; a hop limit.
 
 Out: an agent-talk daemon, GUI, PTY or terminal scraping, remote hosts, worktree management,
 anything undocumented or that impersonates an interactive user, approving tool calls on anyone's
@@ -25,7 +26,7 @@ behalf, deleting sessions.
 3. **Declare the limits.** `agent-talk status` prints what the installed CLI and the running daemon
    or service can do. Unsupported cases fail with a stable error code, never a silent downgrade.
 4. **The user's install and login.** Same binaries, same accounts, same permission defaults,
-   unless `new --full-access` asks for more.
+   unless `--full-access` asks for more.
 5. **Thin.** Normalize only conversation-level events (text, role, phase, turn boundaries,
    approval requests). Everything else passes through as raw agent JSON behind `read --raw`.
 6. **Receipts, not assumptions.** Every mutation returns a receipt stating what was accepted. A
@@ -44,7 +45,7 @@ State lives where the agent already keeps it:
 | Grok, leader live                                    | shared leader process               | per command: a `grok agent --leader stdio` child (ACP)    |
 | Claude, Grok without leader, Antigravity, pi (owned) | nobody between turns; files on disk | one agent child per mutation                              |
 | Claude, Grok, Antigravity TUI (foreign)              | the user's terminal process         | read-only                                                 |
-| pi TUI (foreign)                                     | the user's terminal process         | undetectable; a send forks the session (§6.6)             |
+| pi TUI (foreign)                                     | the user's terminal process         | undetectable; a send branches the session (§6.6)          |
 
 "Owned" means agent-talk started the session; the `owned` table records creation, not current
 exclusivity. The CLI process is short-lived, but within one command it owns a live connection
@@ -61,11 +62,10 @@ belongs there, not in a system daemon (§7).
   text when it differs (provenance header), sender, hop depth.
 - `receipts`: `pending | accepted | unknown | rejected`, queue id, turn id, item id, agent error.
   Intent and receipt are written in one transaction.
-- `owned`: sessions agent-talk started (handle, cwd, start arguments).
+- `owned`: sessions agent-talk started (handle, cwd, settings).
 - `processes`: agent children spawned for an intent (receipt, handle, pid): `claude -p`, a
   direct-mode `grok agent`, `agy -p`, `pi --mode json`. This is how later commands tell an
-  agent-talk run from a
-  foreign writer.
+  agent-talk run from a foreign writer.
 - `approvals`: every approval request seen and what happened to it.
 
 Claude, Grok (direct mode), Antigravity and pi sessions are also locked with OS file locks,
@@ -105,8 +105,8 @@ agent-talk's semantics and is implemented once in `agents/mod.rs`. One exception
 adapter whose child failed to spawn or exited before taking the message settles the receipt
 `rejected` itself, since nothing ran. Adapters supply discovery, submission, event source,
 history lookup and message normalization. Observe loops stay per adapter because the authority
-for "the turn ended" differs: an agent event in Codex, a re-read of history in OpenCode, the `-p`
-process in Claude and Antigravity, the `session/prompt` response in Grok (§7).
+for "the turn ended" differs: an agent event in Codex, a re-read of history in OpenCode, the child
+process and its run log in Claude, Antigravity and pi, the `session/prompt` response in Grok (§7).
 
 Agent responses are decoded into narrow types only where a decode failure must be an error
 (correlation ids, turn status, pages of correlated objects); everything displayed or passed
@@ -145,15 +145,14 @@ the agent runtime injected (task notifications, system messages).
 
 ### Receipts
 
-`new` and `send` write the intent, submit, and mark the receipt `accepted` with the agent's ids.
-An agent refusal marks it `rejected` (also later, when a run log proves the message was never
-taken). When observation ends without a result (deadline, Ctrl-C or SIGTERM, transport loss,
-HTTP 5xx) a `pending` receipt becomes `unknown`; the error carries the receipt, the approvals seen
-so far, and a `state`: `pending` (queued, not running), `running`, `waiting` (an approval is
-unanswered) or `unknown`. `rejected` and `unknown` are reachable only from `pending`; any later proof of delivery
-(history, queue, inbox, run log) moves a receipt to `accepted` and fills in its ids. `wait
---receipt R` or `wait --turn T` resolves it later; both attach the receipt when one exists for
-that turn.
+`new` and `send` write the intent, submit, and mark the receipt `accepted` with the agent's ids. An
+agent refusal marks it `rejected` (also later, when a run log proves the message was never taken).
+When observation ends without a result (deadline, Ctrl-C or SIGTERM, transport loss, HTTP 5xx) a
+`pending` receipt becomes `unknown`; the error carries the receipt, the approvals seen so far, and a
+`state`: `pending` (queued, not running), `running`, `waiting` (an approval is unanswered) or
+`unknown`. `rejected` and `unknown` are reachable only from `pending`; any later proof of delivery
+(history, queue, inbox, run log) moves a receipt to `accepted` and fills in its ids. `wait --receipt
+R` or `wait --turn T` resolves it later; both attach the receipt when one exists for that turn.
 
 ### Approvals
 
@@ -174,15 +173,25 @@ for all. agent-talk never accepts.
 Requests answered by someone else become `resolved`; denials made by the agent CLI itself are
 recorded as `denied`.
 
-### Full access
+### Settings
 
-`new --full-access` (MCP `full_access`) gives a new session every permission and no approval
-prompts: Codex `sandbox: danger-full-access`, Claude `--permission-mode bypassPermissions`,
-OpenCode a session rule allowing every action, Grok `_meta.yoloMode: true`, Antigravity
+`--model`, `--effort` and `--full-access` (MCP `model`, `effort`, `full_access`) are a
+session's settings. `new` sets them. `send` changes them from its message on, only on a session
+agent-talk started and not with `--steer`, which has no turn of its own; otherwise it is
+refused with `E_PRECONDITION`. A value equal to the stored one is no change.
+
+agent-talk stores the settings of the sessions it started and passes again on each send what
+the agent does not keep between turns (§6). The agent itself keeps a model change on every agent
+but Antigravity, an effort change on Codex, OpenCode and Grok, and full access on OpenCode; the
+user's own client then sees the change too. A change the agent refused is taken back from
+agent-talk's store.
+
+Full access gives a session every permission and no approval prompts: Codex
+`sandbox: danger-full-access`, Claude `--permission-mode bypassPermissions`, OpenCode a session
+rule allowing every action, Grok `_meta.yoloMode: true`, Antigravity
 `--dangerously-skip-permissions`; pi has no permission prompts to lift. Without it the session
-runs under the agent's own configuration. The choice is stored with the owned session and applied again on every send,
-because Claude and Antigravity take it per process, a resumed Codex thread falls back to the
-daemon's sandbox once it has unloaded, and a direct-mode Grok load starts a new process.
+runs under the agent's own configuration. Once given it is not taken back, and a Grok session
+resident in a leader cannot be given it (§6.4).
 
 ### Provenance and loops (best-effort)
 
@@ -210,9 +219,9 @@ Sender identity, in priority order:
    are inherited: a Codex daemon started from a Claude shell carries an unrelated
    `CLAUDE_CODE_SESSION_ID`.
 3. CLI from an agent's shell: `CODEX_THREAD_ID`, `OPENCODE_SESSION_ID`, `GROK_SESSION_ID`,
-   `ANTIGRAVITY_CONVERSATION_ID`, `PI_SESSION_ID`, then `CLAUDE_CODE_SESSION_ID`. The first five
-   are set by their agent for that one session's shell; Claude's is inherited, so it goes last. A daemon or
-   service started from another agent's shell still carries that agent's variable, which the
+   `ANTIGRAVITY_CONVERSATION_ID`, `PI_SESSION_ID`, then `CLAUDE_CODE_SESSION_ID`. The first five are
+   set by their agent for that one session's shell; Claude's is inherited, so it goes last. A daemon
+   or service started from another agent's shell still carries that agent's variable, which the
    order cannot detect.
 4. `unknown`.
 
@@ -223,11 +232,12 @@ delivered one. All of this is attribution, not authenticated identity.
 
 ### MCP server
 
-`agent-talk mcp [--caller H]` is an ordinary stdio MCP server that the user
-configures once, globally; agent-talk never writes agent configuration or injects itself into
-sessions. It serves `models / ls / new / send / read / wait` with the JSON the CLI prints under `--json`;
-refusals are tool errors (`isError`), not protocol errors. `new` takes `full_access` as on the
-CLI, and requires `cwd`, because the server's working directory is not the caller's.
+`agent-talk mcp [--caller H]` is an ordinary stdio MCP server that the user configures once,
+globally; agent-talk never writes agent configuration or injects itself into sessions. It serves
+`models / ls / new / send / read / wait` with the JSON the CLI prints under `--json`; refusals are
+tool errors (`isError`), not protocol errors. `new` and `send` take `model`, `effort` and
+`full_access` as on the CLI; `new` requires `cwd`, because the server's working directory is not the
+caller's.
 
 Code-mode clients (Codex for its gpt-6 models, OpenCode, pi) call tools from a script and pass
 results on without the model reading them, so every tool declares an `outputSchema` generated
@@ -249,7 +259,8 @@ agent-talk models A [QUERY] [--limit N] [--cursor C]
 agent-talk ls [--agent A] [--cwd DIR] [--all] [--limit N] [--cursor C]
 agent-talk new A "prompt" [--cwd DIR] [--name N] [--model M] [--effort E] [--full-access]
     [--wait] [--timeout S] [--from H]
-agent-talk send H "text" [--steer] [--wait] [--timeout S] [--from H]
+agent-talk send H "text" [--steer] [--model M] [--effort E] [--full-access] [--wait] [--timeout S]
+    [--from H]
 agent-talk read H [--limit N] [--cursor C] [--all] [--raw]
 agent-talk wait H (--turn ID | --receipt R) [--timeout S]
 agent-talk mcp [--caller H]
@@ -268,11 +279,9 @@ agent-talk mcp [--caller H]
   Grok, Antigravity and pi, inside the same execution on OpenCode. `--steer` joins the running turn
   (Codex, OpenCode, Grok through a live leader) and is refused when the session is idle.
 - `new --cwd` defaults to the current directory.
-- `new --model` and `--effort` pass through unvalidated in the agent's syntax (OpenCode
-  `--model` is `provider/model`). The effort belongs to the session: later sends keep it and
-  cannot change it. Claude and Antigravity take both per process, so sends to a session
-  agent-talk started pass the model and effort `new` recorded again; the other agents store them
-  with the session (§6).
+- `--model` and `--effort` pass through unvalidated in the agent's syntax (OpenCode `--model`
+  is `provider/model`). On `send` they, and `--full-access`, change the session's settings
+  (§4).
 - `models A` lists what those two options take on one agent: `{id, efforts}` rows sorted by id,
   `efforts` being the values `--effort` accepts with that model (empty when it has none). QUERY
   keeps the ids containing it, case-insensitively; `--limit`/`--cursor` page, the cursor being
@@ -284,8 +293,8 @@ agent-talk mcp [--caller H]
   aliases and effort levels `claude --help` names, the one model list agent-talk carries itself.
 - `new --name N` stores a title at the agent (Codex thread name, Claude `custom-title` line,
   OpenCode `title`, Grok `_x.ai/session/rename`, pi `--name`; Antigravity has no interface outside
-  the TUI and refuses). agent-talk keeps no copy. `ls` shows `name` and strips the provenance header from
-  `preview`, so a session an agent created is recognizable without reading its history.
+  the TUI and refuses). agent-talk keeps no copy. `ls` shows `name` and strips the provenance header
+  from `preview`, so a session an agent created is recognizable without reading its history.
 - `read` returns the newest N messages, oldest first, and `next_cursor` names the page of older
   ones. By default a message is a `prompt` (what a person or an agent sent) or a `final` reply, so
   a page is the conversation itself; `--all` adds `commentary` and `other` messages, each tool call
@@ -300,7 +309,8 @@ Errors carry the agent's `code`/`message`/`data` under `agent_error` when there 
 ```
 E_NO_DAEMON     Codex socket absent; OpenCode registration missing, stale, or its pid gone
 E_CAP_MISSING   a required agent capability is missing (Codex queue methods, `claude agents`)
-E_PRECONDITION  agent rejected (stale turn id, idle steer, unknown session or receipt)
+E_PRECONDITION  agent rejected (stale turn id, idle steer, unknown session or receipt), or a
+                settings change §4 does not allow
 E_LOCKED        another agent-talk command or child holds the session (Claude, direct Grok,
                 Antigravity, pi)
 E_FOREIGN_LIVE  held by a process agent-talk cannot talk to (Claude TUI, Grok TUI outside the
@@ -338,13 +348,18 @@ intent; `wait` leaves its receipt as it was).
 **Threads and history.**
 
 - `thread/start` inherits the daemon's sandbox, MCP servers and hooks; agent-talk sets
-  `approvalPolicy: never`, and `sandbox: danger-full-access` for full access. After about 60 s
-  without a subscriber an idle thread unloads, and a `thread/resume` without parameters then
-  restores the daemon's sandbox but keeps the approval policy (codex 0.160.1), so every resume of
-  a full-access thread passes the sandbox again. `thread/queue/add` takes neither. It has no
-  effort parameter but accepts `config.model_reasoning_effort`; agent-talk sends `--effort` as
-  `turn/start.effort` instead (a model-specific string), which also applies to the thread's later
-  turns. An invalid value is accepted and fails the turn with the model's enum error.
+  `approvalPolicy: never`, and `sandbox: danger-full-access` for full access. It has no effort
+  parameter (it accepts `config.model_reasoning_effort`); agent-talk sends `--effort` as
+  `turn/start.effort` (a model-specific string). An invalid value is accepted and fails the turn
+  with the model's enum error.
+- `turn/start` takes `model`, `effort`, `sandboxPolicy` (`{type: dangerFullAccess}` for full
+  access) and `approvalPolicy`; what it sets becomes the thread's setting for every later turn
+  (`thread/settings/updated`, the rollout's `turn_context`; daemon 0.161.0). Model, effort and
+  approval policy survive unloading (state DB). The sandbox does not: after an unload a
+  `thread/resume` without parameters restores the daemon's sandbox (codex 0.160.1), so every
+  resume of a full-access thread passes it again. On a loaded busy thread `thread/resume`
+  ignores `sandbox` (0.161.0). `thread/queue/add` accepts all four fields and silently ignores
+  them (0.161.0).
 - `thread/name/set` fails for a moment after `turn/start` (empty rollout), so `new` names the
   thread between `thread/start` and `turn/start`.
 - History (`thread/turns/list`, `itemsView: full`) needs no resume and works on not-loaded
@@ -365,8 +380,13 @@ intent; `wait` leaves its receipt as it was).
 
 **Turns and sending.**
 
-- A busy `turn/start` creates no turn: its input is folded into the active turn and displaces the
-  original answer. Only `new` uses it, on the thread it just created.
+- A busy `turn/start` is not refused and creates no turn: its input is folded into the active turn
+  and displaces the original answer, and its settings become the thread's at once
+  (`thread/settings/updated` during the running turn, 0.161.0). `new` uses it on
+  the thread it just created, and `send` for a message that changes model, effort or full access,
+  since the queue cannot carry the change; such a send is refused with `E_PRECONDITION` while the
+  resume response shows a turn in progress. A turn that starts between that resume and
+  `turn/start` (a queued one, or another client's) is joined; the window is not closed.
 - Steer is `turn/steer {expectedTurnId}` with the newest turn from the resume response; the input
   lands at the next model step.
 - Queue is `thread/resume`, then `thread/queue/add`, which the daemon drains FIFO as separate
@@ -442,13 +462,15 @@ next one at Claude's discretion, so there is no steer (`E_NO_STEER`).
 **Approvals.** In `-p` Claude denies a tool that would prompt and tells the model
 (`result.permission_denials`); nothing pends. agent-talk records these as `denied`, and on
 sessions it started adds `--permission-prompts none`, which also tells the model not to retry.
-`--permission-mode` is not kept across `--resume` (the user's `defaultMode` applies again,
-claude 2.1.291), so every send to a full-access session passes `bypassPermissions`. `--effort` is
-not kept across `--resume` either and is passed again like the model; `CLAUDE_CODE_EFFORT_LEVEL`
-in the environment silently overrides `--effort`, so a child given `--effort` runs without it
-(claude 2.1.291).
 `--permission-prompt-tool stdio` would block on a `control_request` until answered on stdin, so it
 is not used.
+
+**Settings.** `--permission-mode` and `--effort` are not kept across `--resume` (the user's
+`defaultMode` applies again; claude 2.1.291), so every send passes them again from the session's
+settings. `CLAUDE_CODE_EFFORT_LEVEL` in the environment silently overrides `--effort` (claude
+2.1.291). The model is kept: `--resume` restores the newest assistant message's `message.model`
+from the transcript unless `--model` is given (claude 2.1.292), so `send` passes `--model` only
+to change it, and the change also reaches the user's TUI on its next resume.
 
 **Identity.** Claude speaks MCP 2026-07-28 without `initialize`; `tools/call` `_meta` has no session
 id. Claude sets `CLAUDE_CODE_SESSION_ID` in each MCP server's environment to the spawning process's
@@ -508,6 +530,30 @@ execution; on an idle session either starts an execution at once. Idle steer is 
 just starting. Queue items pending at a user interrupt stay dormant until another execution;
 after a `shutdown` interrupt they run at once in a successor. One reply can cover several messages.
 
+**Changing settings.** The session stores its model, variant and rules, so `send --model`,
+`--effort` and `--full-access` change the session itself, before the message is recorded: a
+refused change is a plain error without a receipt. The new value holds for every later prompt
+until changed again, and the service reads it at each step, so it also covers the rest of an
+execution already running and the prompts queued behind it (verified on 2.0.23).
+
+- Model and effort: `POST /api/session/{id}/model {model: {providerID, id, variant?}}`. The
+  prompt has no model field; one passed is silently dropped. An effort alone keeps the session's
+  model (`GET /api/session/{id}`; a session created without one has none, and then gets the user's
+  default as on `new`); a model alone keeps the stored effort as its variant. Omitting the
+  variant, or `"default"`, selects the default variant. Unknown models and variants are accepted
+  (204) and fail in the turn, as on `new`. A switch that changes something writes a
+  `model-switched` row `{model, previous}` (shown by `read --raw` only); an unchanged value writes
+  nothing.
+- Full access: `PATCH /api/session/{id} {permissions}` with the rules `new --full-access` sets.
+  The PATCH changes only `title`, `metadata` and `permissions` (`additionalProperties: false`);
+  `permissions: null` is a no-op, `[]` clears them. Checks read the ruleset live, but a request
+  already pending is not re-evaluated. The toolset is recomputed from the rules at each step, and
+  a changed one is written as a `system` row into history and the model's context (about 8.7 KB
+  for allow-all, which also enables tools the user's configuration denies). A model that was
+  refused a tool earlier in the session can go on treating it as missing (deepseek-flash, 2.0.23).
+- The TUI uses the session's stored model and follows a switch live; the session's rules apply
+  to the turns it starts too.
+
 **Approvals.** `permission.asked` goes to every subscriber and is not replayed, so agent-talk also
 lists `GET /api/session/{id}/permission`. An unanswered request blocks with no timeout. `reject`
 with a `message` hands the text to the model and the execution continues; a message-less `reject`
@@ -538,7 +584,10 @@ start keep their rules.
 
 Requests that still reach agent-talk (a plugin hook can turn an answer into `ask`) get `reject`
 with a message, and only once its own message was delivered (earlier requests belong to the
-execution ahead of it).
+execution ahead of it). A TUI with `session.permissions: "autoaccept"` (its `cli.json` setting)
+answers `once` to every pending request of the session it displays and of its sub-sessions
+(read in source, 2.0.23), so while such a TUI shows a session agent-talk started, its requests
+are approved, not rejected.
 
 **Identity.** Shell commands get `OPENCODE_SESSION_ID`, overwriting an inherited value. MCP
 `tools/call` carries `_meta["ai.opencode/sessionID"]`: read in source and docs, never observed
@@ -557,8 +606,7 @@ shared leader, where sessions behave like Codex threads in the daemon. Otherwise
 - `--leader` with no live socket spawns a persistent leader, so agent-talk passes it only after a
   connect succeeded. If the leader exits between probe and child, Grok spawns a new one;
   agent-talk compares the pid in the lock file next to the socket before and after and reports a
-  change. The default lock is `leader.lock`; that `x.sock` locks at `x.lock` is the adapter's
-  assumption, not observed.
+  change. The default lock is `leader.lock`; a custom socket `x.sock` locks at `x.lock`.
 - Only `ENOENT`, `ECONNREFUSED` (a stale socket) and a path too long for `SUN_LEN` select direct
   mode; `EPERM`/`EACCES` (a sandbox) is `E_TRANSPORT`.
 - The child gets `GROK_DISABLE_AUTOUPDATER=1` (`grok agent` has no `--no-auto-update`).
@@ -605,6 +653,13 @@ leader check, since clients of one leader do not exclude each other.
   reasoning_effort value"`; `new` then fails with `E_PRECONDITION` before recording anything, and
   the error names the new session, which stays on disk without messages and which `grok sessions
   delete` removes (agent-talk deletes nothing, §7).
+- `send --model` / `--effort`: `session/set_config_option` with `configId: "model"` /
+  `"reasoning_effort"` after `session/load`, direct and through a leader. Grok writes the value to
+  `summary.json` at once, and every later load, by any process or client, runs with it; changing
+  the model keeps the effort, and a process's `-m` does not override the stored model in direct
+  mode, so later sends pass neither again. Through a leader the change applies to the next
+  prompt of every attached client. A refusal fails the send with `E_PRECONDITION` before
+  anything is recorded; a value Grok already accepted stays (§8).
 - Queue: `session/load` plus `session/prompt`, through a leader only when `_x.ai/sessions/list`
   there shows the session `resident` (a listed but dormant session may be held in-process by a
   TUI). That list's `activity` and `resident` describe the answering process, so they mean
@@ -617,19 +672,21 @@ leader check, since clients of one leader do not exclude each other.
   `E_PRECONDITION` when idle). It has no client id and no expected-turn check: the ack is
   acceptance, the turn comes from `_x.ai/session/interjection`, and if the turn ended meanwhile
   Grok starts a fallback turn (`interject-fallback-...`) that the receipt then names.
-- In direct mode the turn dies with the child (closing stdin ends it within about two seconds,
-  with no `turn_completed`), and a `session/cancel` sent before `runningPromptId` names the prompt
-  is ignored. So the command runs until the turn ends even without `--wait`; when a deadline,
-  Ctrl-C or SIGTERM ends it, agent-talk waits up to 10 s for the prompt to run, sends
-  `session/cancel` and waits for the `cancelled` response. Through a leader the turn continues after the command.
+- In direct mode the turn dies with the child (closing stdin ends it within about two seconds, with
+  no `turn_completed`), and a `session/cancel` sent before `runningPromptId` names the prompt is
+  ignored. So the command runs until the turn ends even without `--wait`; when a deadline, Ctrl-C or
+  SIGTERM ends it, agent-talk waits up to 10 s for the prompt to run, sends `session/cancel` and
+  waits for the `cancelled` response. Through a leader the turn continues after the command.
 - `wait` on a turn agent-talk is not running polls `updates.jsonl` for its `turn_completed`; a
   direct child that exited without one leaves the turn `interrupted` or `unknown`.
 
 **Approvals.** The user's `permission_mode` (`always-approve` on this machine) applies to ACP
 sessions, and agent-talk keeps it. On sessions it started agent-talk answers `reject_once` to this
 prompt's requests, matched by `toolCallId`. Full access sends `_meta.yoloMode: true` on
-`session/new` and on a direct-mode `session/load`; it has no effect on a session resident in a
-leader. `session/request_permission` goes to every attached client with one id; the first
+`session/new` and on a direct-mode `session/load`. It holds for that process only and is never
+stored, so every direct-mode send passes it again. It has no effect on a session resident in a
+leader, so `send --full-access` there is refused with `E_UNSUPPORTED` before anything is
+recorded. `session/request_permission` goes to every attached client with one id; the first
 answer wins, `reject_once` ends the turn `cancelled`. An unanswered request was still pending after
 25 s. Which commands prompt with yolo off varied between runs on 1.0.46, and later runs provoked
 none, so the deny and observe paths rest on frames captured earlier.
@@ -676,7 +733,7 @@ no way to join a conversation another process holds.
   stdin. The intent is written once `init` names the conversation, before the message, so a
   deadline before `init` leaves no receipt and possibly an empty conversation.
 - `--model <alias>` without `--effort` fails before `init`, and a resumed conversation forgets its
-  model, so `send` reuses the model and effort `new` recorded. `agy models` prints one
+  model and effort, so `send` passes the session's settings again (§4). `agy models` prints one
   `<alias>-<effort>\t<name> (<Effort>)` line per combination; `models` folds them into the alias
   with its efforts.
 - `--conversation <unknown id>` silently starts a new conversation, so `send` checks that the
@@ -723,15 +780,15 @@ servers are configured globally only.
 
 ### 6.6 pi (1.0.3)
 
-**Transport.** Owned processes only: one `pi --mode json` process per `new` (`--session-id
-<uuid>`, `--model`, `--thinking`, `--name`) or `send` (`--session <file>`), the prompt on its
-stdin. pi reads piped stdin to EOF as the prompt, so the text never meets argument parsing
-(`@file`, options), and json mode would wait for that EOF anyway. stdout is JSONL events, written
-to a run log; the process runs the turn to `agent_settled` and exits, so `send` is synchronous.
-`--mode rpc` is not used: closing its stdin or SIGTERM aborts the running turn without
-persisting the partial reply (the turn would die with the command, as in direct Grok), SIGINT is
-unhandled, and what it adds (steer, abort, `get_entries`) is reachable only from the process
-that holds its stdin, never from a later command.
+**Transport.** Owned processes only: one `pi --mode json` process per `new` (`--session-id <uuid>`,
+`--model`, `--thinking`, `--name`) or `send` (`--session <file>`, settings below), the prompt on its
+stdin. pi reads piped stdin to EOF as the prompt, so the text never meets argument parsing (`@file`,
+options), and json mode would wait for that EOF anyway. stdout is JSONL events, written to a run
+log; the process runs the turn to `agent_settled` and exits, so `send` is synchronous. `--mode rpc`
+is not used: closing its stdin or SIGTERM aborts the running turn without persisting the partial
+reply (the turn would die with the command, as in direct Grok), SIGINT is unhandled, and what it
+adds (steer, abort, `get_entries`) is reachable only from the process that holds its stdin, never
+from a later command.
 
 **Sessions and turns.**
 
@@ -750,10 +807,12 @@ that holds its stdin, never from a later command.
   ancestry; `read` and foreign `wait` follow it.
 - The turn id is the user message's entry id (8 hex characters). pi appends the entry before
   it writes the user `message_end` event, so the receipt is accepted at that event and the entry
-  found by its `message.timestamp` and text. Model, thinking level and name are entries the
-  first run writes and later loads restore, so `send` passes none of them (`--thinking` on a
-  resumed session is not persisted; a saved model without credentials makes pi fall back to
-  another).
+  found by its `message.timestamp` and text. A resumed session takes the model of its newest
+  `model_change` entry or assistant message, whichever is later (one without credentials makes
+  pi fall back to another), and the thinking level of its newest `thinking_level_change` entry,
+  which only a new session writes. `send` therefore passes `--model` only to change it, and
+  `--thinking` from the session's settings on every run. The level pi records is the model's own
+  mapping of the one asked (deepseek-flash records `high` for `medium`, 1.0.3).
 - An own turn ends at `agent_settled`; its status is the newest assistant message's
   `stopReason`: `stop` or `length` completed, `error` failed, `aborted` interrupted (an abort
   during a tool call records `error`, "This operation was aborted"). While the process lives,
@@ -810,6 +869,11 @@ the server is pinned with `--caller`.
   were tested on 2026-10-06 and left out: only Claude could enforce one with web tools allowed,
   Codex loses the sandbox when a thread unloads and the queue path cannot carry it, OpenCode's
   shell bypasses its edit rules, and Grok and Antigravity have no per-session control.
+- **Settings change only where agent-talk started the session.** `send --model/--effort/
+  --full-access` change the session as the agent's own client would, and the agent decides what
+  stays (§4). On other sessions the settings stay the user's: on every agent but Antigravity a
+  model given for one turn stays with the session (probes of 2026-10-07), so there is no
+  per-turn override to offer.
 - **Delete nothing.** No session, conversation or agent file is ever deleted, on any agent.
 - **Agent multi-client processes are joined, never started.** Codex daemon, OpenCode service,
   Grok leader: agent-talk connects when they are live and takes the agent's single-process path
@@ -824,9 +888,10 @@ the server is pinned with `--caller`.
   Codex turn id, Claude user-line uuid, OpenCode user message id, Grok `promptId`, Antigravity
   `USER_INPUT` step index, pi user entry id (matched to the run-log event by timestamp and
   text, but pi's id) (§6).
-- **History is paged to the answer.** `read` and turn attribution follow the agent's cursor,
-  newest first, until the page is full, the rows are found or history ends. The only fixed caps are the 40 pages an
-  OpenCode turn lookup searches (older messages report absent) and the ten Codex resume retries.
+- **History is paged to the answer.** `read` and turn attribution follow the agent's cursor, newest
+  first, until the page is full, the rows are found or history ends. The only fixed caps are the 40
+  pages an OpenCode turn lookup searches (older messages report absent) and the ten Codex resume
+  retries.
 - **Shared lifecycle, separate observe loops.** Receipt and approval handling lives once; a generic
   event-loop driver would hide genuinely different end-of-turn authorities behind mode flags.
 - **OpenCode asks become denials by copying the default agent's rules from the first `ask` on**,
@@ -865,7 +930,8 @@ the server is pinned with `--caller`.
   messages share the turn id). A thread written by another app-server process is refused only at
   `thread/resume`, and `ls` does not show which process holds it. Only `send` starts a dormant
   queued item; `wait --receipt` on one left dormant earlier reports it `pending`. How a terminal TUI
-  renders a decline from agent-talk is unverified.
+  renders a decline from agent-talk is unverified. `send` changing settings was exercised live
+  for effort and full access, not for the model.
 - `status` marks a Codex method unavailable only when the daemon reports it missing; any other
   refusal of the probe on a dummy thread counts as available.
 - Sender attribution cannot detect a daemon or service started from another agent's shell; the
@@ -885,17 +951,22 @@ the server is pinned with `--caller`.
   rules, which decide over the sub-agent's own from the default agent's first `ask` on. The rules
   are a copy taken at `new`: later changes to the user's configuration do not reach the session,
   and approvals saved with `always` and plugin permission hooks no longer turn an `ask` into
-  `allow` there.
+  `allow` there. A TUI with `session.permissions: "autoaccept"` that displays the session
+  answers `once` to its requests (§6.3).
+- OpenCode and Grok apply a settings change before the message is submitted; when the message
+  is then refused, the session keeps the change and agent-talk takes back only its own stored
+  settings.
 - Grok: `reject_once`, an unanswered request and the `session/cancel` at the deadline rest on
-  captured frames, not re-verified; whether a TUI renders live a turn another
-  leader client ran; leader behaviour with a grok.com subscription login (it may open a relay);
-  the lock path of a custom leader socket is assumed.
+  captured frames, not re-verified; whether a TUI renders live a turn another leader client ran;
+  leader behaviour with a grok.com subscription login (it may open a relay). Full access cannot
+  be given to a session resident in a leader (§6.4).
 - pi: a session open in a TUI cannot be detected, so `send` to it branches the conversation:
   the TUI neither shows the message nor its reply, and whichever process writes last decides the
   branch the next load continues. agent-talk cannot continue its own branch instead: moving the
-  leaf in place is open to extensions (`navigateTree`) only, not to the CLI or RPC. Turn ends of sessions agent-talk did not start are read
-  from the file, best effort (no marker separates a turn still running from one whose
-  process died, and a steer message reads as a new prompt). `models` parses a padded table.
+  leaf in place is open to extensions (`navigateTree`) only, not to the CLI or RPC. Turn ends of
+  sessions agent-talk did not start are read from the file, best effort (no marker separates a
+  turn still running from one whose process died, and a steer message reads as a new prompt).
+  `models` parses a padded table.
   A custom flat session directory (`--session-dir`, `PI_CODING_AGENT_SESSION_DIR`, the
   `sessionDir` setting) makes agent-talk refuse pi operations rather than read it; nobody has
   asked for it. Whether a `--session-id` pi did not create itself, and the `wx` exclusive

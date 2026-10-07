@@ -13,8 +13,9 @@ use std::process::{ExitStatus, Stdio};
 use tokio::process::Child;
 
 /// `pi --mode json` arguments for one turn; `session` is `--session-id <id>` for a new
-/// session or `--session <path>` to resume one. Model, thinking level and name are stored
-/// in the session file by the first run, so only `new` passes them (DESIGN.md §6.6).
+/// session or `--session <path>` to resume one. A resumed session takes the model of its
+/// newest assistant message, but the thinking level only from a `thinking_level_change`
+/// entry, which only the first run writes (DESIGN.md §6.6).
 pub fn args(
     session: [&str; 2],
     model: Option<&str>,

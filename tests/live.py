@@ -334,6 +334,10 @@ def offline():
     def o4():
         out = cli("send", f"claude:{uuid.uuid4()}", "x", "--steer", env={"HOME": T}, expect_exit=2)
         expect(err(out).get("code") == "E_NO_STEER", "E_NO_STEER")
+        out = cli("send", f"claude:{uuid.uuid4()}", "x", "--effort", "low", env={"HOME": T}, expect_exit=2)
+        expect(
+            err(out).get("code") == "E_PRECONDITION", "settings on a session agent-talk did not start: E_PRECONDITION"
+        )
 
     def o5():
         seed_max_hops("codex:x")
@@ -656,6 +660,24 @@ def codex_main():
         expect(out["turn"]["turn_id"] == r["turn_id"], "turn id == receipt.turn_id")
         expect("pear" in final(out), "final ~ pear")
 
+    def c5():
+        # A settings change on send goes out on turn/start; the thread keeps it for later
+        # turns, which the queue path does not carry (design 6.1).
+        out = codex_new("reply with the single word one", "--effort", "low", "--wait")
+        h = out["handle"]
+        out = cli("send", h, "reply with the single word two", "--effort", "medium", "--wait")
+        expect(not out["receipt"].get("queue_id"), "a change is sent with turn/start, not queued")
+        ctx = codex_turn_context(native(h), out["turn"]["turn_id"])
+        expect(ctx.get("effort") == "medium", f"changed turn runs at effort medium, got {ctx.get('effort')}")
+        out = cli("send", h, "reply with the single word three", "--wait")
+        ctx = codex_turn_context(native(h), out["turn"]["turn_id"])
+        expect(ctx.get("effort") == "medium", f"a later plain send keeps effort medium, got {ctx.get('effort')}")
+        # The user's daemon may already default to full access; this checks the turn's sandbox.
+        out = cli("send", h, "reply with the single word four", "--full-access", "--wait")
+        ctx = codex_turn_context(native(h), out["turn"]["turn_id"])
+        sandbox = (ctx.get("sandbox_policy") or {}).get("type")
+        expect(sandbox == "danger-full-access", f"full-access turn runs danger-full-access, got {sandbox}")
+
     def c7():
         need("A")
         p1 = cli("ls", "--agent", "codex", "--limit", "2")
@@ -683,6 +705,7 @@ def codex_main():
         ("C3g", c3g),
         ("C3h", c3h),
         ("C4", c4),
+        ("C5", c5),
         ("C7", c7),
         ("C9", c9),
     ):
@@ -924,7 +947,29 @@ def claude_tier():
         out = cli("wait", handle, "--turn", u, "--timeout", "10")
         expect(out["turn"]["status"] == "completed", "completed after F exits")
 
-    for name, fn in (("L1", l1), ("L2", l2), ("L3", l3), ("L4", l4), ("L5", l5), ("L6", l6)):
+    def l7():
+        # send --effort and --model change the session: the effort is passed again on later
+        # sends, the model Claude restores from the transcript.
+        need("S")
+
+        def last_effort():
+            lines = [json.loads(l) for l in claude_transcript(native(st["S"])).read_text().splitlines()]
+            return next(e.get("effort") for e in reversed(lines) if e.get("type") == "assistant")
+
+        out = cli("send", st["S"], "reply with the single word low", "--effort", "low", "--wait")
+        expect(last_effort() == "low", "send --effort low: the turn ran at low")
+        out = cli("send", st["S"], "reply with the single word kept", "--wait")
+        expect(last_effort() == "low", "a later send keeps low")
+        out = cli("send", st["S"], "reply with the single word haiku", "--model", "haiku", "--wait")
+        model = run_init("claude", out["receipt"]["receipt_id"]).get("model") or ""
+        expect("haiku" in model, f"send --model haiku: init model {model}")
+        out = cli("send", st["S"], "reply with the single word kept", "--wait")
+        model = run_init("claude", out["receipt"]["receipt_id"]).get("model") or ""
+        expect("haiku" in model, f"a later send keeps haiku, got {model}")
+        out = cli("send", st["S"], "x", "--steer", "--effort", "low", expect_exit=2)
+        expect(err(out).get("code") == "E_PRECONDITION", "--steer with a setting: E_PRECONDITION")
+
+    for name, fn in (("L1", l1), ("L2", l2), ("L3", l3), ("L4", l4), ("L5", l5), ("L6", l6), ("L7", l7)):
         check("claude", name, fn)
 
 
@@ -1094,6 +1139,51 @@ def opencode_tier():
         created["opencode"].append(native(out["handle"]))
         expect(not out["approvals"] and target.exists(), "file written without an approval request")
 
+    def variants(out: dict) -> set:
+        """Model variants of the assistant rows answering the user message of `out`'s turn."""
+        raw = cli("read", st["O"], "--raw", "--limit", "10")["raw"]
+        at = next(i for i, r in enumerate(raw) if r["id"] == out["turn"]["turn_id"])
+        return {(r.get("model") or {}).get("variant") for r in raw[at + 1 :] if r["type"] == "assistant"}
+
+    def p9():
+        # send --effort switches the session's variant (the prompt has no model field); the
+        # session keeps it for later sends.
+        need("O")
+        models = cli("models", "opencode", OPENCODE_MODEL)["models"]
+        efforts = next((m["efforts"] for m in models if m["id"] == OPENCODE_MODEL), [])
+        effort = next((e for e in efforts if e not in ("none", "default")), None)
+        if not effort:
+            raise Inconclusive(f"{OPENCODE_MODEL} lists no variant to switch to")
+        out = cli("send", st["O"], "reply with the single word pear", "--effort", effort, "--wait")
+        expect(variants(out) == {effort}, f"assistant rows use variant {effort}")
+        out = cli("send", st["O"], "reply with the single word fig", "--wait")
+        expect(variants(out) == {effort}, f"a plain send keeps variant {effort}")
+
+    def p10():
+        # send --full-access on a session started without it replaces the session's rules, so
+        # the write tool P6 shows denied writes without a permission request. A fresh session:
+        # in O the model takes P6's refusal as proof that the tool is missing.
+        out = cli(
+            "new", "opencode", "--cwd", str(DIR), "--model", OPENCODE_MODEL, "--wait", "reply with the single word plum"
+        )
+        h = out["handle"]
+        created["opencode"].append(native(h))
+        rules = opencode_api("GET", f"/api/session/{native(h)}")["data"].get("permissions") or []
+        if not any(r["action"] == "edit" and r["effect"] == "deny" for r in rules):
+            raise Inconclusive("the session's rules do not deny edit (the user's rules do not ask for it)")
+        target = DIR / "oc-full-send.txt"
+        target.unlink(missing_ok=True)
+        out = cli("send", h, f"create {target} with your write tool, then reply done", "--full-access", "--wait")
+        raw = cli("read", h, "--raw", "--limit", "10")["raw"]
+        wrote = any(
+            p.get("type") == "tool" and p.get("name") == "write" and p["state"].get("status") == "completed"
+            for r in raw
+            if r["type"] == "assistant"
+            for p in r.get("content") or []
+        )
+        expect(not out["approvals"], "no approval request")
+        expect(wrote and target.exists(), "file written by the write tool")
+
     def m1():
         need("O")
         m = Mcp()
@@ -1123,6 +1213,8 @@ def opencode_tier():
         ("P6", p6),
         ("P7", p7),
         ("P8", p8),
+        ("P9", p9),
+        ("P10", p10),
         ("M1", m1),
     ):
         check("opencode", name, fn)
@@ -1344,7 +1436,26 @@ def grok_tier():
         yolo = grok_yolo(sid, home)
         expect(yolo == [True, True], f"yolo_mode on both turns, got {yolo}")
 
-    for name, fn in (("G1", g1), ("G2", g2), ("G3", g3), ("G4", g4), ("G5", g5), ("G6", g6), ("G7", g7), ("G8", g8)):
+    def g9():
+        # send --effort --full-access on G7's session (started without them, after G8 used it as
+        # the yolo-off control): session/set_config_option stores the effort in summary.json, and
+        # the turn runs with yolo from the direct-mode session/load.
+        need("G7")
+        home = Path(T) / "ghome"
+        summary = next((home / "sessions").glob(f"*/{st['G7']}/summary.json"))
+        if json.loads(summary.read_text()).get("reasoning_effort") == "low":
+            raise Inconclusive("G7's session already has effort low")
+        turns = grok_yolo(st["G7"], home)
+        args = ["send", f"grok:{st['G7']}", "reply with the single word three", "--effort", "low", "--full-access"]
+        out = cli(*args, "--wait", env={"GROK_HOME": str(home)})
+        expect(out["turn"]["status"] == "completed", "completed")
+        effort = json.loads(summary.read_text()).get("reasoning_effort")
+        expect(effort == "low", f"summary.json reasoning_effort == low, got {effort}")
+        yolo = grok_yolo(st["G7"], home)
+        expect(yolo == [*turns, True], f"one more turn_started, with yolo_mode, got {yolo}")
+
+    cases = (("G1", g1), ("G2", g2), ("G3", g3), ("G4", g4), ("G5", g5), ("G6", g6), ("G7", g7), ("G8", g8), ("G9", g9))
+    for name, fn in cases:
         check("grok", name, fn)
 
 
@@ -1608,6 +1719,23 @@ def antigravity_tier():
             "wait --receipt recovers the denials",
         )
 
+    def a10():
+        # send --full-access on a conversation started without it: this run and later ones pass
+        # --dangerously-skip-permissions (agy keeps no permission mode across runs).
+        need("AG")
+        target = DIR / "full-access.txt"
+        target.unlink(missing_ok=True)
+        out = cli(
+            "send",
+            st["AG"],
+            f"create the file {target} containing ok with your shell tool, then reply done",
+            "--full-access",
+            "--wait",
+        )
+        expect(out["turn"]["status"] == "completed", "completed")
+        expect(target.exists(), "file written without a permission request")
+        expect(not any(a["outcome"] == "denied" for a in out["approvals"]), "nothing denied")
+
     def a9():
         # new --full-access: --dangerously-skip-permissions on the first run and again on a later
         # send (agy keeps no permission mode across runs).
@@ -1627,6 +1755,7 @@ def antigravity_tier():
         ("A6", a6),
         ("A7", a7),
         ("A8", a8),
+        ("A10", a10),
         ("A9", a9),
     ):
         check("antigravity", name, fn)
@@ -1795,7 +1924,23 @@ def pi_tier():
         created["pi_receipts"].append(out["receipt"]["receipt_id"])
         expect(out["turn"]["status"] == "completed" and "pong" in final(out), "completed ~ pong")
 
-    for name, fn in (("P1", p1), ("P2", p2), ("P3", p3), ("P4", p4), ("P5", p5), ("P6", p6)):
+    def p7():
+        # send --effort changes the thinking level, which pi does not restore: agent-talk passes
+        # it again on later sends.
+        need("PI")
+
+        def last_level():
+            msgs = [e for e in pi_entries(native(st["PI"])) if e.get("type") == "message"]
+            return next(
+                e["message"].get("thinkingLevel") for e in reversed(msgs) if e["message"]["role"] == "assistant"
+            )
+
+        cli("send", st["PI"], "reply with the single word high", "--effort", "high", "--wait")
+        expect(last_level() == "high", "send --effort high: the reply records high")
+        cli("send", st["PI"], "reply with the single word kept", "--wait")
+        expect(last_level() == "high", "a later send keeps high")
+
+    for name, fn in (("P1", p1), ("P2", p2), ("P3", p3), ("P4", p4), ("P5", p5), ("P6", p6), ("P7", p7)):
         check("pi", name, fn)
 
 

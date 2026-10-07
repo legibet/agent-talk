@@ -22,7 +22,7 @@ use self::updates::{History, first_prompt};
 use super::{
     Agent, AgentStatus, ApprovalPolicy, Check, ListFilter, Operation, ReadPage, ReadQuery,
     SendRequest, StartRequest, WaitTarget, approval_policy, bounded, cli_version, cut, first_line,
-    full_access, lock, pid_alive, record, reject, settle, strip_provenance, wait_receipt,
+    lock, pid_alive, record, reject, settle, strip_provenance, wait_receipt,
 };
 use crate::model::{
     self, Approval, Error, ErrorCode, Model, Observations, Outcome, Page, ReceiptState, Result,
@@ -1045,10 +1045,12 @@ impl Agent for Grok<'_> {
     async fn start(&self, req: &StartRequest<'_>, deadline: Option<Instant>) -> Result<Outcome> {
         let policy = ApprovalPolicy::Deny;
         let leader = self.leader()?;
-        let mut conn = self.connect(req.cwd, leader.is_some(), req.model).await?;
+        let mut conn = self
+            .connect(req.cwd, leader.is_some(), req.settings.model.as_deref())
+            .await?;
         let res = async {
             let mut params = json!({"cwd": req.cwd, "mcpServers": []});
-            if req.full_access {
+            if req.settings.full_access {
                 params["_meta"] = json!({"yoloMode": true});
             }
             let created = conn.request("session/new", params).await?;
@@ -1061,7 +1063,7 @@ impl Agent for Grok<'_> {
             // Set on the session, not as `--reasoning-effort`, which a leader proxy
             // ignores (DESIGN.md §6.4). A refusal leaves the new session empty and
             // unrecorded; agent-talk deletes nothing, so the error names it.
-            if let Some(e) = req.effort {
+            if let Some(e) = &req.settings.effort {
                 let params = json!({"sessionId": id, "configId": "reasoning_effort", "value": e});
                 if let Err(mut err) = conn.request("session/set_config_option", params).await {
                     err.message = format!(
@@ -1077,13 +1079,7 @@ impl Agent for Grok<'_> {
                 None => Some(lock(&h, SECOND_WRITER)?),
                 Some(_) => None,
             };
-            let stored_args = json!({
-                "model": req.model,
-                "effort": req.effort,
-                "full_access": req.full_access,
-                "leader": leader.is_some(),
-            });
-            self.store.insert_owned(&h, req.cwd, &stored_args)?;
+            self.store.insert_owned(&h, req.cwd, req.settings)?;
             if let Some(n) = req.name {
                 conn.request("_x.ai/session/rename", json!({"sessionId": id, "title": n}))
                     .await?;
@@ -1175,10 +1171,35 @@ impl Agent for Grok<'_> {
             }
         };
         let res = async {
-            // Not through the leader: on a resident session yoloMode has no effect
+            // yoloMode only in direct mode: on a session resident in a leader it has no effect
             // (verified: `yolo` stayed unchanged for every client after such a load).
-            let yolo = leader.is_none() && full_access(self.store, &h)?;
+            if leader.is_some() && req.change.full_access {
+                return Err(Error::new(
+                    ErrorCode::Unsupported,
+                    format!(
+                        "full access cannot be given to {h} while it is resident in the Grok leader (DESIGN.md §6.4); send without --full-access"
+                    ),
+                ));
+            }
+            let yolo = leader.is_none() && req.settings.is_some_and(|s| s.full_access);
             self.session_load(&mut conn, id, &cwd, yolo).await?;
+            // Model and effort are set on the session, which Grok stores in summary.json
+            // at once for every later load and, in a leader, every attached client
+            // (DESIGN.md §6.4). A refusal fails the send before anything is recorded, as
+            // in `start`. A value set here stays stored even if the prompt below, or the
+            // second value, is then refused.
+            let configs = [
+                ("model", &req.change.model),
+                ("reasoning_effort", &req.change.effort),
+            ];
+            for (config, value) in configs {
+                let Some(v) = value else { continue };
+                let params = json!({"sessionId": id, "configId": config, "value": v});
+                if let Err(mut err) = conn.request("session/set_config_option", params).await {
+                    err.message = format!("{config} {v} refused: {}", err.message);
+                    return Err(err);
+                }
+            }
             let receipt_id = uuid::Uuid::new_v4().to_string();
             let prompt_id = uuid::Uuid::new_v4().to_string();
             let intent = NewIntent {

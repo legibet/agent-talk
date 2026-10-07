@@ -11,7 +11,8 @@ use std::process::Stdio;
 use tokio::process::Child;
 
 /// `claude -p` arguments for one turn; `session` is `--session-id <id>` or
-/// `--resume <id>`. Nothing here persists across `--resume`, so every turn passes it again.
+/// `--resume <id>`. `--resume` restores the model from the transcript but neither the effort
+/// nor the permission mode (DESIGN.md §6.2), so those pass again on every turn.
 pub fn args(
     session: [&str; 2],
     model: Option<&str>,

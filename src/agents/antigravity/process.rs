@@ -13,7 +13,7 @@ use tokio::process::Child;
 
 /// `agy -p` arguments for one turn. `--model` without `--effort` is refused by agy
 /// for its model aliases (`--model gemini-3.8-flash requires --effort`), so both pass through
-/// as given. Nothing here persists across runs, so every turn passes it again.
+/// as given. Nothing here persists across runs (DESIGN.md §6.5), so every turn passes it again.
 pub fn args(
     conversation: Option<&str>,
     model: Option<&str>,

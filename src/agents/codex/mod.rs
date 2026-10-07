@@ -8,7 +8,7 @@ use self::transport::{Conn, Event, ServerRequest, decode};
 use super::{
     Agent, AgentStatus, ApprovalPolicy, Boundary, Check, ListFilter, Operation, ReadPage,
     ReadQuery, SendRequest, StartRequest, WaitTarget, approval_policy, bounded, cli_version, cut,
-    full_access, record, reject, resolve, settle, strip_provenance, wait_receipt,
+    record, reject, resolve, settle, strip_provenance, wait_receipt,
 };
 use crate::model::{
     self, Approval, Error, ErrorCode, Message, Model, Observations, Outcome, Page, Result, Session,
@@ -135,7 +135,8 @@ impl<'a> Codex<'a> {
     /// process holds is `E_FOREIGN_LIVE` (`resume_error`).
     async fn subscribe(&self, conn: &Conn, thread_id: &str) -> Result<ThreadResumeResponse> {
         let mut params = resume_latest_turn(thread_id);
-        if full_access(self.store, &handle(thread_id))? {
+        let settings = self.store.settings(&handle(thread_id))?;
+        if settings.is_some_and(|s| s.full_access) {
             // A thread that unloaded comes back with the user's sandbox; the approval
             // policy survives (observed on codex 0.160.1, DESIGN.md §6.1).
             params["sandbox"] = json!("danger-full-access");
@@ -706,21 +707,16 @@ impl Agent for Codex<'_> {
         // Nobody answers approvals on a thread agent-talk started: what needs one fails
         // and the model is told. The sandbox and model fall back to the daemon's defaults.
         let mut params = json!({"cwd": req.cwd, "approvalPolicy": "never"});
-        if let Some(m) = req.model {
+        if let Some(m) = &req.settings.model {
             params["model"] = json!(m);
         }
-        if req.full_access {
+        if req.settings.full_access {
             params["sandbox"] = json!("danger-full-access");
         }
         let started: ThreadStartResponse = conn.call("thread/start", params).await?;
         let thread_id = started.thread.id;
         let handle = handle(&thread_id);
-        let args = json!({
-            "model": req.model,
-            "effort": req.effort,
-            "full_access": req.full_access,
-        });
-        self.store.insert_owned(&handle, req.cwd, &args)?;
+        self.store.insert_owned(&handle, req.cwd, req.settings)?;
         if let Some(name) = req.name {
             // Before turn/start: right after it the rollout file is still empty and the
             // daemon cannot update thread metadata (DESIGN.md §6.1).
@@ -754,7 +750,7 @@ impl Agent for Codex<'_> {
                         "clientUserMessageId": client_msg_id,
                         // thread/start takes no effort; this one applies to the thread's
                         // later turns too.
-                        "effort": req.effort,
+                        "effort": req.settings.effort,
                     }),
                 )
                 .await
@@ -813,6 +809,16 @@ impl Agent for Codex<'_> {
                     ));
                 }
             };
+            // A settings change needs a turn of its own: only turn/start carries it, and
+            // thread/queue/add ignores those fields (DESIGN.md §6.1).
+            let change = !req.change.is_empty();
+            if change && !idle {
+                return Err(Error::new(
+                    ErrorCode::Precondition,
+                    "thread is running a turn and a queued message cannot carry model, effort \
+                     or full access; send the change when the thread is idle",
+                ));
+            }
             self.store.insert_intent(&NewIntent {
                 receipt_id: &receipt_id,
                 handle: &handle,
@@ -823,6 +829,31 @@ impl Agent for Codex<'_> {
                 depth: req.depth,
             })?;
             let target = target.insert(match expected_turn {
+                None if change => {
+                    // The thread keeps these for its later turns; the sandbox only until
+                    // it unloads, so subscribe passes it again (DESIGN.md §6.1).
+                    let mut params = json!({
+                        "threadId": thread_id,
+                        "input": text_input(req.delivered),
+                        "clientUserMessageId": client_msg_id,
+                    });
+                    if let Some(m) = &req.change.model {
+                        params["model"] = json!(m);
+                    }
+                    if let Some(e) = &req.change.effort {
+                        params["effort"] = json!(e);
+                    }
+                    if req.change.full_access {
+                        params["sandboxPolicy"] = json!({"type": "dangerFullAccess"});
+                    }
+                    let started: TurnStartResponse = conn
+                        .call("turn/start", params)
+                        .await
+                        .map_err(|e| reject(self.store, &receipt_id, e))?;
+                    self.store
+                        .accept(&receipt_id, None, Some(&started.turn.id), None)?;
+                    Target::Turn(started.turn.id)
+                }
                 None => {
                     let added: ThreadQueueAddResponse = conn
                         .call(

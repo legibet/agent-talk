@@ -1,11 +1,12 @@
 //! `~/.agent-talk/store.db`: intents, receipts, owned sessions, processes, approvals.
 //! One connection per command, owned by the command's main task.
 
+use crate::agents::Settings;
 use crate::model::{
     AgentError, Approval, Caller, CallerKind, Error, ErrorCode, Receipt, ReceiptState, Result,
 };
 use rusqlite::{Connection, OptionalExtension, params};
-use serde_json::Value;
+use serde_json::json;
 use std::path::PathBuf;
 
 const SCHEMA: &str = r#"
@@ -307,11 +308,34 @@ impl Store {
         Ok(from.and_then(|f| serde_json::from_str(&f).ok()))
     }
 
-    /// agent-talk started this session: its working directory and start arguments.
-    pub fn insert_owned(&self, handle: &str, cwd: &str, args: &Value) -> Result<()> {
+    /// agent-talk started this session: its working directory and settings.
+    pub fn insert_owned(&self, handle: &str, cwd: &str, settings: &Settings) -> Result<()> {
         self.db.execute(
             "INSERT OR REPLACE INTO owned (handle, cwd, args) VALUES (?1, ?2, ?3)",
-            params![handle, cwd, args.to_string()],
+            params![handle, cwd, json!(settings).to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// The settings of a session agent-talk started, as `new` chose or a `send` changed them;
+    /// `None` for any other session. A row stored in another shape (0.1.0 kept OpenCode's
+    /// request body) reads as the default settings.
+    pub fn settings(&self, handle: &str) -> Result<Option<Settings>> {
+        let args: Option<String> = self
+            .db
+            .query_row(
+                "SELECT args FROM owned WHERE handle = ?1",
+                params![handle],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(args.map(|a| serde_json::from_str(&a).unwrap_or_default()))
+    }
+
+    pub fn set_settings(&self, handle: &str, settings: &Settings) -> Result<()> {
+        self.db.execute(
+            "UPDATE owned SET args = ?2 WHERE handle = ?1",
+            params![handle, json!(settings).to_string()],
         )?;
         Ok(())
     }
@@ -327,19 +351,6 @@ impl Store {
             )
             .optional()?;
         Ok(cwd)
-    }
-
-    /// Start arguments recorded when agent-talk started this session.
-    pub fn owned_args(&self, handle: &str) -> Result<Option<Value>> {
-        let args: Option<String> = self
-            .db
-            .query_row(
-                "SELECT args FROM owned WHERE handle = ?1",
-                params![handle],
-                |row| row.get(0),
-            )
-            .optional()?;
-        Ok(args.and_then(|a| serde_json::from_str(&a).ok()))
     }
 
     pub fn is_owned(&self, handle: &str) -> Result<bool> {

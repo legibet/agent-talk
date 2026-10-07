@@ -27,7 +27,6 @@ use crate::model::{
     AgentError, Error, ErrorCode, Model, Observations, Outcome, Page, ReceiptState, Result, Session,
 };
 use crate::store::{NewIntent, Store};
-use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
@@ -417,12 +416,7 @@ impl Agent for Pi<'_> {
         let h = handle(&id);
         let _lock = lock(&h, SECOND_WRITER)?;
         // pi has no permission prompts, so full access changes nothing; recorded as given.
-        let stored_args = json!({
-            "model": req.model,
-            "effort": req.effort,
-            "full_access": req.full_access,
-        });
-        self.store.insert_owned(&h, req.cwd, &stored_args)?;
+        self.store.insert_owned(&h, req.cwd, req.settings)?;
         let receipt_id = uuid::Uuid::new_v4().to_string();
         let client_msg_id = uuid::Uuid::new_v4().to_string();
         self.store.insert_intent(&NewIntent {
@@ -434,7 +428,12 @@ impl Agent for Pi<'_> {
             from: req.from,
             depth: req.depth,
         })?;
-        let args = run::args(["--session-id", &id], req.model, req.effort, req.name);
+        let args = run::args(
+            ["--session-id", &id],
+            req.settings.model.as_deref(),
+            req.settings.effort.as_deref(),
+            req.name,
+        );
         let watch = RunWatch {
             id,
             receipt_id,
@@ -492,8 +491,15 @@ impl Agent for Pi<'_> {
             from: req.from,
             depth: req.depth,
         })?;
-        // Model and thinking level live in the session file; pi restores them on load.
-        let args = run::args(["--session", &path.display().to_string()], None, None, None);
+        // pi restores the model from the session file, so only a change passes it; the
+        // thinking level is not restored and comes from the session's settings.
+        let settings = req.settings.cloned().unwrap_or_default();
+        let args = run::args(
+            ["--session", &path.display().to_string()],
+            req.change.model.as_deref(),
+            settings.effort.as_deref(),
+            None,
+        );
         let watch = RunWatch {
             id: id.to_string(),
             receipt_id,

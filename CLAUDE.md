@@ -20,7 +20,7 @@ The agents on this machine hold the user's own sessions, configuration and daemo
 alongside them:
 
 - Read agent configuration (`~/.codex`, `~/.claude*`, `~/.config/opencode`, `~/.grok`,
-  `~/.gemini`), never edit it.
+  `~/.gemini`, `~/.pi`), never edit it.
 - Connect to running daemons, services and leaders; leave starting and stopping them to the
   user. Grok leader experiments use an isolated `GROK_HOME` and a short socket path.
 - Clean up only sessions and files you created. The user's sessions are never deleted,

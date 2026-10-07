@@ -14,8 +14,8 @@ mod transport;
 use self::transport::{Events, Service};
 use super::{
     Agent, AgentStatus, ApprovalPolicy, Boundary, Check, ListFilter, Operation, ReadPage,
-    ReadQuery, SendRequest, StartRequest, WaitTarget, approval_policy, bounded, cut, record,
-    reject, resolve, settle, wait_receipt,
+    ReadQuery, SendRequest, Settings, StartRequest, WaitTarget, approval_policy, bounded, cut,
+    record, reject, resolve, settle, wait_receipt,
 };
 use crate::model::{
     self, Approval, Error, ErrorCode, Message, Model, Observations, Outcome, Page, ReceiptState,
@@ -152,6 +152,35 @@ fn no_asks(agent_rules: &[Value]) -> Vec<Value> {
             r
         })
         .collect()
+}
+
+/// Full access: one rule allowing every action (DESIGN.md §4).
+fn allow_all() -> Vec<Value> {
+    vec![json!({"action": "*", "resource": "*", "effect": "allow"})]
+}
+
+/// The rules of a session agent-talk started (DESIGN.md §6.3): `rules` (`allow_all` or
+/// `no_asks`) plus a denied question tool, since nobody answers it.
+fn session_rules(mut rules: Vec<Value>) -> Value {
+    rules.push(json!({"action": "question", "resource": "*", "effect": "deny"}));
+    json!(rules)
+}
+
+/// The user's default model for `cwd`, which an effort without a model applies to.
+async fn default_model(svc: &Service, cwd: &str) -> Result<Value> {
+    let default = svc
+        .get("/api/model/default", &[("location[directory]", cwd.into())])
+        .await?;
+    match (
+        text(&default["data"]["providerID"]),
+        text(&default["data"]["id"]),
+    ) {
+        (Some(provider), Some(id)) => Ok(json!({"providerID": provider, "id": id})),
+        _ => Err(Error::new(
+            ErrorCode::Precondition,
+            format!("OpenCode has no default model for {cwd}; pass --model"),
+        )),
+    }
 }
 
 /// Everything in history from the user message `msg_id` (inclusive) to the end of its turn.
@@ -797,26 +826,13 @@ impl Agent for OpenCode<'_> {
         // `integration.list` waits for plugin activation, which applies it.
         svc.get("/api/integration", &location).await?;
         let mut body = json!({"location": {"directory": req.cwd}});
-        if let Some(m) = req.model {
+        if let Some(m) = &req.settings.model {
             body["model"] = model_ref(m)?;
         }
-        if let Some(e) = req.effort {
+        if let Some(e) = &req.settings.effort {
             // The effort is the model's variant, so it needs a model: the user's default.
-            if req.model.is_none() {
-                let default = svc.get("/api/model/default", &location).await?;
-                let (Some(provider), Some(id)) = (
-                    text(&default["data"]["providerID"]),
-                    text(&default["data"]["id"]),
-                ) else {
-                    return Err(Error::new(
-                        ErrorCode::Precondition,
-                        format!(
-                            "OpenCode has no default model for {}; pass --model",
-                            req.cwd
-                        ),
-                    ));
-                };
-                body["model"] = json!({"providerID": provider, "id": id});
+            if req.settings.model.is_none() {
+                body["model"] = default_model(&svc, req.cwd).await?;
             }
             body["model"]["variant"] = json!(e);
         }
@@ -825,8 +841,8 @@ impl Agent for OpenCode<'_> {
         }
         // Session rules, so that the service itself never waits for an answer here
         // (DESIGN.md §4, §6.3).
-        let mut rules = if req.full_access {
-            vec![json!({"action": "*", "resource": "*", "effect": "allow"})]
+        body["permissions"] = if req.settings.full_access {
+            session_rules(allow_all())
         } else {
             // A new session runs the default agent, which the service lists first.
             let agents = svc.get("/api/agent", &location).await?;
@@ -836,11 +852,8 @@ impl Agent for OpenCode<'_> {
                     format!("agent.list returned no default agent for {}", req.cwd),
                 ));
             };
-            no_asks(rules)
+            session_rules(no_asks(rules))
         };
-        // Nobody answers the question tool either.
-        rules.push(json!({"action": "question", "resource": "*", "effect": "deny"}));
-        body["permissions"] = json!(rules);
         let created = svc.post("/api/session", &body).await?;
         let session_id = text(&created["data"]["id"]).ok_or_else(|| {
             Error::new(
@@ -849,11 +862,13 @@ impl Agent for OpenCode<'_> {
             )
         })?;
         self.store
-            .insert_owned(&handle(&session_id), req.cwd, &body)?;
+            .insert_owned(&handle(&session_id), req.cwd, req.settings)?;
         let send = SendRequest {
             text: req.prompt,
             delivered: req.delivered,
             steer: false,
+            change: &Settings::default(),
+            settings: Some(req.settings),
             from: req.from,
             depth: req.depth,
         };
@@ -867,6 +882,51 @@ impl Agent for OpenCode<'_> {
         deadline: Option<Instant>,
     ) -> Result<Outcome> {
         let svc = self.connect().await?;
+        // The session stores its model, variant and rules, and the service applies a change
+        // from the next step on, so only the change is sent, before the message is recorded:
+        // a refused change is a plain error (DESIGN.md §4, §6.3). The prompt has no model
+        // field.
+        let change = req.change;
+        if change.model.is_some() || change.effort.is_some() {
+            let mut model = match &change.model {
+                Some(m) => model_ref(m)?,
+                // An effort alone applies to the session's model, the user's default when the
+                // session has none.
+                None => {
+                    let session = svc.get(&format!("/api/session/{session_id}"), &[]).await?;
+                    let s = &session["data"];
+                    match (text(&s["model"]["providerID"]), text(&s["model"]["id"])) {
+                        (Some(provider), Some(id)) => json!({"providerID": provider, "id": id}),
+                        _ => {
+                            let cwd = text(&s["location"]["directory"]).ok_or_else(|| {
+                                Error::new(
+                                    ErrorCode::Transport,
+                                    format!("session.get returned no location: {session}"),
+                                )
+                            })?;
+                            default_model(&svc, &cwd).await?
+                        }
+                    }
+                }
+            };
+            // The session's effort (the change included), kept across a model change; without
+            // one the service selects the model's default variant.
+            if let Some(e) = req.settings.and_then(|s| s.effort.as_deref()) {
+                model["variant"] = json!(e);
+            }
+            svc.post(
+                &format!("/api/session/{session_id}/model"),
+                &json!({"model": model}),
+            )
+            .await?;
+        }
+        if change.full_access {
+            svc.patch(
+                &format!("/api/session/{session_id}"),
+                &json!({"permissions": session_rules(allow_all())}),
+            )
+            .await?;
+        }
         self.submit(&svc, session_id, req, deadline).await
     }
 
