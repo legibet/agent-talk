@@ -398,7 +398,12 @@ impl TurnWatch {
         );
         model::Turn {
             handle,
-            turn_id: self.prompt_id.clone().unwrap_or_default(),
+            // A result exists only for a known prompt: a prompt carries its id from the
+            // start, and a steer result is the prompt_complete matched by that id.
+            turn_id: self
+                .prompt_id
+                .clone()
+                .expect("a turn result names its prompt"),
             status,
             error,
             final_text: (!self.text.is_empty()).then(|| self.text.clone()),
@@ -1243,12 +1248,7 @@ impl Agent for Grok<'_> {
         // The direct-mode child that ran the receipt's prompt; once it is gone nothing
         // will write the turn's end.
         let child = match &receipt {
-            Some(r) => self
-                .store
-                .processes(&h)?
-                .into_iter()
-                .find(|(rid, _)| *rid == r.receipt_id)
-                .map(|(_, pid)| pid),
+            Some(r) => self.store.process(&r.receipt_id)?,
             None => None,
         };
         let work = async {

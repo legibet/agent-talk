@@ -359,7 +359,9 @@ impl Store {
         Ok(())
     }
 
-    /// `(receipt_id, pid)` of the newest processes spawned for `handle`, newest first.
+    /// `(receipt_id, pid)` of the newest processes spawned for `handle`, newest first, for
+    /// the liveness scan. While a run is alive, agent-talk refuses further sends to the
+    /// handle, so a live run is always among the newest ten.
     pub fn processes(&self, handle: &str) -> Result<Vec<(String, u32)>> {
         let mut stmt = self.db.prepare(
             "SELECT receipt_id, pid FROM processes WHERE handle = ?1
@@ -369,6 +371,18 @@ impl Store {
             .query_map(params![handle], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    /// The pid of the process spawned for `receipt_id`.
+    pub fn process(&self, receipt_id: &str) -> Result<Option<u32>> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT pid FROM processes WHERE receipt_id = ?1",
+                params![receipt_id],
+                |row| row.get(0),
+            )
+            .optional()?)
     }
 
     pub fn insert_approval(&self, a: &Approval) -> Result<()> {

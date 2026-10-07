@@ -714,6 +714,13 @@ impl Agent for Codex<'_> {
         }
         let started: ThreadStartResponse = conn.call("thread/start", params).await?;
         let thread_id = started.thread.id;
+        let handle = handle(&thread_id);
+        let args = json!({
+            "model": req.model,
+            "effort": req.effort,
+            "full_access": req.full_access,
+        });
+        self.store.insert_owned(&handle, req.cwd, &args)?;
         if let Some(name) = req.name {
             // Before turn/start: right after it the rollout file is still empty and the
             // daemon cannot update thread metadata (DESIGN.md §6.1).
@@ -723,13 +730,6 @@ impl Agent for Codex<'_> {
             )
             .await?;
         }
-        let handle = handle(&thread_id);
-        let args = json!({
-            "model": req.model,
-            "effort": req.effort,
-            "full_access": req.full_access,
-        });
-        self.store.insert_owned(&handle, req.cwd, &args)?;
         let mut w = Watch::new(&thread_id, ApprovalPolicy::Deny);
         let receipt_id = uuid::Uuid::new_v4().to_string();
         let client_msg_id = uuid::Uuid::new_v4().to_string();

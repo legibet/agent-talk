@@ -816,12 +816,7 @@ impl Agent for Antigravity<'_> {
                         self.store.accept(r, None, Some(&t), None)?;
                         unaccepted = false;
                     }
-                    let pid = self
-                        .store
-                        .processes(&h)?
-                        .into_iter()
-                        .find(|(rid, _)| rid == r)
-                        .map(|(_, pid)| pid);
+                    let pid = self.store.process(r)?;
                     if run.result.is_some() || !pid.is_some_and(pid_alive) {
                         // This command did not start the process: no exit code.
                         let (turn, denied) = self.finished(&h, r, log, &run, None)?;

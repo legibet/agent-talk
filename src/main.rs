@@ -238,6 +238,7 @@ fn main() -> ExitCode {
                     eprintln!("agent error: {} {}", v.code, v.message);
                 }
                 if let Some(r) = &e.receipt {
+                    eprintln!("handle: {}", r.handle);
                     eprintln!("receipt: {}", receipt_line(r));
                 }
                 for a in &e.approvals {
