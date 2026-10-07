@@ -37,14 +37,14 @@ behalf, deleting sessions.
 
 State lives where the agent already keeps it:
 
-| agent                                            | who holds the live session          | agent-talk's connection                                   |
-| ------------------------------------------------ | ----------------------------------- | --------------------------------------------------------- |
-| Codex                                            | shared app-server daemon            | per command: connect, subscribe, act, observe, disconnect |
-| OpenCode                                         | `opencode serve --service`          | per command: HTTP, plus SSE while observing               |
-| Grok, leader live                                | shared leader process               | per command: a `grok agent --leader stdio` child (ACP)    |
+| agent                                                | who holds the live session          | agent-talk's connection                                   |
+| ---------------------------------------------------- | ----------------------------------- | --------------------------------------------------------- |
+| Codex                                                | shared app-server daemon            | per command: connect, subscribe, act, observe, disconnect |
+| OpenCode                                             | `opencode serve --service`          | per command: HTTP, plus SSE while observing               |
+| Grok, leader live                                    | shared leader process               | per command: a `grok agent --leader stdio` child (ACP)    |
 | Claude, Grok without leader, Antigravity, pi (owned) | nobody between turns; files on disk | one agent child per mutation                              |
-| Claude, Grok, Antigravity TUI (foreign)          | the user's terminal process         | read-only                                                 |
-| pi TUI (foreign)                                 | the user's terminal process         | undetectable; a send forks the session (§6.6)             |
+| Claude, Grok, Antigravity TUI (foreign)              | the user's terminal process         | read-only                                                 |
+| pi TUI (foreign)                                     | the user's terminal process         | undetectable; a send forks the session (§6.6)             |
 
 "Owned" means agent-talk started the session; the `owned` table records creation, not current
 exclusivity. The CLI process is short-lived, but within one command it owns a live connection
@@ -116,11 +116,11 @@ through stays untyped JSON.
 
 ### Observations
 
-| observation | values                                                                                                                                  | learned from                                                                                                                                                                             |
-| ----------- | --------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `history`   | `visible` / `none` / `unknown`                                                                                                          | the agent's history listing or files                                                                                                                                                     |
+| observation | values                                                                                                                                  | learned from                                                                                                                                                                                                |
+| ----------- | --------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `history`   | `visible` / `none` / `unknown`                                                                                                          | the agent's history listing or files                                                                                                                                                                        |
 | `loaded`    | `yes` / `no` / `unknown`                                                                                                                | Codex `thread/loaded/list`; Claude `claude agents` (pid present); OpenCode `yes` while the service answers; Grok own child, live TUI row or leader `resident`; Antigravity presence lock; pi own child only |
-| `origin`    | agent label (`codex-tui`, `codex_exec`, `claude-interactive`, `opencode agent build`, `headless`, ...), `agent-talk` for owned sessions | agent metadata; the `owned` table                                                                                                                                                        |
+| `origin`    | agent label (`codex-tui`, `codex_exec`, `claude-interactive`, `opencode agent build`, `headless`, ...), `agent-talk` for owned sessions | agent metadata; the `owned` table                                                                                                                                                                           |
 
 Declared blind spot: for Codex, "not loaded" cannot distinguish a stopped thread from a live
 standalone `codex exec` or `--no-daemon` run. agent-talk proceeds through the daemon.
@@ -772,11 +772,12 @@ that holds its stdin, never from a later command.
 **Writers.** pi has no lock between processes, no marker of a live process and no re-read: a
 TUI holding the session never sees entries another process appends, its next message hangs off
 its own leaf (verified in a herdr pane: two user entries under one parent), and the next load
-follows the file's last entry, leaving the other branch out of view. agent-talk refuses only its
-own running child, `E_LOCKED` while the pid is alive and its run log not settled, and locks the
-session for the command. A session open in a TUI cannot be told from an idle one, so a send to
-it forks the conversation (§8); `ls` reports `loaded: yes` for an own run and `unknown`
-otherwise.
+follows the file's last entry. agent-talk refuses only its own running child, `E_LOCKED` while
+the pid is alive and its run log not settled, and locks the session for the command. A session
+open in a TUI cannot be told from an idle one, so a send to it is not refused: the TUI shows
+neither the message nor the reply, and its next message starts a branch beside them. A send
+after that continues from the TUI's messages, and the turn agent-talk sent before is out of the
+session's context (§8). `ls` reports `loaded: yes` for an own run and `unknown` otherwise.
 
 **Approvals.** None. Tools run with the process's rights, and extension dialogs resolve to
 their defaults in json mode without blocking. `--full-access` changes nothing and is recorded as
@@ -889,9 +890,10 @@ the server is pinned with `--caller`.
   captured frames, not re-verified; whether a TUI renders live a turn another
   leader client ran; leader behaviour with a grok.com subscription login (it may open a relay);
   the lock path of a custom leader socket is assumed.
-- pi: a session open in a TUI cannot be detected, so `send` to it forks the conversation: the
-  TUI neither shows the message nor its reply, and whichever process writes last decides the
-  branch the next load continues. Turn ends of sessions agent-talk did not start are read
+- pi: a session open in a TUI cannot be detected, so `send` to it branches the conversation:
+  the TUI neither shows the message nor its reply, and whichever process writes last decides the
+  branch the next load continues. agent-talk cannot continue its own branch instead: moving the
+  leaf in place is open to extensions (`navigateTree`) only, not to the CLI or RPC. Turn ends of sessions agent-talk did not start are read
   from the file, best effort (no marker separates a turn still running from one whose
   process died, and a steer message reads as a new prompt). `models` parses a padded table.
   A custom flat session directory (`--session-dir`, `PI_CODING_AGENT_SESSION_DIR`, the

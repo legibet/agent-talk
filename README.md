@@ -98,10 +98,11 @@ agent's own TUI or app depends on the agent.
   `E_FOREIGN_LIVE`. After the TUI switches to another conversation with `/new`, agent-talk can
   send, but the TUI still holds the old conversation in memory. If the user returns to it with
   `/resume`, the TUI overwrites the messages that agent-talk added.
-- pi: not safely. pi records nothing about running processes, so agent-talk cannot tell a session
-  open in a TUI from an idle one and does not refuse. The TUI does not show the message or the
-  reply, and its next message branches the conversation; only one branch is visible when the
-  session is next opened. Send to pi sessions that are not open in a TUI.
+- pi: yes, on a separate branch. pi records nothing about running processes, so agent-talk cannot
+  tell a session open in a TUI from an idle one and does not refuse. The TUI does not show the
+  message or the reply, and its next message starts a branch beside them. pi always continues the
+  newest branch, so a later message from agent-talk follows the TUI's messages, and the turn
+  agent-talk sent before is no longer in the session's context.
 
 ## Skill
 

@@ -51,10 +51,11 @@ reply. `--steer` adds it to the running turn instead and is refused when the ses
 A session open in another client accepts messages when that client shares it with agent-talk: a
 Codex TUI attached to the shared app-server daemon, any OpenCode client, or a Grok TUI started with
 `--leader`. Other live clients, including Claude Code and Antigravity TUIs, cause `E_FOREIGN_LIVE`
-until they release the session. A pi TUI cannot be detected: a `send` to a session it has open
-is not refused, but the TUI does not show the message and its next message branches the
-conversation, so send only to pi sessions that are not open in a TUI. In sessions created outside agent-talk, agent-talk leaves approval
-requests for the user to answer.
+until they release the session. A pi TUI cannot be detected, so a `send` to a session it has
+open is not refused. The TUI does not show the message, and its next message starts a branch
+beside it. Every pi run continues the newest branch, so a later `send` continues from the TUI's
+messages, without the turn sent before. In sessions created outside agent-talk, agent-talk leaves
+approval requests for the user to answer.
 
 Antigravity releases a session when the user switches away with `/new`, but keeps it in memory.
 Returning to it with `/resume` overwrites messages that agent-talk added in the meantime.
