@@ -1,12 +1,11 @@
 # agent-talk
 
-agent-talk lets an agent send a message to another agent's session and read the reply, across
-agents, using only each agent's official non-interactive interfaces. It works as a command-line
-tool and as an MCP server, and it supports Codex, Claude Code, OpenCode, Grok CLI, Antigravity
-CLI and pi.
+agent-talk lets an agent talk with another agent. It can start a session, continue an
+existing one, wait for a reply and read a conversation. It runs as a command-line tool
+or as an MCP server, supporting Codex, Claude Code, OpenCode, Grok CLI, Antigravity CLI and pi.
 
-agent-talk does not run a daemon of its own. Each command connects to the agent, performs one
-operation and exits. The session it reaches is the agent's own session, with its full history.
+agent-talk uses each agent's official interface and works on the agent's own sessions. agent-talk
+runs no daemon. Each command connects to the agent, performs one operation and exits.
 
 ## Install
 
@@ -16,8 +15,7 @@ On macOS and Linux, install the prebuilt binary with:
 curl -LsSf https://github.com/legibet/agent-talk/releases/latest/download/agent-talk-installer.sh | sh
 ```
 
-The script installs `agent-talk` into `~/.local/bin`. To build it from source instead, which
-requires Rust 1.89 or later, run:
+The script installs `agent-talk` into `~/.local/bin`. To build it from source (requires Rust 1.89+):
 
 ```sh
 cargo install agent-talk
