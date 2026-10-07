@@ -3,6 +3,7 @@ pub mod claude;
 pub mod codex;
 pub mod grok;
 pub mod opencode;
+pub mod pi;
 
 use crate::model::{
     Approval, Caller, CallerKind, Error, ErrorCode, Message, Model, Outcome, Page, Receipt,
@@ -67,11 +68,12 @@ pub fn pid_alive(pid: u32) -> bool {
 
 /// The environment variables naming the session an agent-talk command runs in, with
 /// the agent each one belongs to, in the order the CLI derives its sender from them (DESIGN.md §4).
-pub const SESSION_VARS: [(&str, &str); 5] = [
+pub const SESSION_VARS: [(&str, &str); 6] = [
     ("CODEX_THREAD_ID", "codex"),
     ("OPENCODE_SESSION_ID", "opencode"),
     ("GROK_SESSION_ID", "grok"),
     ("ANTIGRAVITY_CONVERSATION_ID", "antigravity"),
+    ("PI_SESSION_ID", "pi"),
     ("CLAUDE_CODE_SESSION_ID", "claude"),
 ];
 
@@ -221,16 +223,18 @@ pub enum Adapter<'a> {
     OpenCode(opencode::OpenCode<'a>),
     Grok(grok::Grok<'a>),
     Antigravity(antigravity::Antigravity<'a>),
+    Pi(pi::Pi<'a>),
 }
 
 impl<'a> Adapter<'a> {
-    pub fn all(store: &'a Store) -> [Adapter<'a>; 5] {
+    pub fn all(store: &'a Store) -> [Adapter<'a>; 6] {
         [
             Adapter::Codex(codex::Codex::new(store)),
             Adapter::Claude(claude::Claude::new(store)),
             Adapter::OpenCode(opencode::OpenCode::new(store)),
             Adapter::Grok(grok::Grok::new(store)),
             Adapter::Antigravity(antigravity::Antigravity::new(store)),
+            Adapter::Pi(pi::Pi::new(store)),
         ]
     }
 
@@ -242,7 +246,7 @@ impl<'a> Adapter<'a> {
                 Error::new(
                     ErrorCode::Unsupported,
                     format!(
-                        "agent {name} is not supported (codex, claude, opencode, grok, antigravity)"
+                        "agent {name} is not supported (codex, claude, opencode, grok, antigravity, pi)"
                     ),
                 )
             })
@@ -255,6 +259,7 @@ impl<'a> Adapter<'a> {
             Adapter::OpenCode(_) => "opencode",
             Adapter::Grok(_) => "grok",
             Adapter::Antigravity(_) => "antigravity",
+            Adapter::Pi(_) => "pi",
         }
     }
 }
@@ -267,6 +272,7 @@ impl Agent for Adapter<'_> {
             Adapter::OpenCode(p) => p.status().await,
             Adapter::Grok(p) => p.status().await,
             Adapter::Antigravity(p) => p.status().await,
+            Adapter::Pi(p) => p.status().await,
         }
     }
 
@@ -277,6 +283,7 @@ impl Agent for Adapter<'_> {
             Adapter::OpenCode(p) => p.models().await,
             Adapter::Grok(p) => p.models().await,
             Adapter::Antigravity(p) => p.models().await,
+            Adapter::Pi(p) => p.models().await,
         }
     }
 
@@ -292,6 +299,7 @@ impl Agent for Adapter<'_> {
             Adapter::OpenCode(p) => p.list(filter, limit, cursor).await,
             Adapter::Grok(p) => p.list(filter, limit, cursor).await,
             Adapter::Antigravity(p) => p.list(filter, limit, cursor).await,
+            Adapter::Pi(p) => p.list(filter, limit, cursor).await,
         }
     }
 
@@ -302,6 +310,7 @@ impl Agent for Adapter<'_> {
             Adapter::OpenCode(p) => p.start(req, deadline).await,
             Adapter::Grok(p) => p.start(req, deadline).await,
             Adapter::Antigravity(p) => p.start(req, deadline).await,
+            Adapter::Pi(p) => p.start(req, deadline).await,
         }
     }
 
@@ -317,6 +326,7 @@ impl Agent for Adapter<'_> {
             Adapter::OpenCode(p) => p.send(id, req, deadline).await,
             Adapter::Grok(p) => p.send(id, req, deadline).await,
             Adapter::Antigravity(p) => p.send(id, req, deadline).await,
+            Adapter::Pi(p) => p.send(id, req, deadline).await,
         }
     }
 
@@ -327,6 +337,7 @@ impl Agent for Adapter<'_> {
             Adapter::OpenCode(p) => p.read(id, q).await,
             Adapter::Grok(p) => p.read(id, q).await,
             Adapter::Antigravity(p) => p.read(id, q).await,
+            Adapter::Pi(p) => p.read(id, q).await,
         }
     }
 
@@ -337,6 +348,7 @@ impl Agent for Adapter<'_> {
             Adapter::OpenCode(p) => p.wait(id, target, deadline).await,
             Adapter::Grok(p) => p.wait(id, target, deadline).await,
             Adapter::Antigravity(p) => p.wait(id, target, deadline).await,
+            Adapter::Pi(p) => p.wait(id, target, deadline).await,
         }
     }
 }

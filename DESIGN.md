@@ -42,8 +42,9 @@ State lives where the agent already keeps it:
 | Codex                                            | shared app-server daemon            | per command: connect, subscribe, act, observe, disconnect |
 | OpenCode                                         | `opencode serve --service`          | per command: HTTP, plus SSE while observing               |
 | Grok, leader live                                | shared leader process               | per command: a `grok agent --leader stdio` child (ACP)    |
-| Claude, Grok without leader, Antigravity (owned) | nobody between turns; files on disk | one agent child per mutation                              |
+| Claude, Grok without leader, Antigravity, pi (owned) | nobody between turns; files on disk | one agent child per mutation                              |
 | Claude, Grok, Antigravity TUI (foreign)          | the user's terminal process         | read-only                                                 |
+| pi TUI (foreign)                                 | the user's terminal process         | undetectable; a send forks the session (§6.6)             |
 
 "Owned" means agent-talk started the session; the `owned` table records creation, not current
 exclusivity. The CLI process is short-lived, but within one command it owns a live connection
@@ -62,16 +63,17 @@ belongs there, not in a system daemon (§7).
   Intent and receipt are written in one transaction.
 - `owned`: sessions agent-talk started (handle, cwd, start arguments).
 - `processes`: agent children spawned for an intent (receipt, handle, pid): `claude -p`, a
-  direct-mode `grok agent`, `agy -p`. This is how later commands tell an agent-talk run from a
+  direct-mode `grok agent`, `agy -p`, `pi --mode json`. This is how later commands tell an
+  agent-talk run from a
   foreign writer.
 - `approvals`: every approval request seen and what happened to it.
 
-Claude, Grok (direct mode) and Antigravity sessions are also locked with OS file locks,
+Claude, Grok (direct mode), Antigravity and pi sessions are also locked with OS file locks,
 `locks/<agent>-<id>`, opened close-on-exec so an agent child does not inherit them and released
 by process exit, never with SQLite rows. A child that outlives its command is tracked by pid
-instead. Claude and Antigravity children write stdout to a run log per receipt
-(`claude-runs/`, `antigravity-runs/`), which the command tails and later commands read to recover
-a receipt.
+instead. Claude, Antigravity and pi children write stdout to a run log per receipt
+(`claude-runs/`, `antigravity-runs/`, `pi-runs/`), which the command tails and later commands
+read to recover a receipt.
 
 Agent children get the user's environment minus `AGENT_TALK_CALLER` and the agents' session
 variables of §4; otherwise the agent would pass them to its own shells and MCP servers and the
@@ -92,6 +94,7 @@ src/
   agents/opencode/     adapter, transport (HTTP + SSE)
   agents/grok/         adapter, ACP client of a grok agent child, updates.jsonl rules
   agents/antigravity/  adapter (summaries db, presence lock), transcript, stream, process
+  agents/pi/           adapter, session file rules, the `pi --mode json` run
 tests/live.py          regression harness against the real agents; see tests/README.md
 skills/agent-talk/     the skill that teaches agents the CLI (installed with `npx skills add`)
 ```
@@ -116,7 +119,7 @@ through stays untyped JSON.
 | observation | values                                                                                                                                  | learned from                                                                                                                                                                             |
 | ----------- | --------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `history`   | `visible` / `none` / `unknown`                                                                                                          | the agent's history listing or files                                                                                                                                                     |
-| `loaded`    | `yes` / `no` / `unknown`                                                                                                                | Codex `thread/loaded/list`; Claude `claude agents` (pid present); OpenCode `yes` while the service answers; Grok own child, live TUI row or leader `resident`; Antigravity presence lock |
+| `loaded`    | `yes` / `no` / `unknown`                                                                                                                | Codex `thread/loaded/list`; Claude `claude agents` (pid present); OpenCode `yes` while the service answers; Grok own child, live TUI row or leader `resident`; Antigravity presence lock; pi own child only |
 | `origin`    | agent label (`codex-tui`, `codex_exec`, `claude-interactive`, `opencode agent build`, `headless`, ...), `agent-talk` for owned sessions | agent metadata; the `owned` table                                                                                                                                                        |
 
 Declared blind spot: for Codex, "not loaded" cannot distinguish a stopped thread from a live
@@ -176,8 +179,8 @@ recorded as `denied`.
 `new --full-access` (MCP `full_access`) gives a new session every permission and no approval
 prompts: Codex `sandbox: danger-full-access`, Claude `--permission-mode bypassPermissions`,
 OpenCode a session rule allowing every action, Grok `_meta.yoloMode: true`, Antigravity
-`--dangerously-skip-permissions`. Without it the session runs under the agent's own
-configuration. The choice is stored with the owned session and applied again on every send,
+`--dangerously-skip-permissions`; pi has no permission prompts to lift. Without it the session
+runs under the agent's own configuration. The choice is stored with the owned session and applied again on every send,
 because Claude and Antigravity take it per process, a resumed Codex thread falls back to the
 daemon's sandbox once it has unloaded, and a direct-mode Grok load starts a new process.
 
@@ -207,8 +210,8 @@ Sender identity, in priority order:
    are inherited: a Codex daemon started from a Claude shell carries an unrelated
    `CLAUDE_CODE_SESSION_ID`.
 3. CLI from an agent's shell: `CODEX_THREAD_ID`, `OPENCODE_SESSION_ID`, `GROK_SESSION_ID`,
-   `ANTIGRAVITY_CONVERSATION_ID`, then `CLAUDE_CODE_SESSION_ID`. The first four are set by their
-   agent for that one session's shell; Claude's is inherited, so it goes last. A daemon or
+   `ANTIGRAVITY_CONVERSATION_ID`, `PI_SESSION_ID`, then `CLAUDE_CODE_SESSION_ID`. The first five
+   are set by their agent for that one session's shell; Claude's is inherited, so it goes last. A daemon or
    service started from another agent's shell still carries that agent's variable, which the
    order cannot detect.
 4. `unknown`.
@@ -255,14 +258,14 @@ agent-talk mcp [--caller H]
 - `--json` on every command; default output is for humans. Exit codes: 0 ok, 2 refused with a
   stable error code, 3 unknown outcome (timeout, Ctrl-C or SIGTERM after an accepted intent),
   4 transport failure.
-- `send` without `--wait` promises only that the agent accepted the message. Claude, Grok and
-  Antigravity sends still run the turn to its end, because the turn lives in the child.
+- `send` without `--wait` promises only that the agent accepted the message. Claude, Grok,
+  Antigravity and pi sends still run the turn to its end, because the turn lives in the child.
 - `send --wait` subscribes, persists the intent, submits, correlates and observes on one
   connection; notifications arriving before the RPC response are buffered.
 - `wait` checks history first (the turn may be complete), then observes. It matches session and
   turn id and returns the terminal status as reported. "Latest" does not exist.
 - `send` queues by default: the message runs after the current reply, as its own turn on Codex,
-  Grok and Antigravity, inside the same execution on OpenCode. `--steer` joins the running turn
+  Grok, Antigravity and pi, inside the same execution on OpenCode. `--steer` joins the running turn
   (Codex, OpenCode, Grok through a live leader) and is refused when the session is idle.
 - `new --cwd` defaults to the current directory.
 - `new --model` and `--effort` pass through unvalidated in the agent's syntax (OpenCode
@@ -276,12 +279,12 @@ agent-talk mcp [--caller H]
   the last id shown. The rows come from the agent each time: Codex `model/list`, OpenCode
   `GET /api/model` (every model of every configured provider, hundreds of rows, hence the query),
   Grok the `initialize` response of a direct child, Antigravity `agy models` with its
-  `<alias>-<effort>` ids folded into the alias and its efforts. Claude Code has no listing
-  interface; its rows are the aliases and effort levels `claude --help` names, the one model
-  list agent-talk carries itself.
+  `<alias>-<effort>` ids folded into the alias and its efforts, pi the `pi --list-models` table
+  with its thinking levels as efforts. Claude Code has no listing interface; its rows are the
+  aliases and effort levels `claude --help` names, the one model list agent-talk carries itself.
 - `new --name N` stores a title at the agent (Codex thread name, Claude `custom-title` line,
-  OpenCode `title`, Grok `_x.ai/session/rename`; Antigravity has no interface outside the TUI and
-  refuses). agent-talk keeps no copy. `ls` shows `name` and strips the provenance header from
+  OpenCode `title`, Grok `_x.ai/session/rename`, pi `--name`; Antigravity has no interface outside
+  the TUI and refuses). agent-talk keeps no copy. `ls` shows `name` and strips the provenance header from
   `preview`, so a session an agent created is recognizable without reading its history.
 - `read` returns the newest N messages, oldest first, and `next_cursor` names the page of older
   ones. By default a message is a `prompt` (what a person or an agent sent) or a `final` reply, so
@@ -298,10 +301,11 @@ Errors carry the agent's `code`/`message`/`data` under `agent_error` when there 
 E_NO_DAEMON     Codex socket absent; OpenCode registration missing, stale, or its pid gone
 E_CAP_MISSING   a required agent capability is missing (Codex queue methods, `claude agents`)
 E_PRECONDITION  agent rejected (stale turn id, idle steer, unknown session or receipt)
-E_LOCKED        another agent-talk command or child holds the session (Claude, direct Grok, Antigravity)
+E_LOCKED        another agent-talk command or child holds the session (Claude, direct Grok,
+                Antigravity, pi)
 E_FOREIGN_LIVE  held by a process agent-talk cannot talk to (Claude TUI, Grok TUI outside the
                 leader, Antigravity TUI, a Codex thread written by another app-server process)
-E_NO_STEER      agent cannot steer (Claude, Antigravity, Grok without a live leader)
+E_NO_STEER      agent cannot steer (Claude, Antigravity, pi, Grok without a live leader)
 E_MAX_HOPS      hop depth exceeded
 E_TIMEOUT       deadline passed; outcome unknown, receipt retained
 E_INTERRUPTED   Ctrl-C or SIGTERM while observing; outcome unknown, receipt retained
@@ -717,6 +721,77 @@ every run, because a resumed conversation falls back to the user's `toolPermissi
 environment has no `ANTIGRAVITY_*` variable. Shell commands get `ANTIGRAVITY_CONVERSATION_ID`. MCP
 servers are configured globally only.
 
+### 6.6 pi (1.0.3)
+
+**Transport.** Owned processes only: one `pi --mode json` process per `new` (`--session-id
+<uuid>`, `--model`, `--thinking`, `--name`) or `send` (`--session <file>`), the prompt on its
+stdin. pi reads piped stdin to EOF as the prompt, so the text never meets argument parsing
+(`@file`, options), and json mode would wait for that EOF anyway. stdout is JSONL events, written
+to a run log; the process runs the turn to `agent_settled` and exits, so `send` is synchronous.
+`--mode rpc` is not used: closing its stdin or SIGTERM aborts the running turn without
+persisting the partial reply (the turn would die with the command, as in direct Grok), SIGINT is
+unhandled, and what it adds (steer, abort, `get_entries`) is reachable only from the process
+that holds its stdin, never from a later command.
+
+**Sessions and turns.**
+
+- Session files `<agent dir>/sessions/--<cwd>--/<timestamp>_<id>.jsonl`, where the agent dir is
+  `$PI_CODING_AGENT_DIR`, else `~/.pi/agent`, and the cwd loses its leading separator and has
+  `/`, `\` and `:` replaced by `-`. `--session <path>` opens the file in place and runs the
+  session in the directory its header records, whatever the process cwd. `--session <id>` is
+  not used: an id found only in another project's directory makes pi ask on stdin whether to
+  fork, and json mode would read the prompt as the answer. Ids are unique per directory only;
+  a handle whose id exists in two directories is refused. A custom session directory
+  (`--session-dir`, `PI_CODING_AGENT_SESSION_DIR`, the `sessionDir` setting) is a flat layout
+  agent-talk does not read: while pi is configured for one, `status` names it and every pi
+  operation but `models` is refused (`E_UNSUPPORTED`).
+- Entries form a tree (`id`, `parentId`); on load the leaf is the file's last entry, and
+  nothing re-reads the file while a process runs. The live branch is the newest entry's
+  ancestry; `read` and foreign `wait` follow it.
+- The turn id is the user message's entry id (8 hex characters). pi appends the entry before
+  it writes the user `message_end` event, so the receipt is accepted at that event and the entry
+  found by its `message.timestamp` and text. Model, thinking level and name are entries the
+  first run writes and later loads restore, so `send` passes none of them (`--thinking` on a
+  resumed session is not persisted; a saved model without credentials makes pi fall back to
+  another).
+- An own turn ends at `agent_settled`; its status is the newest assistant message's
+  `stopReason`: `stop` or `length` completed, `error` failed, `aborted` interrupted (an abort
+  during a tool call records `error`, "This operation was aborted"). While the process lives,
+  `wait` reads only its run log: the file may hold a failed message pi is about to retry. Once
+  it is gone without `agent_settled`, a run that never took the message is `rejected` with pi's
+  stderr, and one that did is read from the file like any other turn, `unknown` when nothing
+  ended it. Other turns end, best effort, at the first assistant entry after the prompt on the
+  live branch without tool calls, skipping an entry a later `context_edit` with a `null`
+  replacement hides (pi's auto-retry keeps the failed message in the file; an edit with content
+  keeps the entry), or at a later user message. Steer and follow-up messages are plain user
+  entries, so they read as prompts of their own. No `duration_ms`: pi stamps an assistant
+  message when its request starts, not when the reply ends.
+- An unknown `--model` exits 1 before any file exists and the receipt is `rejected` with pi's
+  stderr; an invalid `--thinking` is only a warning and the run proceeds at pi's default.
+
+**Writers.** pi has no lock between processes, no marker of a live process and no re-read: a
+TUI holding the session never sees entries another process appends, its next message hangs off
+its own leaf (verified in a herdr pane: two user entries under one parent), and the next load
+follows the file's last entry, leaving the other branch out of view. agent-talk refuses only its
+own running child, `E_LOCKED` while the pid is alive and its run log not settled, and locks the
+session for the command. A session open in a TUI cannot be told from an idle one, so a send to
+it forks the conversation (§8); `ls` reports `loaded: yes` for an own run and `unknown`
+otherwise.
+
+**Approvals.** None. Tools run with the process's rights, and extension dialogs resolve to
+their defaults in json mode without blocking. `--full-access` changes nothing and is recorded as
+given.
+
+**Models.** `pi --list-models` prints a padded table, one row per model of every provider with
+credentials; `models` reads it as `provider/model`, and gives reasoning models the seven thinking
+levels (`off` to `max`), which pi clamps to what the model supports.
+
+**Identity.** pi sets `PI_SESSION_ID` (with `PI_SESSION_FILE`, `PI_PROVIDER`, `PI_MODEL`,
+`PI_REASONING_LEVEL`) for each shell command of its `bash` tool, replacing inherited values. MCP
+servers get pi's own environment, with no session variable, and `tools/call` `_meta` carries only
+`progressToken`, so a message a pi session sends through `agent-talk mcp` has no sender unless
+the server is pinned with `--caller`.
+
 ## 7. Key decisions
 
 - **Rust, single binary.** Agents call the CLI many times per session; startup time and one
@@ -742,10 +817,12 @@ servers are configured globally only.
 - **Two-writer agents get agent-talk's lock plus the agent's liveness marker.** Claude, Grok
   without a leader and Antigravity have no lock between processes; agent-talk refuses to write
   while the agent's marker says another process holds the session (Claude live pid, Grok
-  `active_sessions.json`, Antigravity presence lock) and locks its own children.
-- **Turn ids come from the agent or from agent-talk's own client id**, never from matching text:
+  `active_sessions.json`, Antigravity presence lock) and locks its own children. pi has no
+  marker at all, so only its own children are refused and the hazard is declared (§6.6, §8).
+- **Turn ids come from the agent or from agent-talk's own client id**, never made up from text:
   Codex turn id, Claude user-line uuid, OpenCode user message id, Grok `promptId`, Antigravity
-  `USER_INPUT` step index (§6).
+  `USER_INPUT` step index, pi user entry id (matched to the run-log event by timestamp and
+  text, but pi's id) (§6).
 - **History is paged to the answer.** `read` and turn attribution follow the agent's cursor,
   newest first, until the page is full, the rows are found or history ends. The only fixed caps are the 40 pages an
   OpenCode turn lookup searches (older messages report absent) and the ten Codex resume retries.
@@ -760,9 +837,10 @@ servers are configured globally only.
   rejects an unknown effort in the turn, not at submission).
 - **Steer is refused when idle** on every agent that would silently start a new turn instead.
 - **No tight polling.** Observation uses the agents' event streams. The polls that exist: Claude
-  foreign sessions, Grok `updates.jsonl` and Antigravity transcripts in `wait` (1 s; no event
-  source exists), agent-talk's own `claude -p` and `agy -p` run logs (50 ms file tail), and Codex
-  `thread/resume` while a new thread's history is unreadable (1 s, at most ten).
+  foreign sessions, Grok `updates.jsonl`, Antigravity transcripts and pi session files in `wait`
+  (1 s; no event source exists), agent-talk's own `claude -p`, `agy -p` and `pi --mode json` run
+  logs (50 ms file tail), and Codex `thread/resume` while a new thread's history is unreadable
+  (1 s, at most ten).
 
 ## 8. Known limitations and open items
 
@@ -811,6 +889,15 @@ servers are configured globally only.
   captured frames, not re-verified; whether a TUI renders live a turn another
   leader client ran; leader behaviour with a grok.com subscription login (it may open a relay);
   the lock path of a custom leader socket is assumed.
+- pi: a session open in a TUI cannot be detected, so `send` to it forks the conversation: the
+  TUI neither shows the message nor its reply, and whichever process writes last decides the
+  branch the next load continues. Turn ends of sessions agent-talk did not start are read
+  from the file, best effort (no marker separates a turn still running from one whose
+  process died, and a steer message reads as a new prompt). `models` parses a padded table.
+  A custom flat session directory (`--session-dir`, `PI_CODING_AGENT_SESSION_DIR`, the
+  `sessionDir` setting) makes agent-talk refuse pi operations rather than read it; nobody has
+  asked for it. Whether a `--session-id` pi did not create itself, and the `wx` exclusive
+  create of a new file, collide when two processes race is untested.
 - Antigravity: a TUI that switched conversations can overwrite steps an agent-talk `send`
   appended once it resumes its cached copy; `--print-timeout` expiry was not observed;
   self-updates change behaviour between versions (the denied step already differs); a denied

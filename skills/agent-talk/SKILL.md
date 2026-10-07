@@ -1,12 +1,12 @@
 ---
 name: agent-talk
-description: Message other agents (Codex, Claude Code, OpenCode, Grok, Antigravity) through the agent-talk CLI. Use it to hand one a task, ask it a question or for a review, follow up in an existing session, or read what a session did.
+description: Message other agents (Codex, Claude Code, OpenCode, Grok, Antigravity, pi) through the agent-talk CLI. Use it to hand one a task, ask it a question or for a review, follow up in an existing session, or read what a session did.
 ---
 
 # agent-talk
 
 agent-talk sends messages to other agents' sessions on this machine and reads their replies.
-The agent names are `codex`, `claude`, `opencode`, `grok` and `antigravity`. A session is
+The agent names are `codex`, `claude`, `opencode`, `grok`, `antigravity` and `pi`. A session is
 identified by a handle, `<agent>:<id>`, returned by `new` or `ls`. Every command accepts `--json`
 for structured output.
 
@@ -41,7 +41,7 @@ agent-talk send <handle> "<text>" --wait
 ```
 
 `ls` lists matching sessions with their handles, states and message previews. Omit `--agent` to
-list all five agents. `send` continues the selected session with its history, including sessions
+list all six agents. `send` continues the selected session with its history, including sessions
 created outside agent-talk. Sessions created by agent-talk retain their model, effort and
 `--full-access` setting on subsequent sends.
 
@@ -51,7 +51,9 @@ reply. `--steer` adds it to the running turn instead and is refused when the ses
 A session open in another client accepts messages when that client shares it with agent-talk: a
 Codex TUI attached to the shared app-server daemon, any OpenCode client, or a Grok TUI started with
 `--leader`. Other live clients, including Claude Code and Antigravity TUIs, cause `E_FOREIGN_LIVE`
-until they release the session. In sessions created outside agent-talk, agent-talk leaves approval
+until they release the session. A pi TUI cannot be detected: a `send` to a session it has open
+is not refused, but the TUI does not show the message and its next message branches the
+conversation, so send only to pi sessions that are not open in a TUI. In sessions created outside agent-talk, agent-talk leaves approval
 requests for the user to answer.
 
 Antigravity releases a session when the user switches away with `/new`, but keeps it in memory.
@@ -73,7 +75,7 @@ agent-talk wait <handle> --receipt <receipt-id>
 If the turn has finished, `wait` returns its result immediately. Otherwise, it waits up to 600
 seconds by default; `--timeout <seconds>` sets a different limit.
 
-Claude Code, Grok and Antigravity run the turn to its end even without `--wait`. For parallel work
+Claude Code, Grok, Antigravity and pi run the turn to its end even without `--wait`. For parallel work
 with these agents, run each command as a separate background job and keep `--wait` to include the
 reply in its output.
 

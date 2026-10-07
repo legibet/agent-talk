@@ -26,7 +26,7 @@ use std::time::Duration;
 
 const INSTRUCTIONS: &str = "Tools for sending messages to sessions of other agents on this \
 machine and reading their replies. The agents are codex (Codex), claude (Claude Code), opencode \
-(OpenCode), grok (Grok CLI) and antigravity (Antigravity CLI). A session is identified by a \
+(OpenCode), grok (Grok CLI), antigravity (Antigravity CLI) and pi. A session is identified by a \
 handle, <agent>:<id>, which new and ls return. A turn can take minutes. If new or send times \
 out or loses its connection, the message may already have been delivered. Resending can \
 duplicate it. When the error includes a receipt, use its receipt_id with wait to check the \
@@ -49,7 +49,7 @@ pub struct Server {
 
 #[derive(Deserialize, JsonSchema)]
 struct ModelsParams {
-    /// `codex`, `claude`, `opencode`, `grok` or `antigravity`.
+    /// `codex`, `claude`, `opencode`, `grok`, `antigravity` or `pi`.
     agent: String,
     /// Filter model IDs by a case-insensitive substring.
     query: Option<String>,
@@ -61,7 +61,7 @@ struct ModelsParams {
 
 #[derive(Deserialize, JsonSchema)]
 struct LsParams {
-    /// Filter by agent: `codex`, `claude`, `opencode`, `grok` or `antigravity`. Lists all agents when omitted.
+    /// Filter by agent: `codex`, `claude`, `opencode`, `grok`, `antigravity` or `pi`. Lists all agents when omitted.
     agent: Option<String>,
     /// Only sessions in this directory, given as an absolute path.
     cwd: Option<String>,
@@ -73,7 +73,7 @@ struct LsParams {
 
 #[derive(Deserialize, JsonSchema)]
 struct NewParams {
-    /// `codex`, `claude`, `opencode`, `grok` or `antigravity`.
+    /// `codex`, `claude`, `opencode`, `grok`, `antigravity` or `pi`.
     agent: String,
     /// Working directory of the session, given as an absolute path.
     cwd: String,

@@ -5,13 +5,13 @@
 """Live regression harness for agent-talk.
 
 Runs the real `agent-talk` binary against the installed agents (Codex daemon, `claude -p`,
-OpenCode service, `grok agent stdio`, `agy -p`) on cheap models (Grok and Antigravity have no
+OpenCode service, `grok agent stdio`, `agy -p`, `pi --mode json`) on cheap models (Grok and Antigravity have no
 cheaper model than grok-4.7 / gemini-3.8-flash) and checks the behavior documented in DESIGN.md.
 
-    uv run tests/live.py (offline|codex|claude|opencode|grok|antigravity ... | all) [--keep]
+    uv run tests/live.py (offline|codex|claude|opencode|grok|antigravity|pi ... | all) [--keep]
 
 Models: LIVE_CODEX_MODEL, LIVE_CLAUDE_MODEL, LIVE_OPENCODE_MODEL, LIVE_GROK_MODEL,
-LIVE_ANTIGRAVITY_MODEL override the defaults below. Exit 0 only when every requested check ran
+LIVE_ANTIGRAVITY_MODEL, LIVE_PI_MODEL override the defaults below. Exit 0 only when every requested check ran
 and passed.
 """
 
@@ -43,6 +43,7 @@ CLAUDE_MODEL = os.environ.get("LIVE_CLAUDE_MODEL", "sonnet")
 OPENCODE_MODEL = os.environ.get("LIVE_OPENCODE_MODEL", "deepseek/deepseek-flash")
 GROK_MODEL = os.environ.get("LIVE_GROK_MODEL", "grok-4.7")
 ANTIGRAVITY_MODEL = os.environ.get("LIVE_ANTIGRAVITY_MODEL", "gemini-3.8-flash")
+PI_MODEL = os.environ.get("LIVE_PI_MODEL", "deepseek/deepseek-flash")
 
 BASE_ENV = {
     k: v
@@ -54,6 +55,7 @@ BASE_ENV = {
         "OPENCODE_SESSION_ID",
         "GROK_SESSION_ID",
         "ANTIGRAVITY_CONVERSATION_ID",
+        "PI_SESSION_ID",
         "AGENT_TALK_CALLER",
     )
 }
@@ -73,9 +75,11 @@ created = {
     "claude_sessions": [],
     "grok": [],
     "antigravity": [],
+    "pi_sessions": [],
     # receipts whose run logs under ~/.agent-talk/<agent>-runs the run created
     "claude_receipts": [],
     "antigravity_receipts": [],
+    "pi_receipts": [],
 }
 
 
@@ -150,7 +154,7 @@ def cli(*args, env=None, expect_exit=0, during=None) -> dict:
     # remember the run logs the harness created
     for r in (out.get("receipt"), (out.get("error") or {}).get("receipt")):
         agent = str(r.get("handle", "")).split(":", 1)[0] if r else ""
-        if agent in ("claude", "antigravity") and args and args[0] in ("new", "send"):
+        if agent in ("claude", "antigravity", "pi") and args and args[0] in ("new", "send"):
             created[f"{agent}_receipts"].append(r["receipt_id"])
         if agent == "codex" and args and args[0] == "new":
             created["codex"].append(native(r["handle"]))
@@ -1631,6 +1635,170 @@ def antigravity_tier():
 # ---------------------------------------------------------------- setup, cleanup
 
 
+# ---------------------------------------------------------------- pi
+
+PI_SESSIONS = Path(os.environ.get("PI_CODING_AGENT_DIR") or Path.home() / ".pi/agent") / "sessions"
+
+
+def pi_session_file(session_id: str) -> Path | None:
+    hits = list(PI_SESSIONS.glob(f"*/*_{session_id}.jsonl"))
+    return hits[0] if hits else None
+
+
+def pi_entries(session_id: str) -> list[dict]:
+    path = pi_session_file(session_id)
+    return [json.loads(l) for l in path.read_text().splitlines() if l.strip()] if path else []
+
+
+def pi_tier():
+    def p1():
+        out = cli(
+            "new",
+            "pi",
+            "--cwd",
+            str(DIR),
+            "--model",
+            PI_MODEL,
+            "--effort",
+            "low",
+            "--name",
+            "live",
+            "--wait",
+            "reply with the single word pong",
+        )
+        st["PI"] = out["handle"]
+        created["pi_sessions"].append(native(out["handle"]))
+        expect(out["receipt"]["state"] == "accepted", "receipt accepted")
+        expect(out["receipt"]["turn_id"] == out["turn"]["turn_id"], "receipt.turn_id == turn.turn_id")
+        expect(out["turn"]["status"] == "completed", "completed")
+        expect("pong" in final(out), "final ~ pong")
+        expect(out["turn"].get("basis"), "turn.basis present")
+        entries = pi_entries(native(out["handle"]))
+        user = next((e for e in entries if e.get("type") == "message" and e["message"]["role"] == "user"), None)
+        expect(user is not None and user["id"] == out["turn"]["turn_id"], "turn id is the user entry id")
+        kinds = {e.get("type"): e for e in entries}
+        expect(kinds.get("session_info", {}).get("name") == "live", "session_info name == live")
+        expect(kinds.get("thinking_level_change", {}).get("thinkingLevel") == "low", "thinking level low")
+        rows = cli("ls", "--agent", "pi", "--cwd", str(DIR))["sessions"]
+        row = next((r for r in rows if r["handle"] == out["handle"]), None)
+        expect(row is not None and row["owned"] and row["name"] == "live", "ls: owned, name live")
+        expect(row["observations"]["origin"] == "agent-talk", "ls: origin agent-talk")
+
+    def p2():
+        need("PI")
+        out = cli(
+            "send", st["PI"], "reply with the single word kiwi", "--wait", env={"AGENT_TALK_CALLER": "codex:harness"}
+        )
+        expect(out["from"].get("session") == "codex:harness", "from.session == codex:harness")
+        expect("kiwi" in final(out), "final ~ kiwi")
+        turn = out["receipt"]["turn_id"]
+        out = cli("read", st["PI"], "--limit", "2")
+        m0, m1 = out["messages"]
+        expect(m0["turn_id"] == turn and m0["item_id"] == turn, "messages[0] is the prompt entry of the turn")
+        expect((m0.get("from") or {}).get("session") == "codex:harness", "messages[0].from.session")
+        expect(m0["text"].startswith("[from codex:harness "), "text starts with header")
+        expect(m1["phase"] == "final" and "kiwi" in m1["text"], "messages[1] final ~ kiwi")
+        # send passes no model or thinking level; pi restores the ones new stored in the file.
+        reply = [
+            e
+            for e in pi_entries(native(st["PI"]))
+            if e.get("type") == "message" and e["message"]["role"] == "assistant"
+        ]
+        provider, model = PI_MODEL.split("/", 1)
+        expect(
+            reply and (reply[-1]["message"].get("provider"), reply[-1]["message"].get("model")) == (provider, model),
+            f"reply model is {PI_MODEL}",
+        )
+        expect(reply and reply[-1]["message"].get("thinkingLevel") == "low", "reply thinking level is low")
+
+    def p3():
+        need("PI")
+        out = cli(
+            "send", st["PI"], "count from 1 to 2000, one number per line", "--wait", "--timeout", "3", expect_exit=3
+        )
+        expect(err(out).get("code") == "E_TIMEOUT", "E_TIMEOUT")
+        expect(err(out).get("state") == "running", "error.state == running")
+        rec = err(out).get("receipt") or {}
+        expect(rec.get("receipt_id") and rec.get("state") == "accepted", "receipt accepted")
+        out = cli("send", st["PI"], "x", expect_exit=2)
+        expect(err(out).get("code") == "E_LOCKED", "E_LOCKED while the child runs")
+        rows = cli("ls", "--agent", "pi", "--cwd", str(DIR))["sessions"]
+        row = next((r for r in rows if r["handle"] == st["PI"]), None)
+        expect(row is not None and row["state"] == "running", "ls: state running")
+        out = cli("wait", st["PI"], "--receipt", rec["receipt_id"], "--timeout", "120")
+        expect(out["turn"]["status"] == "completed", "completed")
+        expect(out["turn"]["turn_id"] == rec["turn_id"], "wait names the receipt's turn")
+
+    def p4():
+        need("PI")
+        out = cli("send", st["PI"], "x", "--steer", expect_exit=2)
+        expect(err(out).get("code") == "E_NO_STEER", "E_NO_STEER")
+        out = cli("send", f"pi:{uuid.uuid4()}", "x", expect_exit=2)
+        expect(err(out).get("code") == "E_PRECONDITION", "E_PRECONDITION for an unknown session")
+        out = cli("models", "pi", PI_MODEL.split("/", 1)[1])
+        row = next((m for m in out["models"] if m["id"] == PI_MODEL), None)
+        expect(row is not None and "low" in row["efforts"], f"models lists {PI_MODEL} with effort low")
+
+    def p5():
+        # A session pi wrote on its own (no agent-talk): its turn ends are read from the file,
+        # and a send resumes it in place.
+        f = str(uuid.uuid4())
+        created["pi_sessions"].append(f)
+        p = subprocess.run(
+            ["pi", "--mode", "json", "--model", PI_MODEL, "--thinking", "low", "--session-id", f],
+            cwd=DIR,
+            input="reply with the single word ok",
+            capture_output=True,
+            text=True,
+            env=BASE_ENV,
+            timeout=120,
+        )
+        expect(p.returncode == 0, f"pi --mode json exited {p.returncode}: {p.stderr[-300:]}")
+        user = next(e for e in pi_entries(f) if e.get("type") == "message" and e["message"]["role"] == "user")
+        handle = f"pi:{f}"
+        out = cli("wait", handle, "--turn", user["id"], "--timeout", "10")
+        expect(out["turn"]["status"] == "completed", "completed from the session file")
+        expect("ok" in final(out), "final ~ ok")
+        expect("session file" in (out["turn"].get("basis") or ""), "basis names the session file")
+        out = cli("wait", handle, "--turn", "nothere", "--timeout", "5", expect_exit=2)
+        expect(err(out).get("code") == "E_PRECONDITION", "E_PRECONDITION for an unknown turn")
+        out = cli("send", handle, "reply with the single word two", "--wait")
+        expect("two" in final(out), "send resumes the foreign session")
+        out = cli("read", handle, "--limit", "4")
+        expect([m["phase"] for m in out["messages"]] == ["prompt", "final", "prompt", "final"], "read: two turns")
+        expect(
+            (out["messages"][2].get("from") or {}).get("kind") == "unknown",
+            "a prompt sent from the CLI by a person: from.kind unknown",
+        )
+        rows = cli("ls", "--agent", "pi", "--cwd", str(DIR))["sessions"]
+        row = next((r for r in rows if r["handle"] == handle), None)
+        expect(row is not None and not row["owned"] and row["observations"]["origin"] == "pi", "ls: not owned")
+
+    def p6():
+        m = Mcp()
+        try:
+            is_err, out = m.call(
+                "new",
+                {
+                    "agent": "pi",
+                    "cwd": str(DIR),
+                    "model": PI_MODEL,
+                    "prompt": "reply with the single word pong",
+                    "full_access": True,
+                    "wait": True,
+                },
+            )
+        finally:
+            m.close()
+        expect(not is_err, "isError false")
+        created["pi_sessions"].append(native(out["handle"]))
+        created["pi_receipts"].append(out["receipt"]["receipt_id"])
+        expect(out["turn"]["status"] == "completed" and "pong" in final(out), "completed ~ pong")
+
+    for name, fn in (("P1", p1), ("P2", p2), ("P3", p3), ("P4", p4), ("P5", p5), ("P6", p6)):
+        check("pi", name, fn)
+
+
 def preconditions() -> dict[str, str | None]:
     """agent -> None when new and send can run, else the reasons from status."""
     out = json.loads(subprocess.run([B, "status", "--json"], capture_output=True, text=True, env=BASE_ENV).stdout)
@@ -1664,7 +1832,11 @@ def cleanup():
         if (path := claude_transcript(sid)) is not None:
             path.unlink()
             print(f"cleanup: deleted {path}")
-    for agent in ("claude", "antigravity"):
+    for sid in created["pi_sessions"]:
+        if (path := pi_session_file(sid)) is not None:
+            path.unlink()
+            print(f"cleanup: deleted {path}")
+    for agent in ("claude", "antigravity", "pi"):
         runs = Path.home() / f".agent-talk/{agent}-runs"
         receipts = set(created[f"{agent}_receipts"])
         for rid in receipts:
@@ -1684,7 +1856,7 @@ def cleanup():
 def main():
     args = sys.argv[1:]
     keep = "--keep" in args
-    all_tiers = ["offline", "codex", "claude", "opencode", "grok", "antigravity"]
+    all_tiers = ["offline", "codex", "claude", "opencode", "grok", "antigravity", "pi"]
     tiers = [a for a in args if a != "--keep"]
     if not tiers:
         sys.exit(f"usage: uv run tests/live.py ({'|'.join(all_tiers)} ... | all) [--keep]")
@@ -1721,6 +1893,8 @@ def main():
             grok_tier()
         if run["antigravity"]:
             antigravity_tier()
+        if run["pi"]:
+            pi_tier()
         if run["codex"]:
             codex_c6()
     finally:

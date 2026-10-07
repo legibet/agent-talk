@@ -66,7 +66,7 @@ enum Cmd {
     /// List the models an agent can start a session on, with the effort values each
     /// takes; one page per call, sorted by id.
     Models {
-        /// codex, claude, opencode, grok or antigravity.
+        /// codex, claude, opencode, grok, antigravity or pi.
         agent: String,
         /// Only models whose id contains this text.
         query: Option<String>,
@@ -79,7 +79,7 @@ enum Cmd {
     },
     /// List sessions, one page per call; pass a handle to send or read.
     Ls {
-        /// Only this agent: codex, claude, opencode, grok or antigravity.
+        /// Only this agent: codex, claude, opencode, grok, antigravity or pi.
         #[arg(long)]
         agent: Option<String>,
         /// Only sessions in this working directory.
@@ -97,7 +97,7 @@ enum Cmd {
     },
     /// Start a session with a first message; prints its handle and a receipt.
     New {
-        /// codex, claude, opencode, grok or antigravity.
+        /// codex, claude, opencode, grok, antigravity or pi.
         agent: String,
         /// The first message.
         prompt: String,

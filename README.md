@@ -2,8 +2,8 @@
 
 agent-talk lets an agent send a message to another agent's session and read the reply, across
 agents, using only each agent's official non-interactive interfaces. It works as a command-line
-tool and as an MCP server, and it supports Codex, Claude Code, OpenCode, Grok CLI and Antigravity
-CLI.
+tool and as an MCP server, and it supports Codex, Claude Code, OpenCode, Grok CLI, Antigravity
+CLI and pi.
 
 agent-talk does not run a daemon of its own. Each command connects to the agent, performs one
 operation and exits. The session it reaches is the agent's own session, with its full history.
@@ -32,6 +32,7 @@ cargo install agent-talk
 | OpenCode 2.x    | shared background service                                          | an open `opencode` client, or `opencode service start` |
 | Grok CLI        | ACP to `grok agent stdio`, through the shared leader when one runs | none                                                   |
 | Antigravity CLI | `agy -p`                                                           | none                                                   |
+| pi              | `pi --mode json`                                                   | none                                                   |
 
 agent-talk connects to the shared daemon, service or leader when it is running, but never starts
 one itself.
@@ -97,6 +98,10 @@ agent's own TUI or app depends on the agent.
   `E_FOREIGN_LIVE`. After the TUI switches to another conversation with `/new`, agent-talk can
   send, but the TUI still holds the old conversation in memory. If the user returns to it with
   `/resume`, the TUI overwrites the messages that agent-talk added.
+- pi: not safely. pi records nothing about running processes, so agent-talk cannot tell a session
+  open in a TUI from an idle one and does not refuse. The TUI does not show the message or the
+  reply, and its next message branches the conversation; only one branch is visible when the
+  session is next opened. Send to pi sessions that are not open in a TUI.
 
 ## Skill
 

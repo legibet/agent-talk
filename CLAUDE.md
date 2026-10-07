@@ -1,7 +1,7 @@
 # agent-talk
 
 Rust CLI and stdio MCP server that sends messages to agent sessions (Codex, Claude Code,
-OpenCode, Grok CLI, Antigravity CLI) through each agent's official interface, and reads the
+OpenCode, Grok CLI, Antigravity CLI, pi) through each agent's official interface, and reads the
 replies. No daemon of its own; state lives with the agents, plus intents and receipts in
 `~/.agent-talk/store.db`.
 
@@ -37,7 +37,7 @@ alongside them:
 cargo test
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
-uv run tests/live.py offline <tier>    # tiers: codex claude opencode grok antigravity, or all
+uv run tests/live.py offline <tier>    # tiers: codex claude opencode grok antigravity pi, or all
 ```
 
 Every live tier but `offline` spends real model calls, Grok and Antigravity the most. Run the
@@ -49,8 +49,11 @@ in `tests/live.py`. Add a test only when it would catch a real regression. Pytho
 
 - Receipt and approval semantics live once in `src/agents/mod.rs`; each adapter keeps its own
   observe loop (DESIGN.md §3, §7).
-- Decode agent responses into types only where a decode failure must be an error; everything
-  else stays `serde_json::Value`.
+- File records and events are decoded into small structs where that reads better than
+  `Value` indexing: optional fields default, unknown variants are tolerated, the raw record is
+  kept, and content a struct does not recognize never counts as a turn's end. Strict decoding,
+  where a failure is an error, only where it must be. Payloads agent-talk only passes through
+  stay `serde_json::Value`.
 - Comments cite `DESIGN.md §N`; a fact about an agent that the design does not cover names the
   version it was observed on.
 - A behaviour change updates DESIGN.md, and `skills/agent-talk/SKILL.md` where it states that

@@ -6,14 +6,14 @@
 foreign-session refusals, MCP over stdio. The unit tests (`cargo test`) cover the parsing rules;
 this covers what only the agents can show.
 
-    uv run tests/live.py (offline|codex|claude|opencode|grok|antigravity ... | all) [--keep]
+    uv run tests/live.py (offline|codex|claude|opencode|grok|antigravity|pi ... | all) [--keep]
 
 Every tier but `offline` makes real model calls, so name the tiers you need: the one for the
 adapter you changed, `offline` always, `all` before a release. The Grok and Antigravity tiers
 are the expensive ones (grok-4.7 and gemini-3.8-flash have no cheaper sibling). Default models
-are gpt-6-luna, sonnet, deepseek/deepseek-flash, grok-4.7 and gemini-3.8-flash; override them
-with `LIVE_CODEX_MODEL`, `LIVE_CLAUDE_MODEL`, `LIVE_OPENCODE_MODEL`, `LIVE_GROK_MODEL`,
-`LIVE_ANTIGRAVITY_MODEL`. A full run takes about 8 minutes, including a deliberate ~65 s idle
+are gpt-6-luna, sonnet, deepseek/deepseek-flash, grok-4.7, gemini-3.8-flash and
+deepseek/deepseek-flash; override them with `LIVE_CODEX_MODEL`, `LIVE_CLAUDE_MODEL`,
+`LIVE_OPENCODE_MODEL`, `LIVE_GROK_MODEL`, `LIVE_ANTIGRAVITY_MODEL`, `LIVE_PI_MODEL`. A full run takes about 8 minutes, including a deliberate ~65 s idle
 wait before C6.
 
 Approval checks on sessions agent-talk did not start (C4, P7) create those sessions themselves,
@@ -30,8 +30,8 @@ leader cases need an isolated `GROK_HOME` and a short socket path and are run by
 against the user's `~/.grok/leader.sock`.
 
 All sessions use `target/live-work`. Cleanup deletes only what the run created: its OpenCode
-sessions, its Claude transcripts, its Grok sessions (`grok sessions delete`) and its
-`~/.agent-talk/*-runs` logs, and archives its Codex threads (`thread/archive`). Files the checks
+sessions, its Claude transcripts, its pi session files, its Grok sessions (`grok sessions
+delete`) and its `~/.agent-talk/*-runs` logs, and archives its Codex threads (`thread/archive`). Files the checks
 write stay under `target/live-work`. agy has no delete command, so Antigravity conversations stay
 and are printed at the end; intents stay in `~/.agent-talk/store.db`. The run also spawns and
 kills its own foreign test processes: a `claude -p`, an `agy -p` holding a presence lock, a standalone
