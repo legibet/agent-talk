@@ -21,28 +21,29 @@ mod process;
 mod stream;
 mod transcript;
 
-use self::process::{agent_error, args, spawn, wait_init};
+use self::process::{agent_error, args, wait_init};
 use self::stream::{Event, Run, decode, denials, result_turn};
 use self::transcript::{
     ends_with_reply, load, messages, preview, span_reply, turn_span, user_input,
 };
-use crate::agents::child::{agent_cmd, cli_version, lock, pid_alive, tail};
+use crate::agents::child::{Runs, agent_cmd, cli_version, lock, observe, pid_alive, tail};
 use crate::agents::history::{ReadPage, ReadQuery, cut};
-use crate::agents::lifecycle::{bounded, record, settle, wait_receipt};
+use crate::agents::lifecycle::{bounded, note_waiting, record, reject, settle, wait_receipt};
 use crate::agents::{
-    Agent, AgentStatus, Check, ListFilter, Operation, SendRequest, StartRequest, WaitTarget,
+    Agent, AgentStatus, Check, ListFilter, Operation, SendRequest, Settings, StartRequest,
+    WaitTarget,
 };
 use crate::model::{
     self, Approval, Error, ErrorCode, History, Loaded, Model, Observations, Outcome, Page,
-    Progress, ReceiptState, Result, Role, Session, SessionState, TurnStatus,
+    Progress, Result, Role, Session, SessionState, TurnStatus,
 };
 use crate::store::{NewIntent, Store};
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde_json::{Value, json};
 use std::fs::{File, TryLockError};
 use std::path::{Path, PathBuf};
+use std::process::ExitStatus;
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
 use tokio::process::Child;
 use tokio::time::Instant;
 
@@ -57,7 +58,7 @@ pub struct Antigravity<'a> {
     /// `~/.gemini/antigravity-cli`
     dir: PathBuf,
     /// `~/.agent-talk/antigravity-runs`
-    runs: PathBuf,
+    runs: Runs,
 }
 
 fn handle(id: &str) -> String {
@@ -178,16 +179,11 @@ fn uri_path(uri: &str) -> Option<String> {
 impl<'a> Antigravity<'a> {
     pub fn new(store: &'a Store) -> Self {
         let home = std::env::home_dir().unwrap_or_default();
-        let data = home.join(".agent-talk");
         Antigravity {
             store,
             dir: home.join(".gemini/antigravity-cli"),
-            runs: data.join("antigravity-runs"),
+            runs: Runs::new("agy", "antigravity"),
         }
-    }
-
-    fn log_path(&self, receipt_id: &str) -> PathBuf {
-        self.runs.join(format!("{receipt_id}.ndjson"))
     }
 
     fn transcript_path(&self, id: &str) -> PathBuf {
@@ -282,14 +278,10 @@ impl<'a> Antigravity<'a> {
     }
 
     /// Of the conversation's recorded agy processes, the pid of one still running its
-    /// turn: alive, and its run log has no `result` yet.
+    /// turn: its run log has no `result` yet.
     fn own_run(&self, procs: &[(String, u32)]) -> Option<u32> {
-        procs
-            .iter()
-            .find(|(receipt_id, pid)| {
-                pid_alive(*pid) && Run::from_log(&self.log_path(receipt_id)).result.is_none()
-            })
-            .map(|(_, pid)| *pid)
+        self.runs
+            .running(procs, |log| Run::from_log(log).result.is_some())
     }
 
     /// Refuse while anything else has the conversation open. agent-talk's own children are
@@ -318,22 +310,20 @@ impl<'a> Antigravity<'a> {
 
     /// What the run log of a run that is over (a `result`, or the process gone) means:
     /// without a user step agy never took the message and the receipt is `rejected` with
-    /// agy's error; without a `result` the turn's outcome is unknown; otherwise the turn is
-    /// the `result`, and its denials are recorded. `exit_code` is known when this command
-    /// saw the process exit.
+    /// agy's error (DESIGN.md §3); without a `result` the turn's outcome is unknown;
+    /// otherwise the turn is the `result`, and its denials are recorded. `status` is known
+    /// when this command saw the process exit.
     fn finished(
         &self,
         h: &str,
         receipt_id: &str,
-        log: &Path,
         run: &Run,
-        exit_code: Option<i32>,
+        status: Option<ExitStatus>,
     ) -> Result<(model::Turn, Vec<Approval>)> {
         let Some(turn_id) = run.turn_id() else {
-            let agent_error = agent_error(log, run, exit_code);
-            self.store
-                .settle_unaccepted(receipt_id, ReceiptState::Rejected, Some(&agent_error))?;
-            return Err(Error::from_agent(ErrorCode::Precondition, agent_error));
+            let e = agent_error(&self.runs, receipt_id, run, status);
+            let e = Error::from_agent(ErrorCode::Precondition, e);
+            return Err(reject(self.store, receipt_id, e));
         };
         let Some(result) = &run.result else {
             let turn = model::Turn {
@@ -342,7 +332,7 @@ impl<'a> Antigravity<'a> {
                 status: TurnStatus::Unknown,
                 error: Some(json!({
                     "message": "agy exited without a result event",
-                    "exit_code": exit_code,
+                    "exit_code": status.and_then(|s| s.code()),
                 })),
                 final_text: None,
                 duration_ms: None,
@@ -365,40 +355,27 @@ impl<'a> Antigravity<'a> {
     async fn execute(
         &self,
         mut child: Child,
-        log: PathBuf,
         mut watch: RunWatch,
         prompt: &str,
         deadline: Option<Instant>,
     ) -> Result<Outcome> {
         let h = handle(&watch.id);
+        let log = self.runs.log(&watch.receipt_id);
         if let Some(pid) = child.id() {
             self.store.insert_process(&watch.receipt_id, &h, pid)?;
         }
         let line = json!({"event": "user", "message": {"content": prompt}}).to_string();
         let mut approvals = Vec::new();
         let work = async {
-            let mut stdin = child.stdin.take().expect("stdin is piped");
-            stdin
-                .write_all(format!("{line}\n").as_bytes())
-                .await
-                .map_err(|e| Error::transport("write the message to agy", e))?;
-            // Closing stdin makes agy exit after this turn's result.
-            stdin
-                .shutdown()
-                .await
-                .map_err(|e| Error::transport("close agy stdin", e))?;
-            drop(stdin);
+            self.runs
+                .deliver(&mut child, format!("{line}\n").as_bytes())
+                .await?;
             let status = tail(&mut child, &log, |l| watch.on_event(self.store, l)).await?;
-            let (turn, denied) =
-                self.finished(&h, &watch.receipt_id, &log, &watch.run, status.code())?;
+            let (turn, denied) = self.finished(&h, &watch.receipt_id, &watch.run, Some(status))?;
             approvals = denied;
             Ok(turn)
         };
-        // Without --wait the turn still runs to completion (synchronous sends); only
-        // Ctrl-C stops observing early.
-        let res = bounded(deadline, work).await;
-        // Without a deadline the turn is not reported even though it ran to completion.
-        let res = res.map(|turn| deadline.is_some().then_some(turn));
+        let res = observe(deadline, work).await;
         settle(
             self.store,
             h,
@@ -639,20 +616,22 @@ impl Agent for Antigravity<'_> {
             ));
         }
         let receipt_id = uuid::Uuid::new_v4().to_string();
-        let log = self.log_path(&receipt_id);
-        let mut child = spawn(
+        let args = args(
+            None,
+            req.settings.model.as_deref(),
+            req.settings.effort.as_deref(),
+            req.settings.full_access,
+        );
+        // No intent yet, so a spawn failure has no receipt to settle.
+        let mut child = self.runs.spawn(
+            self.store,
+            agent_cmd("agy").args(&args),
             req.cwd,
-            &args(
-                None,
-                req.settings.model.as_deref(),
-                req.settings.effort.as_deref(),
-                req.settings.full_access,
-            ),
-            &log,
+            &receipt_id,
         )?;
         // The conversation id exists only once agy reports it; the intent is written then,
         // before the message is.
-        let id = match bounded(deadline, wait_init(&mut child, &log)).await {
+        let id = match bounded(deadline, wait_init(&mut child, &self.runs, &receipt_id)).await {
             Ok(id) => id,
             Err(mut e) => {
                 // Closing stdin unsent makes agy exit without a turn.
@@ -660,7 +639,7 @@ impl Agent for Antigravity<'_> {
                 if matches!(e.code, ErrorCode::Timeout | ErrorCode::Interrupted) {
                     e.message = format!(
                         "agy did not report a conversation id before the deadline; no message was sent (agy may leave an empty conversation; run log {})",
-                        log.display()
+                        self.runs.log(&receipt_id).display()
                     );
                 }
                 return Err(e);
@@ -683,7 +662,7 @@ impl Agent for Antigravity<'_> {
             receipt_id,
             run: Run::default(),
         };
-        self.execute(child, log, watch, req.message.delivered, deadline)
+        self.execute(child, watch, req.message.delivered, deadline)
             .await
     }
 
@@ -726,7 +705,8 @@ impl Agent for Antigravity<'_> {
             },
         };
         // A resumed conversation keeps none of its settings, so they all pass again.
-        let settings = req.settings.cloned().unwrap_or_default();
+        let unset = Settings::default();
+        let settings = req.settings.unwrap_or(&unset);
         let args = args(
             Some(id),
             settings.model.as_deref(),
@@ -740,21 +720,15 @@ impl Agent for Antigravity<'_> {
             client_msg_id: &receipt_id,
             message: &req.message,
         })?;
-        let log = self.log_path(&receipt_id);
-        let child = match spawn(&cwd, &args, &log) {
-            Ok(c) => c,
-            Err(e) => {
-                self.store
-                    .settle_unaccepted(&receipt_id, ReceiptState::Rejected, None)?;
-                return Err(e);
-            }
-        };
+        let child = self
+            .runs
+            .spawn(self.store, agent_cmd("agy").args(&args), &cwd, &receipt_id)?;
         let watch = RunWatch {
             id: id.to_string(),
             receipt_id,
             run: Run::default(),
         };
-        self.execute(child, log, watch, req.message.delivered, deadline)
+        self.execute(child, watch, req.message.delivered, deadline)
             .await
     }
 
@@ -795,7 +769,7 @@ impl Agent for Antigravity<'_> {
         // here, once, when the run log shows it.
         let mut unaccepted = receipt.as_ref().is_some_and(|r| r.turn_id.is_none());
         let receipt_id = receipt.map(|r| r.receipt_id);
-        let run_log = receipt_id.as_deref().map(|r| (r, self.log_path(r)));
+        let run_log = receipt_id.as_deref().map(|r| (r, self.runs.log(r)));
         // What the last poll was waiting for, reported at the deadline.
         let mut waiting_for = String::new();
         let work = async {
@@ -812,7 +786,7 @@ impl Agent for Antigravity<'_> {
                     let pid = self.store.process(r)?;
                     if run.result.is_some() || !pid.is_some_and(pid_alive) {
                         // This command did not start the process: no exit code.
-                        let (turn, denied) = self.finished(&h, r, log, &run, None)?;
+                        let (turn, denied) = self.finished(&h, r, &run, None)?;
                         approvals = denied;
                         return Ok(turn);
                     }
@@ -840,14 +814,7 @@ impl Agent for Antigravity<'_> {
         let res = bounded(Some(deadline), work)
             .await
             .map(Some)
-            .map_err(|mut e| {
-                if matches!(e.code, ErrorCode::Timeout | ErrorCode::Interrupted)
-                    && !waiting_for.is_empty()
-                {
-                    e.message = format!("{}; {waiting_for}", e.message);
-                }
-                e
-            });
+            .map_err(|e| note_waiting(e, &waiting_for));
         settle(
             self.store,
             h,

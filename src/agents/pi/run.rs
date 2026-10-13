@@ -1,15 +1,12 @@
-//! The `pi --mode json` child: command line, spawn into a run log, and what the run log
-//! (its stdout) says about the turn. Reading the log as it is written is `agents::child::tail`.
+//! The `pi --mode json` child: command line, and what the run log (its stdout) says about
+//! the turn. Spawning into the run log and reading it are `agents::child`.
 
 use super::session::{self, Body};
-use crate::agents::child::agent_cmd;
-use crate::model::{self, Error, Result, TurnStatus};
+use crate::model::{self, TurnStatus};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::fs::File;
 use std::path::Path;
-use std::process::{ExitStatus, Stdio};
-use tokio::process::Child;
+use std::process::ExitStatus;
 
 /// `pi --mode json` arguments for one turn; `session` is `--session-id <id>` for a new
 /// session or `--session <path>` to resume one. A resumed session takes the model of its
@@ -34,28 +31,6 @@ pub fn args(
         args.extend(["--name".into(), n.into()]);
     }
     args
-}
-
-/// Spawn `pi` with stdout to the run log `log` (stderr next to it), in its own process
-/// group so that Ctrl-C on agent-talk stops observing, not the turn. The prompt goes to
-/// stdin: pi reads piped stdin to EOF as the prompt, which keeps `@file` and option
-/// parsing away from the text.
-pub fn spawn(cwd: &str, args: &[String], log: &Path) -> Result<Child> {
-    if let Some(dir) = log.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| Error::transport("create run dir", e))?;
-    }
-    let out = File::create(log).map_err(|e| Error::transport(log.display(), e))?;
-    let err = File::create(log.with_extension("stderr"))
-        .map_err(|e| Error::transport(log.display(), e))?;
-    agent_cmd("pi")
-        .args(args)
-        .current_dir(cwd)
-        .stdin(Stdio::piped())
-        .stdout(out)
-        .stderr(err)
-        .process_group(0)
-        .spawn()
-        .map_err(|e| Error::transport("spawn pi", e))
 }
 
 #[derive(Debug, Deserialize)]

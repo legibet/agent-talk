@@ -20,17 +20,18 @@ mod transcript;
 use self::process::{AgentEntry, agents};
 use self::stream::{Run, StreamEvent, System, denial, result_turn};
 use self::transcript::{TurnEnd, head, live_branch, load, slug, transcript_turn, turn_end};
-use crate::agents::child::{cli_version, lock, pid_alive, tail};
+use crate::agents::child::{Runs, cli_version, lock, observe, tail};
 use crate::agents::history::{ReadPage, ReadQuery, cut, first_line};
 use crate::agents::lifecycle::{
-    ApprovalPolicy, approval_policy, bounded, record, settle, wait_receipt,
+    ApprovalPolicy, approval_policy, bounded, note_waiting, record, reject, settle, wait_receipt,
 };
 use crate::agents::{
-    Agent, AgentStatus, Check, ListFilter, Operation, SendRequest, StartRequest, WaitTarget,
+    Agent, AgentStatus, Check, ListFilter, Operation, SendRequest, Settings, StartRequest,
+    WaitTarget,
 };
 use crate::model::{
-    self, AgentError, Approval, ApprovalOutcome, Error, ErrorCode, History, Loaded, Model,
-    Observations, Outcome, Page, Progress, ReceiptState, Result, Session, SessionState, TurnStatus,
+    self, Approval, ApprovalOutcome, Error, ErrorCode, History, Loaded, Model, Observations,
+    Outcome, Page, Progress, ReceiptState, Result, Session, SessionState, TurnStatus,
 };
 use crate::store::{NewIntent, Store};
 use serde::Deserialize;
@@ -38,7 +39,6 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, UNIX_EPOCH};
-use tokio::io::AsyncWriteExt;
 use tokio::time::Instant;
 
 /// Why agent-talk refuses a second writer (DESIGN.md §6.2).
@@ -55,7 +55,7 @@ pub struct Claude<'a> {
     /// `~/.claude/projects`
     projects: PathBuf,
     /// `~/.agent-talk/claude-runs`
-    runs: PathBuf,
+    runs: Runs,
 }
 
 fn handle(id: &str) -> String {
@@ -153,27 +153,18 @@ impl RunWatch {
 impl<'a> Claude<'a> {
     pub fn new(store: &'a Store) -> Self {
         let home = std::env::home_dir().unwrap_or_default();
-        let data = home.join(".agent-talk");
         Claude {
             store,
             projects: home.join(".claude/projects"),
-            runs: data.join("claude-runs"),
+            runs: Runs::new("claude", "claude"),
         }
     }
 
-    fn log_path(&self, receipt_id: &str) -> PathBuf {
-        self.runs.join(format!("{receipt_id}.ndjson"))
-    }
-
-    /// Of the claude processes recorded for the session (`Store::processes`), the pid of one
-    /// still running its turn: alive, and its run log has no `result` yet.
+    /// Of the claude processes recorded for the session, the pid of one still running its
+    /// turn: its run log has no `result` yet.
     fn own_run(&self, procs: &[(String, u32)]) -> Option<u32> {
-        procs
-            .iter()
-            .find(|(receipt_id, pid)| {
-                pid_alive(*pid) && Run::from_log(&self.log_path(receipt_id)).result.is_none()
-            })
-            .map(|(_, pid)| *pid)
+        self.runs
+            .running(procs, |log| Run::from_log(log).result.is_some())
     }
 
     /// Any process running this session, classified by agent-talk's pid records,
@@ -256,21 +247,19 @@ impl<'a> Claude<'a> {
     async fn execute(
         &self,
         cwd: &str,
-        args: Vec<String>,
+        args: &[String],
         mut watch: RunWatch,
         prompt: &str,
         deadline: Option<Instant>,
     ) -> Result<Outcome> {
         let h = handle(&watch.id);
-        let log = self.log_path(&watch.receipt_id);
-        let mut child = match process::spawn(cwd, &args, &log) {
-            Ok(c) => c,
-            Err(e) => {
-                self.store
-                    .settle_unaccepted(&watch.receipt_id, ReceiptState::Rejected, None)?;
-                return Err(e);
-            }
-        };
+        let log = self.runs.log(&watch.receipt_id);
+        let mut child = self.runs.spawn(
+            self.store,
+            &mut process::command(args),
+            cwd,
+            &watch.receipt_id,
+        )?;
         if let Some(pid) = child.id() {
             self.store.insert_process(&watch.receipt_id, &h, pid)?;
         }
@@ -283,38 +272,15 @@ impl<'a> Claude<'a> {
         })
         .to_string();
         let work = async {
-            let mut stdin = child.stdin.take().expect("stdin is piped");
-            stdin
-                .write_all(format!("{line}\n").as_bytes())
-                .await
-                .map_err(|e| Error::transport("write prompt to claude", e))?;
-            // Closing stdin makes claude exit after this turn's result.
-            stdin
-                .shutdown()
-                .await
-                .map_err(|e| Error::transport("close claude stdin", e))?;
-            drop(stdin);
+            self.runs
+                .deliver(&mut child, format!("{line}\n").as_bytes())
+                .await?;
             let status = tail(&mut child, &log, |l| watch.on_event(self.store, l)).await?;
+            // Neither init nor result: claude never took the message (DESIGN.md §3).
             if !watch.run.init && watch.run.result.is_none() {
-                let stderr = std::fs::read_to_string(log.with_extension("stderr"))
-                    .unwrap_or_default()
-                    .trim()
-                    .to_string();
-                let agent_error = AgentError {
-                    code: status.code().unwrap_or(-1).into(),
-                    message: if stderr.is_empty() {
-                        format!("claude exited with {status} before starting the session")
-                    } else {
-                        stderr
-                    },
-                    data: None,
-                };
-                self.store.settle_unaccepted(
-                    &watch.receipt_id,
-                    ReceiptState::Rejected,
-                    Some(&agent_error),
-                )?;
-                return Err(Error::from_agent(ErrorCode::Precondition, agent_error));
+                let e = self.runs.startup_error(&watch.receipt_id, Some(status));
+                let e = Error::from_agent(ErrorCode::Precondition, e);
+                return Err(reject(self.store, &watch.receipt_id, e));
             }
             let Some(r) = &watch.run.result else {
                 return Ok(model::Turn {
@@ -345,11 +311,7 @@ impl<'a> Claude<'a> {
             }
             Ok(result_turn(h.clone(), watch.turn_id.clone(), r))
         };
-        // Without --wait the turn still runs to completion (synchronous sends);
-        // only Ctrl-C stops observing early.
-        let res = bounded(deadline, work).await;
-        // Without a deadline the turn is not reported even though it ran to completion.
-        let res = res.map(|turn| deadline.is_some().then_some(turn));
+        let res = observe(deadline, work).await;
         settle(
             self.store,
             h,
@@ -606,7 +568,7 @@ impl Agent for Claude<'_> {
             run: Run::default(),
             approvals: Vec::new(),
         };
-        self.execute(req.cwd, args, watch, req.message.delivered, deadline)
+        self.execute(req.cwd, &args, watch, req.message.delivered, deadline)
             .await
     }
 
@@ -660,7 +622,8 @@ impl Agent for Claude<'_> {
         })?;
         // Claude restores the model from the transcript, so only a change passes it; effort
         // and permission mode are per process and come from the session's settings.
-        let settings = req.settings.cloned().unwrap_or_default();
+        let unset = Settings::default();
+        let settings = req.settings.unwrap_or(&unset);
         let args = process::args(
             ["--resume", id],
             req.change.model.as_deref(),
@@ -675,7 +638,7 @@ impl Agent for Claude<'_> {
             run: Run::default(),
             approvals: Vec::new(),
         };
-        self.execute(&cwd, args, watch, req.message.delivered, deadline)
+        self.execute(&cwd, &args, watch, req.message.delivered, deadline)
             .await
     }
 
@@ -729,7 +692,7 @@ impl Agent for Claude<'_> {
             loop {
                 // 1. Own run: its result event is authoritative.
                 if let Some(r) = &receipt {
-                    let run = Run::from_log(&self.log_path(&r.receipt_id));
+                    let run = Run::from_log(&self.runs.log(&r.receipt_id));
                     if unaccepted && (run.init || run.result.is_some()) {
                         self.store
                             .accept(&r.receipt_id, None, Some(&turn_id), Some(&turn_id))?;
@@ -816,14 +779,7 @@ impl Agent for Claude<'_> {
         let res = bounded(Some(deadline), work)
             .await
             .map(Some)
-            .map_err(|mut e| {
-                if matches!(e.code, ErrorCode::Timeout | ErrorCode::Interrupted)
-                    && !waiting_for.is_empty()
-                {
-                    e.message = format!("{}; {waiting_for}", e.message);
-                }
-                e
-            });
+            .map_err(|e| note_waiting(e, &waiting_for));
         let receipt_id = receipt.map(|r| r.receipt_id);
         settle(
             self.store,

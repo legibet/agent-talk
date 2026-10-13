@@ -18,20 +18,20 @@ mod session;
 
 use self::run::Run;
 use self::session::{check_id, head, live_branch, load, transcript_turn, turn_end};
-use crate::agents::child::{agent_cmd, cli_version, lock, pid_alive, tail};
+use crate::agents::child::{Runs, agent_cmd, cli_version, lock, observe, pid_alive, tail};
 use crate::agents::history::{ReadPage, ReadQuery, cut};
-use crate::agents::lifecycle::{bounded, settle, wait_receipt};
+use crate::agents::lifecycle::{bounded, note_waiting, reject, settle, wait_receipt};
 use crate::agents::{
     Agent, AgentStatus, Check, ListFilter, Operation, SendRequest, StartRequest, WaitTarget,
 };
 use crate::model::{
-    AgentError, Error, ErrorCode, History, Loaded, Model, Observations, Outcome, Page, Phase,
-    Progress, ReceiptState, Result, Session, SessionState,
+    Error, ErrorCode, History, Loaded, Model, Observations, Outcome, Page, Phase, Progress, Result,
+    Session, SessionState,
 };
 use crate::store::{NewIntent, Store};
 use std::path::{Path, PathBuf};
+use std::process::ExitStatus;
 use std::time::{Duration, UNIX_EPOCH};
-use tokio::io::AsyncWriteExt;
 use tokio::time::Instant;
 
 /// Why agent-talk refuses a second writer of its own (DESIGN.md §6.6).
@@ -45,7 +45,7 @@ pub struct Pi<'a> {
     /// `<agent dir>/sessions`; the agent dir is `$PI_CODING_AGENT_DIR`, else `~/.pi/agent`.
     sessions: PathBuf,
     /// `~/.agent-talk/pi-runs`
-    runs: PathBuf,
+    runs: Runs,
     /// Set when pi is configured to keep sessions in a flat custom directory, which
     /// agent-talk does not read (DESIGN.md §8): the setting, for the refusal.
     custom_dir: Option<String>,
@@ -113,7 +113,7 @@ impl<'a> Pi<'a> {
         Pi {
             store,
             sessions: agent_dir.join("sessions"),
-            runs: home.join(".agent-talk/pi-runs"),
+            runs: Runs::new("pi", "pi"),
             custom_dir,
         }
     }
@@ -131,40 +131,21 @@ impl<'a> Pi<'a> {
         }
     }
 
-    /// Settle the receipt of a run pi left before taking the message: rejected, with pi's
-    /// stderr as the reason.
-    fn reject_startup(&self, receipt_id: &str, exit_code: Option<i32>) -> Result<Error> {
-        let stderr = std::fs::read_to_string(self.log_path(receipt_id).with_extension("stderr"))
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-        let agent_error = AgentError {
-            code: exit_code.unwrap_or(-1).into(),
-            message: match (stderr.is_empty(), exit_code) {
-                (false, _) => stderr,
-                (true, Some(c)) => format!("pi exited with code {c} before taking the message"),
-                (true, None) => "pi exited before taking the message".into(),
-            },
-            data: None,
-        };
-        self.store
-            .settle_unaccepted(receipt_id, ReceiptState::Rejected, Some(&agent_error))?;
-        Ok(Error::from_agent(ErrorCode::Precondition, agent_error))
+    /// A run pi left before taking the message: the receipt is rejected with pi's stderr as
+    /// the reason (DESIGN.md §3).
+    fn reject_startup(&self, receipt_id: &str, status: Option<ExitStatus>) -> Error {
+        let e = self.runs.startup_error(receipt_id, status);
+        reject(
+            self.store,
+            receipt_id,
+            Error::from_agent(ErrorCode::Precondition, e),
+        )
     }
 
-    fn log_path(&self, receipt_id: &str) -> PathBuf {
-        self.runs.join(format!("{receipt_id}.ndjson"))
-    }
-
-    /// Of the pi processes recorded for the session (`Store::processes`), the pid of one
-    /// still running its turn: alive, and its run log not settled.
+    /// Of the pi processes recorded for the session, the pid of one still running its turn:
+    /// its run log not settled.
     fn own_run(&self, procs: &[(String, u32)]) -> Option<u32> {
-        procs
-            .iter()
-            .find(|(receipt_id, pid)| {
-                pid_alive(*pid) && !Run::from_log(&self.log_path(receipt_id)).settled
-            })
-            .map(|(_, pid)| *pid)
+        self.runs.running(procs, |log| Run::from_log(log).settled)
     }
 
     /// Refuse while a pi process agent-talk started still runs the session. pi has no lock
@@ -201,42 +182,32 @@ impl<'a> Pi<'a> {
     async fn execute(
         &self,
         cwd: &str,
-        args: Vec<String>,
+        args: &[String],
         mut watch: RunWatch,
         prompt: &str,
         deadline: Option<Instant>,
     ) -> Result<Outcome> {
         let h = handle(&watch.id);
-        let log = self.log_path(&watch.receipt_id);
-        let mut child = match run::spawn(cwd, &args, &log) {
-            Ok(c) => c,
-            Err(e) => {
-                self.store
-                    .settle_unaccepted(&watch.receipt_id, ReceiptState::Rejected, None)?;
-                return Err(e);
-            }
-        };
+        let log = self.runs.log(&watch.receipt_id);
+        let mut child = self.runs.spawn(
+            self.store,
+            agent_cmd("pi").args(args),
+            cwd,
+            &watch.receipt_id,
+        )?;
         if let Some(pid) = child.id() {
             self.store.insert_process(&watch.receipt_id, &h, pid)?;
         }
         let work = async {
-            let mut stdin = child.stdin.take().expect("stdin is piped");
-            // pi reads piped stdin to EOF as the prompt (DESIGN.md §6.6).
-            stdin
-                .write_all(prompt.as_bytes())
-                .await
-                .map_err(|e| Error::transport("write prompt to pi", e))?;
-            stdin
-                .shutdown()
-                .await
-                .map_err(|e| Error::transport("close pi stdin", e))?;
-            drop(stdin);
+            // pi reads piped stdin to EOF as the prompt, which keeps `@file` and option
+            // parsing away from the text (DESIGN.md §6.6).
+            self.runs.deliver(&mut child, prompt.as_bytes()).await?;
             let status = tail(&mut child, &log, |l| {
                 watch.on_line(self.store, &self.sessions, l)
             })
             .await?;
             if watch.run.user.is_none() {
-                return Err(self.reject_startup(&watch.receipt_id, status.code())?);
+                return Err(self.reject_startup(&watch.receipt_id, Some(status)));
             }
             let turn_id = watch.turn_id.clone().unwrap_or_default();
             if !watch.run.settled {
@@ -244,11 +215,7 @@ impl<'a> Pi<'a> {
             }
             Ok(watch.run.turn(h.clone(), turn_id))
         };
-        // Without --wait the turn still runs to completion (synchronous sends);
-        // only Ctrl-C stops observing early.
-        let res = bounded(deadline, work).await;
-        // Without a deadline the turn is not reported even though it ran to completion.
-        let res = res.map(|turn| deadline.is_some().then_some(turn));
+        let res = observe(deadline, work).await;
         settle(
             self.store,
             h,
@@ -444,7 +411,7 @@ impl Agent for Pi<'_> {
             run: Run::default(),
             turn_id: None,
         };
-        self.execute(req.cwd, args, watch, req.message.delivered, deadline)
+        self.execute(req.cwd, &args, watch, req.message.delivered, deadline)
             .await
     }
 
@@ -493,11 +460,11 @@ impl Agent for Pi<'_> {
         })?;
         // pi restores the model from the session file, so only a change passes it; the
         // thinking level is not restored and comes from the session's settings.
-        let settings = req.settings.cloned().unwrap_or_default();
+        let effort = req.settings.and_then(|s| s.effort.as_deref());
         let args = run::args(
             ["--session", &path.display().to_string()],
             req.change.model.as_deref(),
-            settings.effort.as_deref(),
+            effort,
             None,
         );
         let watch = RunWatch {
@@ -507,7 +474,7 @@ impl Agent for Pi<'_> {
             run: Run::default(),
             turn_id: None,
         };
-        self.execute(&cwd, args, watch, req.message.delivered, deadline)
+        self.execute(&cwd, &args, watch, req.message.delivered, deadline)
             .await
     }
 
@@ -554,9 +521,9 @@ impl Agent for Pi<'_> {
                 // turn when the sending command stopped observing before pi took the message.
                 let mut exited = false;
                 if let Some(r) = &receipt
-                    && self.log_path(&r.receipt_id).is_file()
+                    && self.runs.log(&r.receipt_id).is_file()
                 {
-                    let run = Run::from_log(&self.log_path(&r.receipt_id));
+                    let run = Run::from_log(&self.runs.log(&r.receipt_id));
                     if turn_id.is_none()
                         && run.user.is_some()
                         && let Some(t) = file.as_deref().and_then(|f| run.turn_id(f))
@@ -579,7 +546,7 @@ impl Agent for Pi<'_> {
                     // Gone without settling: a startup failure if it never took the
                     // message, otherwise the file says what it left behind.
                     if run.user.is_none() {
-                        return Err(self.reject_startup(&r.receipt_id, None)?);
+                        return Err(self.reject_startup(&r.receipt_id, None));
                     }
                     exited = true;
                 }
@@ -641,14 +608,7 @@ impl Agent for Pi<'_> {
         let res = bounded(Some(deadline), work)
             .await
             .map(Some)
-            .map_err(|mut e| {
-                if matches!(e.code, ErrorCode::Timeout | ErrorCode::Interrupted)
-                    && !waiting_for.is_empty()
-                {
-                    e.message = format!("{}; {waiting_for}", e.message);
-                }
-                e
-            });
+            .map_err(|e| note_waiting(e, &waiting_for));
         let receipt_id = receipt.map(|r| r.receipt_id);
         settle(
             self.store,

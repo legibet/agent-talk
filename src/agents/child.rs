@@ -1,13 +1,16 @@
 //! Agent CLIs as children of agent-talk, and the local files around them: the session
 //! lock and the run log a child writes.
 
-use crate::model::{Error, ErrorCode, Result};
+use crate::agents::lifecycle::bounded;
+use crate::model::{AgentError, Error, ErrorCode, ReceiptState, Result, Turn};
+use crate::store::Store;
 use std::fs::{File, OpenOptions, TryLockError};
-use std::path::Path;
-use std::process::ExitStatus;
+use std::path::{Path, PathBuf};
+use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
-use tokio::io::AsyncBufReadExt;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
+use tokio::time::Instant;
 
 /// The environment variables naming the session an agent-talk command runs in, with
 /// the agent each one belongs to, in the order the CLI derives its sender from them (DESIGN.md §4).
@@ -95,6 +98,115 @@ pub fn lock(handle: &str, why: &str) -> Result<File> {
         )),
         Err(TryLockError::Error(e)) => Err(Error::transport(path.display(), e)),
     }
+}
+
+/// The children of an agent CLI that runs one child per mutation (Claude, Antigravity, pi).
+/// Each child writes its stdout to the run log `~/.agent-talk/<agent>-runs/<receipt>.ndjson`,
+/// which the command tails and later commands read to recover the receipt, and its stderr
+/// to `<receipt>.stderr` next to it (DESIGN.md §3).
+pub struct Runs {
+    program: &'static str,
+    /// `~/.agent-talk/<agent>-runs`
+    dir: PathBuf,
+}
+
+impl Runs {
+    pub fn new(program: &'static str, agent: &str) -> Runs {
+        let home = std::env::home_dir().unwrap_or_default();
+        Runs {
+            program,
+            dir: home.join(".agent-talk").join(format!("{agent}-runs")),
+        }
+    }
+
+    /// The run log of the child spawned for `receipt_id`.
+    pub fn log(&self, receipt_id: &str) -> PathBuf {
+        self.dir.join(format!("{receipt_id}.ndjson"))
+    }
+
+    /// Spawn `cmd` (an `agent_cmd` of the program, arguments set) in `cwd` for `receipt_id`:
+    /// stdout to its run log, stderr next to it, stdin piped for the message, and in its own
+    /// process group so that Ctrl-C on agent-talk stops observing, not the turn. A failure
+    /// settles the receipt `rejected`, since nothing ran (DESIGN.md §3); before the intent
+    /// is written there is no receipt to settle.
+    pub fn spawn(
+        &self,
+        store: &Store,
+        cmd: &mut Command,
+        cwd: &str,
+        receipt_id: &str,
+    ) -> Result<Child> {
+        let log = self.log(receipt_id);
+        let stderr = log.with_extension("stderr");
+        let spawned = (|| {
+            std::fs::create_dir_all(&self.dir)
+                .map_err(|e| Error::transport("create run dir", e))?;
+            let out = File::create(&log).map_err(|e| Error::transport(log.display(), e))?;
+            let err = File::create(&stderr).map_err(|e| Error::transport(stderr.display(), e))?;
+            cmd.current_dir(cwd)
+                .stdin(Stdio::piped())
+                .stdout(out)
+                .stderr(err)
+                .process_group(0)
+                .spawn()
+                .map_err(|e| Error::transport(format!("spawn {}", self.program), e))
+        })();
+        if spawned.is_err() {
+            store.settle_unaccepted(receipt_id, ReceiptState::Rejected, None)?;
+        }
+        spawned
+    }
+
+    /// Write `message` to the child's stdin and close it: Claude and agy exit after the turn
+    /// it starts, and pi reads stdin to EOF as its prompt.
+    pub async fn deliver(&self, child: &mut Child, message: &[u8]) -> Result<()> {
+        let mut stdin = child.stdin.take().expect("stdin is piped");
+        stdin
+            .write_all(message)
+            .await
+            .map_err(|e| Error::transport(format!("write the message to {}", self.program), e))?;
+        // Dropping the handle closes the pipe; `shutdown` does not (a no-op on tokio 1.53.2).
+        drop(stdin);
+        Ok(())
+    }
+
+    /// Why the child of `receipt_id` exited before taking the message: its stderr, or how it
+    /// exited when it wrote none. `status` is `None` when this command did not see the exit.
+    pub fn startup_error(&self, receipt_id: &str, status: Option<ExitStatus>) -> AgentError {
+        let stderr = std::fs::read_to_string(self.log(receipt_id).with_extension("stderr"))
+            .unwrap_or_default();
+        let exited = format!("{} exited before taking the message", self.program);
+        AgentError {
+            code: status.and_then(|s| s.code()).unwrap_or(-1).into(),
+            message: match (stderr.trim(), status) {
+                ("", Some(s)) => format!("{exited} ({s})"),
+                ("", None) => exited,
+                (stderr, _) => stderr.to_string(),
+            },
+            data: None,
+        }
+    }
+
+    /// Of the children recorded for a session (`Store::processes`), the pid of one still
+    /// running its turn: alive, and its run log not `ended` yet.
+    pub fn running(&self, procs: &[(String, u32)], ended: impl Fn(&Path) -> bool) -> Option<u32> {
+        procs
+            .iter()
+            .find(|(receipt_id, pid)| pid_alive(*pid) && !ended(&self.log(receipt_id)))
+            .map(|(_, pid)| *pid)
+    }
+}
+
+/// Observe the turn of a child this command started until it ends, `deadline` passes or a
+/// signal arrives. A run is synchronous: without a deadline the turn still runs to its end,
+/// and only a signal stops observing early. But `new` and `send` without a deadline promise
+/// only acceptance, as on every agent, so then the observed turn is not reported.
+pub async fn observe(
+    deadline: Option<Instant>,
+    turn: impl Future<Output = Result<Turn>>,
+) -> Result<Option<Turn>> {
+    let turn = bounded(deadline, turn).await?;
+    Ok(deadline.is_some().then_some(turn))
 }
 
 /// Feed each line of a child's run log (its stdout, redirected to `log`) to `on_line` as it

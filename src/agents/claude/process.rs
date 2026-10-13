@@ -1,14 +1,11 @@
-//! The `claude` CLI as a child process: command line, spawn into a run log, and
-//! `claude agents --json --all`. Reading the run log is `agents::child::tail`.
+//! The `claude` CLI as a child process: command line and `claude agents --json --all`.
+//! Spawning into a run log and reading it are `agents::child`.
 
 use crate::agents::child::agent_cmd;
 use crate::agents::lifecycle::ApprovalPolicy;
-use crate::model::{Error, Result};
 use serde::Deserialize;
-use std::fs::File;
-use std::path::Path;
 use std::process::Stdio;
-use tokio::process::Child;
+use tokio::process::Command;
 
 /// `claude -p` arguments for one turn; `session` is `--session-id <id>` or
 /// `--resume <id>`. `--resume` restores the model from the transcript but neither the effort
@@ -51,15 +48,8 @@ pub fn args(
     args
 }
 
-/// Spawn `claude` with stdout to the run log `log` (stderr next to it), in its own
-/// process group so that Ctrl-C on agent-talk stops observing, not the turn.
-pub fn spawn(cwd: &str, args: &[String], log: &Path) -> Result<Child> {
-    if let Some(dir) = log.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| Error::transport("create run dir", e))?;
-    }
-    let out = File::create(log).map_err(|e| Error::transport(log.display(), e))?;
-    let err = File::create(log.with_extension("stderr"))
-        .map_err(|e| Error::transport(log.display(), e))?;
+/// `claude` with `args`.
+pub fn command(args: &[String]) -> Command {
     let mut cmd = agent_cmd("claude");
     // CLAUDE_CODE_EFFORT_LEVEL silently overrides --effort (claude 2.1.291, DESIGN.md §6.2).
     if args.iter().any(|a| a == "--effort") {
@@ -67,14 +57,8 @@ pub fn spawn(cwd: &str, args: &[String], log: &Path) -> Result<Child> {
     }
     // A nested `claude -p` with the inherited CLAUDECODE=1 runs normally (observed on
     // claude 2.1.288).
-    cmd.args(args)
-        .current_dir(cwd)
-        .stdin(Stdio::piped())
-        .stdout(out)
-        .stderr(err)
-        .process_group(0)
-        .spawn()
-        .map_err(|e| Error::transport("spawn claude", e))
+    cmd.args(args);
+    cmd
 }
 
 /// One entry of `claude agents --json --all`. Fields seen: cwd, id, kind, name, pid,

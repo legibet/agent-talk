@@ -1,12 +1,10 @@
-//! The `agy` CLI as a child process: command line, spawn, the run's start-up, and what a
-//! run that never took the message reports.
+//! The `agy` CLI as a child process: command line, the run's start-up, and what a run that
+//! never took the message reports. Spawning into a run log and reading it are `agents::child`.
 
 use super::stream::Run;
-use crate::agents::child::agent_cmd;
+use crate::agents::child::Runs;
 use crate::model::{AgentError, Error, ErrorCode, Result};
-use std::fs::File;
-use std::path::Path;
-use std::process::Stdio;
+use std::process::ExitStatus;
 use std::time::Duration;
 use tokio::process::Child;
 
@@ -44,58 +42,39 @@ pub fn args(
     args
 }
 
-/// Spawn `agy` with stdout to the run log `log` (stderr next to it), in its own process
-/// group so that Ctrl-C on agent-talk stops observing, not the turn.
-pub fn spawn(cwd: &str, args: &[String], log: &Path) -> Result<Child> {
-    let runs = log.parent().expect("run log has a directory");
-    std::fs::create_dir_all(runs).map_err(|e| Error::transport("create run dir", e))?;
-    let out = File::create(log).map_err(|e| Error::transport(log.display(), e))?;
-    let err = File::create(log.with_extension("stderr"))
-        .map_err(|e| Error::transport(log.display(), e))?;
-    agent_cmd("agy")
-        .args(args)
-        .current_dir(cwd)
-        .stdin(Stdio::piped())
-        .stdout(out)
-        .stderr(err)
-        .process_group(0)
-        .spawn()
-        .map_err(|e| Error::transport("spawn agy", e))
-}
-
-/// Why a run ended without taking the message: the `result` error or stderr.
-pub fn agent_error(log: &Path, run: &Run, status: Option<i32>) -> AgentError {
-    let stderr = std::fs::read_to_string(log.with_extension("stderr"))
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    let message = match run.result.as_ref().and_then(|r| r["error"].as_str()) {
-        Some(e) if !e.is_empty() => e.to_string(),
-        _ if !stderr.is_empty() => stderr,
-        _ => format!("agy exited ({status:?}) before taking the message"),
-    };
-    AgentError {
-        code: status.unwrap_or(-1).into(),
-        message,
-        data: run.result.clone(),
+/// Why a run ended without taking the message: the `result` error, else its stderr or how it
+/// exited (`Runs::startup_error`).
+pub fn agent_error(
+    runs: &Runs,
+    receipt_id: &str,
+    run: &Run,
+    status: Option<ExitStatus>,
+) -> AgentError {
+    let mut e = runs.startup_error(receipt_id, status);
+    if let Some(m) = run.result.as_ref().and_then(|r| r["error"].as_str())
+        && !m.is_empty()
+    {
+        e.message = m.to_string();
     }
+    e.data = run.result.clone();
+    e
 }
 
 /// Until the run log shows `init`: the id of the conversation a new run created. agy
 /// emits it at startup, before it reads stdin.
-pub async fn wait_init(child: &mut Child, log: &Path) -> Result<String> {
+pub async fn wait_init(child: &mut Child, runs: &Runs, receipt_id: &str) -> Result<String> {
     loop {
         let exited = child
             .try_wait()
             .map_err(|e| Error::transport("agy process", e))?;
-        let run = Run::from_log(log);
+        let run = Run::from_log(&runs.log(receipt_id));
         if let Some(id) = run.conversation_id {
             return Ok(id);
         }
         if let Some(status) = exited {
             return Err(Error::from_agent(
                 ErrorCode::Precondition,
-                agent_error(log, &run, status.code()),
+                agent_error(runs, receipt_id, &run, Some(status)),
             ));
         }
         tokio::time::sleep(Duration::from_millis(50)).await;

@@ -91,9 +91,9 @@ src/
   agents/mod.rs        agent interface, adapter dispatch, request types, provenance header
   agents/lifecycle.rs  shared receipt/approval lifecycle, observation bounds (deadline, signals)
   agents/history.rs    read paging: query, page cut, cursors
-  agents/child.rs      agent CLI children: environment, version, session lock, run log tail
+  agents/child.rs      agent CLI children: environment, version, session lock, run logs
   agents/codex/        adapter, protocol (narrow response types), transport (WebSocket over AF_UNIX)
-  agents/claude/       adapter, transcript rules, stream-json events, process spawning
+  agents/claude/       adapter, transcript rules, stream-json events, command line and `claude agents`
   agents/opencode/     adapter, transport (HTTP + SSE)
   agents/grok/         adapter, ACP client of a grok agent child, updates.jsonl rules
   agents/antigravity/  adapter (summaries db, presence lock), transcript, stream, process

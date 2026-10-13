@@ -188,6 +188,15 @@ pub async fn bounded<T>(
     }
 }
 
+/// `e` with what the observation was still waiting for, when the deadline or a signal ended
+/// it.
+pub fn note_waiting(mut e: Error, waiting_for: &str) -> Error {
+    if matches!(e.code, ErrorCode::Timeout | ErrorCode::Interrupted) && !waiting_for.is_empty() {
+        e.message = format!("{}; {waiting_for}", e.message);
+    }
+    e
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
