@@ -262,4 +262,67 @@ mod tests {
         assert_eq!((c.records.clone(), c.more), (2..4, true));
         assert!(cut(&all, Some("2-prompt"), tagged(&HISTORY[3..]), 5, false).is_err());
     }
+
+    /// Reading a remote history page by page returns every message once, in order, and a
+    /// next page starts at the agent page holding its boundary instead of the newest.
+    #[tokio::test]
+    async fn remote_history_pages_across_agent_pages() {
+        // Six records, one prompt each, served newest first two at a time.
+        let agent_page = |cursor: Option<&str>| match cursor {
+            None => (vec![5, 4], Some("p2")),
+            Some("p2") => (vec![3, 2], Some("p4")),
+            Some("p4") => (vec![1, 0], None),
+            Some(c) => panic!("unknown agent cursor {c}"),
+        };
+        let normalize = |records: &[Value]| {
+            let messages = records.iter().enumerate().map(|(i, r)| {
+                let (_, mut m) = tagged(&[(i, Role::User, Phase::Prompt)]).remove(0);
+                m.item_id = r["n"].to_string();
+                (i, m)
+            });
+            Ok(messages.collect())
+        };
+        let mut q = ReadQuery {
+            limit: 3,
+            cursor: None,
+            all: false,
+        };
+        let mut pages = Vec::new();
+        loop {
+            let mut fetched = Vec::new();
+            let h = RemoteHistory::fetch(
+                &q,
+                async |c: Option<&str>| {
+                    fetched.push(c.map(String::from));
+                    let (records, next) = agent_page(c);
+                    let records = records.into_iter().map(|n| serde_json::json!({"n": n}));
+                    Ok((records.collect(), next.map(String::from)))
+                },
+                normalize,
+            )
+            .await
+            .unwrap();
+            let messages = normalize(h.records()).unwrap();
+            let page = h.page(&q, messages).unwrap();
+            let ids: Vec<String> = page
+                .messages
+                .items
+                .iter()
+                .map(|m| m.item_id.clone())
+                .collect();
+            let raw: Vec<String> = page.raw.iter().map(|r| r["n"].to_string()).collect();
+            assert_eq!(ids, raw);
+            pages.push((ids, fetched));
+            match page.messages.next_cursor {
+                Some(c) => q.cursor = Some(c),
+                None => break,
+            }
+        }
+        let some = |c: &str| Some(c.to_string());
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0].0, ["3", "4", "5"]);
+        assert_eq!(pages[0].1, [None, some("p2")]);
+        assert_eq!(pages[1].0, ["0", "1", "2"]);
+        assert_eq!(pages[1].1, [some("p2"), some("p4")]);
+    }
 }
