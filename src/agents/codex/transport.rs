@@ -228,19 +228,11 @@ impl Conn {
 }
 
 pub fn decode<T: DeserializeOwned>(what: &str, v: &Value) -> Result<T> {
-    T::deserialize(v).map_err(|e| {
-        Error::new(
-            ErrorCode::Transport,
-            format!("unexpected {what} payload: {e}"),
-        )
-    })
+    T::deserialize(v).map_err(|e| Error::transport(format!("unexpected {what} payload"), e))
 }
 
 fn closed(reason: &str) -> Error {
-    Error::new(
-        ErrorCode::Transport,
-        format!("daemon connection lost: {reason}"),
-    )
+    Error::transport("daemon connection lost", reason)
 }
 
 async fn read_loop(

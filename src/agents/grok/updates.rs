@@ -12,7 +12,7 @@
 //! `turn_completed` of a prompt id is its end.
 
 use crate::agents::history::first_line;
-use crate::model::{self, Error, Message, Result};
+use crate::model::{self, Error, Message, Phase, Result, Role, TurnStatus};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
@@ -182,15 +182,15 @@ impl History {
                         line: i,
                         span,
                         prompt: opens_turn(&l.raw),
-                        message: message("user", "prompt", text.to_string()),
+                        message: message(Role::User, Phase::Prompt, text.to_string()),
                     });
                 }
                 "agent_message_chunk" => {
                     let text = u["content"]["text"].as_str().unwrap_or("");
                     let extends = out.last().is_some_and(|m| {
                         m.span == span
-                            && m.message.role == "assistant"
-                            && m.message.phase == "commentary"
+                            && m.message.role == Role::Assistant
+                            && m.message.phase == Phase::Commentary
                     });
                     match out.last_mut() {
                         Some(m) if extends => m.message.text.push_str(text),
@@ -198,7 +198,7 @@ impl History {
                             line: i,
                             span,
                             prompt: false,
-                            message: message("assistant", "commentary", text.to_string()),
+                            message: message(Role::Assistant, Phase::Commentary, text.to_string()),
                         }),
                     }
                 }
@@ -229,7 +229,11 @@ impl History {
                         line: i,
                         span,
                         prompt: false,
-                        message: message("assistant", "other", tool_text(&name, status, &detail)),
+                        message: message(
+                            Role::Assistant,
+                            Phase::Other,
+                            tool_text(&name, status, &detail),
+                        ),
                     });
                     tools.insert(id, (out.len() - 1, name, detail));
                 }
@@ -247,9 +251,9 @@ impl History {
         for (s, span) in self.spans.iter().enumerate() {
             if span.end.is_some()
                 && let Some(m) = out.iter_mut().rfind(|m| m.span == Some(s))
-                && m.message.phase == "commentary"
+                && m.message.phase == Phase::Commentary
             {
-                m.message.phase = "final";
+                m.message.phase = Phase::Final;
             }
         }
         out
@@ -269,7 +273,7 @@ impl History {
             error,
             final_text: messages
                 .iter()
-                .find(|m| m.span == Some(span) && m.message.phase == "final")
+                .find(|m| m.span == Some(span) && m.message.phase == Phase::Final)
                 .map(|m| m.message.text.clone()),
             duration_ms: u["elapsed_ms"].as_i64(),
             basis: Some("updates.jsonl turn_completed".into()),
@@ -293,14 +297,14 @@ fn tool_text(name: &str, status: &str, detail: &str) -> String {
 /// Turn status for an ACP stop reason (`session/prompt` `stopReason`,
 /// `turn_completed.stop_reason`); `detail` goes into the error of a turn that did not
 /// complete.
-pub fn status(stop_reason: &str, detail: &Value) -> (&'static str, Option<Value>) {
+pub fn status(stop_reason: &str, detail: &Value) -> (TurnStatus, Option<Value>) {
     match stop_reason {
-        "end_turn" => ("completed", None),
+        "end_turn" => (TurnStatus::Completed, None),
         // cancelled: session/cancel, a rejected permission, Ctrl+C in the TUI;
         // interrupted: written by another process that found the turn dangling.
-        "cancelled" | "interrupted" => ("interrupted", Some(detail.clone())),
-        "" => ("unknown", Some(detail.clone())),
-        _ => ("failed", Some(detail.clone())),
+        "cancelled" | "interrupted" => (TurnStatus::Interrupted, Some(detail.clone())),
+        "" => (TurnStatus::Unknown, Some(detail.clone())),
+        _ => (TurnStatus::Failed, Some(detail.clone())),
     }
 }
 
@@ -360,7 +364,7 @@ mod tests {
     fn texts(h: &History) -> Vec<(String, &'static str, String)> {
         h.messages()
             .into_iter()
-            .map(|m| (m.message.turn_id, m.message.phase, m.message.text))
+            .map(|m| (m.message.turn_id, m.message.phase.as_str(), m.message.text))
             .collect()
     }
 
@@ -378,7 +382,7 @@ mod tests {
         let t = h.turn("grok:s".into(), 0, &m).unwrap();
         assert_eq!(
             (t.status, t.final_text.as_deref()),
-            ("completed", Some("DONE-A"))
+            (TurnStatus::Completed, Some("DONE-A"))
         );
         assert_eq!(
             texts(&h),
@@ -401,7 +405,7 @@ mod tests {
         let id = "40d64389-3fc6-4a15-bdb7-fc3957a2ca47";
         let span = h.find(id).unwrap();
         let t = h.turn("grok:s".into(), span, &h.messages()).unwrap();
-        assert_eq!((t.status, t.final_text), ("interrupted", None));
+        assert_eq!((t.status, t.final_text), (TurnStatus::Interrupted, None));
         assert_eq!(t.duration_ms, Some(9));
     }
 
@@ -410,7 +414,10 @@ mod tests {
         let h = History::new(parse(CANCELLED_AT_START));
         let span = h.find("e171c160-7ac7-4e44-9ffa-ac57134b9035").unwrap();
         let t = h.turn("grok:s".into(), span, &h.messages()).unwrap();
-        assert_eq!((t.status, t.duration_ms), ("interrupted", Some(3)));
+        assert_eq!(
+            (t.status, t.duration_ms),
+            (TurnStatus::Interrupted, Some(3))
+        );
         // The turn before it keeps its own end.
         assert!(h.spans[0].end.is_some() && h.spans.len() == 2);
     }

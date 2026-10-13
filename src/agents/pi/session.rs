@@ -5,7 +5,7 @@
 
 use crate::agents::history::first_line;
 use crate::agents::strip_provenance;
-use crate::model::{self, Caller, Error, ErrorCode, Message, Result};
+use crate::model::{self, Caller, Error, ErrorCode, Message, Phase, Result, Role, TurnStatus};
 use serde::Deserialize;
 use serde::de::IgnoredAny;
 use serde_json::Value;
@@ -228,12 +228,12 @@ pub fn turn_end(entries: &[Entry], branch: &HashSet<usize>, start: usize) -> Opt
 }
 
 /// Turn status pi's `stopReason` means.
-pub fn status(stop_reason: Option<&str>) -> &'static str {
+pub fn status(stop_reason: Option<&str>) -> TurnStatus {
     match stop_reason {
-        Some("stop" | "length") => "completed",
-        Some("error") => "failed",
-        Some("aborted") => "interrupted",
-        _ => "unknown",
+        Some("stop" | "length") => TurnStatus::Completed,
+        Some("error") => TurnStatus::Failed,
+        Some("aborted") => TurnStatus::Interrupted,
+        _ => TurnStatus::Unknown,
     }
 }
 
@@ -255,7 +255,7 @@ pub fn transcript_turn(
                 handle,
                 turn_id,
                 status,
-                error: (status != "completed").then(|| {
+                error: (status != TurnStatus::Completed).then(|| {
                     serde_json::json!({
                         "stop_reason": stop,
                         "message": body.and_then(|m| m.error_message.clone()),
@@ -273,7 +273,7 @@ pub fn transcript_turn(
         TurnEnd::LaterPrompt(i) => model::Turn {
             handle,
             turn_id,
-            status: "unknown",
+            status: TurnStatus::Unknown,
             error: Some(serde_json::json!({
                 "message": "a later user message follows the prompt on the live branch and no reply without tool calls was recorded between them",
             })),
@@ -319,7 +319,7 @@ fn to_message(line: &Line, turn_id: &str, item_id: &str) -> Option<Message> {
         "message" => {
             let body = line.message.as_ref()?;
             match body.role.as_str() {
-                "user" => ("user", "prompt", body.text(), None),
+                "user" => (Role::User, Phase::Prompt, body.text(), None),
                 "toolResult" => {
                     let tag = if body.is_error == Some(true) {
                         "[tool_result error]"
@@ -328,8 +328,8 @@ fn to_message(line: &Line, turn_id: &str, item_id: &str) -> Option<Message> {
                     };
                     let name = body.tool_name.as_deref().unwrap_or("");
                     (
-                        "user",
-                        "other",
+                        Role::User,
+                        Phase::Other,
                         format!("{tag} {name} {}", first_line(&body.text(), 120))
                             .trim()
                             .to_string(),
@@ -341,15 +341,20 @@ fn to_message(line: &Line, turn_id: &str, item_id: &str) -> Option<Message> {
                     let tools = body.tool_calls();
                     if !text.is_empty() {
                         let phase = if tools.is_empty() {
-                            "final"
+                            Phase::Final
                         } else {
-                            "commentary"
+                            Phase::Commentary
                         };
-                        ("assistant", phase, text, None)
+                        (Role::Assistant, phase, text, None)
                     } else if !tools.is_empty() {
-                        ("assistant", "other", tools.join("\n"), None)
+                        (Role::Assistant, Phase::Other, tools.join("\n"), None)
                     } else if let Some(err) = &body.error_message {
-                        ("assistant", "other", format!("[error] {err}"), None)
+                        (
+                            Role::Assistant,
+                            Phase::Other,
+                            format!("[error] {err}"),
+                            None,
+                        )
                     } else {
                         return None;
                     }
@@ -367,7 +372,7 @@ fn to_message(line: &Line, turn_id: &str, item_id: &str) -> Option<Message> {
                     .join("\n"),
                 _ => return None,
             };
-            ("user", "other", text, Some(Caller::RUNTIME))
+            (Role::User, Phase::Other, text, Some(Caller::RUNTIME))
         }
         _ => return None,
     };
@@ -550,7 +555,7 @@ mod tests {
         let t = transcript_turn("pi:s".into(), &e, start, TurnEnd::Reply(i));
         assert_eq!(
             (t.status, t.final_text.as_deref()),
-            ("completed", Some("done"))
+            (TurnStatus::Completed, Some("done"))
         );
         assert_eq!(t.turn_id, "4924e440");
         // The last prompt has no reply yet.
@@ -559,7 +564,7 @@ mod tests {
         let msgs = messages(&e, &branch);
         let view: Vec<(&str, &str, &str)> = msgs
             .iter()
-            .map(|(_, m)| (m.role, m.phase, m.item_id.as_str()))
+            .map(|(_, m)| (m.role.as_str(), m.phase.as_str(), m.item_id.as_str()))
             .collect();
         assert_eq!(
             view,
@@ -606,9 +611,9 @@ mod tests {
         assert!(check_id("-abc").is_err());
         assert!(check_id("bad/id").is_err());
         assert!(check_id("").is_err());
-        assert_eq!(status(Some("stop")), "completed");
-        assert_eq!(status(Some("error")), "failed");
-        assert_eq!(status(Some("aborted")), "interrupted");
-        assert_eq!(status(None), "unknown");
+        assert_eq!(status(Some("stop")), TurnStatus::Completed);
+        assert_eq!(status(Some("error")), TurnStatus::Failed);
+        assert_eq!(status(Some("aborted")), TurnStatus::Interrupted);
+        assert_eq!(status(None), TurnStatus::Unknown);
     }
 }

@@ -33,8 +33,8 @@ use crate::agents::{
     Agent, AgentStatus, Check, ListFilter, Operation, SendRequest, StartRequest, WaitTarget,
 };
 use crate::model::{
-    self, Approval, Error, ErrorCode, Model, Observations, Outcome, Page, ReceiptState, Result,
-    Session,
+    self, Approval, Error, ErrorCode, History, Loaded, Model, Observations, Outcome, Page,
+    Progress, ReceiptState, Result, Role, Session, SessionState, TurnStatus,
 };
 use crate::store::{NewIntent, Store};
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
@@ -339,7 +339,7 @@ impl<'a> Antigravity<'a> {
             let turn = model::Turn {
                 handle: h.to_string(),
                 turn_id,
-                status: "unknown",
+                status: TurnStatus::Unknown,
                 error: Some(json!({
                     "message": "agy exited without a result event",
                     "exit_code": exit_code,
@@ -405,7 +405,7 @@ impl<'a> Antigravity<'a> {
             res,
             Some(&watch.receipt_id),
             approvals,
-            "running",
+            Progress::Running,
         )
     }
 
@@ -445,7 +445,11 @@ impl<'a> Antigravity<'a> {
         };
         if closed {
             return Ok(Ok(turn(
-                if replied { "completed" } else { "unknown" },
+                if replied {
+                    TurnStatus::Completed
+                } else {
+                    TurnStatus::Unknown
+                },
                 "transcript-derived: a later USER_INPUT exists".into(),
             )));
         }
@@ -460,14 +464,14 @@ impl<'a> Antigravity<'a> {
         let running = status == "CASCADE_RUN_STATUS_RUNNING";
         Ok(Ok(if replied && !running {
             turn(
-                "completed",
+                TurnStatus::Completed,
                 format!(
                     "transcript-derived, best effort: the turn ends with a reply without tool calls, no process holds the conversation and the summary status is {status:?}"
                 ),
             )
         } else {
             turn(
-                "unknown",
+                TurnStatus::Unknown,
                 format!(
                     "transcript-derived: no process holds the conversation, the summary status is {status:?} (a killed run may leave RUNNING) and the transcript {} (a denied tool ends the turn without a reply)",
                     if replied {
@@ -590,13 +594,13 @@ impl Agent for Antigravity<'_> {
             let held = self.presence_held(&row.id).ok();
             let running = row.status == "CASCADE_RUN_STATUS_RUNNING";
             let state = if own_pid.is_some() {
-                "running"
+                SessionState::Running
             } else {
                 // A killed run leaves RUNNING with the lock released.
                 match (held, running) {
-                    (Some(true), true) => "running",
-                    (Some(false), true) | (None, _) => "unknown",
-                    (Some(_), false) => "idle",
+                    (Some(true), true) => SessionState::Running,
+                    (Some(false), true) | (None, _) => SessionState::Unknown,
+                    (Some(_), false) => SessionState::Idle,
                 }
             };
             let (has_history, first_prompt) = preview(&self.transcript_path(&row.id));
@@ -607,11 +611,15 @@ impl Agent for Antigravity<'_> {
                 name: (!row.title.is_empty()).then_some(row.title),
                 preview: first_prompt,
                 observations: Observations {
-                    history: if has_history { "visible" } else { "none" },
+                    history: if has_history {
+                        History::Visible
+                    } else {
+                        History::Absent
+                    },
                     loaded: match (own_pid, held) {
-                        (Some(_), _) | (_, Some(true)) => "yes",
-                        (None, Some(false)) => "no",
-                        (None, None) => "unknown",
+                        (Some(_), _) | (_, Some(true)) => Loaded::Yes,
+                        (None, Some(false)) => Loaded::No,
+                        (None, None) => Loaded::Unknown,
                     },
                     origin: if owned { "agent-talk" } else { "antigravity" }.into(),
                 },
@@ -757,7 +765,7 @@ impl Agent for Antigravity<'_> {
         let lines = load(&self.transcript_path(id))?;
         let mut messages = messages(&lines);
         for (_, m) in &mut messages {
-            if m.role == "user" && m.from.is_none() {
+            if m.role == Role::User && m.from.is_none() {
                 m.from = self.store.sender_by_turn(&h, &m.turn_id)?;
             }
         }
@@ -846,7 +854,7 @@ impl Agent for Antigravity<'_> {
             res,
             receipt_id.as_deref(),
             approvals,
-            "running",
+            Progress::Running,
         )
     }
 }

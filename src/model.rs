@@ -5,6 +5,7 @@
 //! `#[serde(default)]` on a field of a type that is never deserialized still matters: it
 //! makes the field optional in the schema.
 
+use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ValueRef};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -12,60 +13,80 @@ use std::fmt;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Stable error codes (DESIGN.md §5); serialized as their `E_*` names.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ErrorCode {
-    NoDaemon,
-    CapMissing,
-    Precondition,
-    Locked,
-    ForeignLive,
-    NoSteer,
-    MaxHops,
-    Timeout,
-    /// Ctrl-C during an observation; outcome unknown like a timeout.
-    Interrupted,
-    Transport,
-    Unsupported,
+/// A closed set of strings as an enum, each variant listed once with its wire string:
+/// `as_str`, `Display`, `Serialize` as the string, and an inline `{"type": "string",
+/// "enum": [...]}` schema.
+macro_rules! string_enum {
+    (
+        $(#[$meta:meta])*
+        pub enum $name:ident {
+            $($(#[$vmeta:meta])* $variant:ident = $wire:literal,)*
+        }
+    ) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum $name {
+            $($(#[$vmeta])* $variant,)*
+        }
+
+        impl $name {
+            pub fn as_str(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $wire,)*
+                }
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.pad(self.as_str())
+            }
+        }
+
+        impl Serialize for $name {
+            fn serialize<S>(&self, s: S) -> std::result::Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                s.serialize_str(self.as_str())
+            }
+        }
+
+        impl JsonSchema for $name {
+            fn inline_schema() -> bool {
+                true
+            }
+
+            fn schema_name() -> std::borrow::Cow<'static, str> {
+                stringify!($name).into()
+            }
+
+            fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+                schemars::json_schema!({"type": "string", "enum": [$($wire),*]})
+            }
+        }
+    };
 }
 
-impl Serialize for ErrorCode {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
-        s.serialize_str(self.as_str())
+string_enum! {
+    /// Stable error codes (DESIGN.md §5).
+    pub enum ErrorCode {
+        NoDaemon = "E_NO_DAEMON",
+        CapMissing = "E_CAP_MISSING",
+        Precondition = "E_PRECONDITION",
+        Locked = "E_LOCKED",
+        ForeignLive = "E_FOREIGN_LIVE",
+        NoSteer = "E_NO_STEER",
+        MaxHops = "E_MAX_HOPS",
+        Timeout = "E_TIMEOUT",
+        /// Ctrl-C during an observation; outcome unknown like a timeout.
+        Interrupted = "E_INTERRUPTED",
+        Transport = "E_TRANSPORT",
+        Unsupported = "E_UNSUPPORTED",
     }
 }
 
 impl ErrorCode {
-    const ALL: [Self; 11] = [
-        Self::NoDaemon,
-        Self::CapMissing,
-        Self::Precondition,
-        Self::Locked,
-        Self::ForeignLive,
-        Self::NoSteer,
-        Self::MaxHops,
-        Self::Timeout,
-        Self::Interrupted,
-        Self::Transport,
-        Self::Unsupported,
-    ];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::NoDaemon => "E_NO_DAEMON",
-            Self::CapMissing => "E_CAP_MISSING",
-            Self::Precondition => "E_PRECONDITION",
-            Self::Locked => "E_LOCKED",
-            Self::ForeignLive => "E_FOREIGN_LIVE",
-            Self::NoSteer => "E_NO_STEER",
-            Self::MaxHops => "E_MAX_HOPS",
-            Self::Timeout => "E_TIMEOUT",
-            Self::Interrupted => "E_INTERRUPTED",
-            Self::Transport => "E_TRANSPORT",
-            Self::Unsupported => "E_UNSUPPORTED",
-        }
-    }
-
     /// The outcome of a submission is unknown: the deadline passed, Ctrl-C or SIGTERM
     /// ended observation, or the transport was lost (DESIGN.md §4).
     pub fn is_unknown_outcome(self) -> bool {
@@ -79,23 +100,6 @@ impl ErrorCode {
             Self::Transport => 4,
             _ => 2,
         }
-    }
-}
-
-impl JsonSchema for ErrorCode {
-    fn schema_name() -> std::borrow::Cow<'static, str> {
-        "ErrorCode".into()
-    }
-
-    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
-        let codes: Vec<&str> = Self::ALL.iter().map(|c| c.as_str()).collect();
-        schemars::json_schema!({"type": "string", "enum": codes})
-    }
-}
-
-impl fmt::Display for ErrorCode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
     }
 }
 
@@ -120,8 +124,7 @@ pub struct Error {
     /// Progress when the outcome is unknown: waiting (approval pending), pending (still
     /// queued), running, unknown.
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[schemars(extend("enum" = ["waiting", "pending", "running", "unknown", null]))]
-    pub state: Option<&'static str>,
+    pub state: Option<Progress>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub approvals: Vec<Approval>,
 }
@@ -158,32 +161,33 @@ impl From<rusqlite::Error> for Error {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum ReceiptState {
-    Pending,
-    Accepted,
-    Unknown,
-    Rejected,
+string_enum! {
+    /// How far an intent whose outcome is unknown got (`Error::state`).
+    pub enum Progress {
+        Waiting = "waiting",
+        Pending = "pending",
+        Running = "running",
+        Unknown = "unknown",
+    }
 }
 
-impl ReceiptState {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Pending => "pending",
-            Self::Accepted => "accepted",
-            Self::Unknown => "unknown",
-            Self::Rejected => "rejected",
-        }
+string_enum! {
+    pub enum ReceiptState {
+        Pending = "pending",
+        Accepted = "accepted",
+        Unknown = "unknown",
+        Rejected = "rejected",
     }
+}
 
-    pub fn parse(s: &str) -> Self {
-        match s {
-            "pending" => Self::Pending,
-            "accepted" => Self::Accepted,
-            "rejected" => Self::Rejected,
-            _ => Self::Unknown,
-        }
+/// Read back from the string `as_str` stored; any other text is an error.
+impl FromSql for ReceiptState {
+    fn column_result(v: ValueRef<'_>) -> FromSqlResult<Self> {
+        let s = v.as_str()?;
+        [Self::Pending, Self::Accepted, Self::Unknown, Self::Rejected]
+            .into_iter()
+            .find(|state| state.as_str() == s)
+            .ok_or_else(|| FromSqlError::Other(format!("not a receipt state: {s:?}").into()))
     }
 }
 
@@ -214,18 +218,48 @@ pub struct Approval {
     pub summary: String,
     /// pending (nobody answered yet), declined (by agent-talk), resolved (answered by
     /// another client), denied (by the agent CLI's own permission handling).
-    #[schemars(extend("enum" = ["pending", "declined", "resolved", "denied"]))]
-    pub outcome: &'static str,
+    pub outcome: ApprovalOutcome,
     pub raw: Value,
+}
+
+string_enum! {
+    pub enum ApprovalOutcome {
+        Pending = "pending",
+        Declined = "declined",
+        Resolved = "resolved",
+        Denied = "denied",
+    }
+}
+
+string_enum! {
+    pub enum History {
+        Visible = "visible",
+        Absent = "none",
+    }
+}
+
+string_enum! {
+    pub enum Loaded {
+        Yes = "yes",
+        No = "no",
+        Unknown = "unknown",
+    }
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct Observations {
-    #[schemars(extend("enum" = ["visible", "none", "unknown"]))]
-    pub history: &'static str,
-    #[schemars(extend("enum" = ["yes", "no", "unknown"]))]
-    pub loaded: &'static str,
+    pub history: History,
+    pub loaded: Loaded,
     pub origin: String,
+}
+
+string_enum! {
+    pub enum SessionState {
+        Idle = "idle",
+        Running = "running",
+        Waiting = "waiting",
+        Unknown = "unknown",
+    }
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -237,17 +271,24 @@ pub struct Session {
     pub name: Option<String>,
     pub preview: Option<String>,
     pub observations: Observations,
-    #[schemars(extend("enum" = ["idle", "running", "waiting", "unknown"]))]
-    pub state: &'static str,
+    pub state: SessionState,
     pub owned: bool,
+}
+
+string_enum! {
+    pub enum TurnStatus {
+        Completed = "completed",
+        Failed = "failed",
+        Interrupted = "interrupted",
+        Unknown = "unknown",
+    }
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct Turn {
     pub handle: String,
     pub turn_id: String,
-    #[schemars(extend("enum" = ["completed", "failed", "interrupted", "unknown"]))]
-    pub status: &'static str,
+    pub status: TurnStatus,
     pub error: Option<Value>,
     pub final_text: Option<String>,
     pub duration_ms: Option<i64>,
@@ -310,17 +351,31 @@ impl Caller {
     };
 }
 
+string_enum! {
+    pub enum Role {
+        User = "user",
+        Assistant = "assistant",
+    }
+}
+
+string_enum! {
+    pub enum Phase {
+        Prompt = "prompt",
+        Final = "final",
+        Commentary = "commentary",
+        Other = "other",
+    }
+}
+
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct Message {
     pub turn_id: String,
     pub item_id: String,
-    #[schemars(extend("enum" = ["user", "assistant"]))]
-    pub role: &'static str,
+    pub role: Role,
     /// `prompt`: input a person or an agent sent; `final`: the reply that ended a turn;
     /// `commentary`: text the agent wrote on the way; `other`: tool calls and results,
     /// input the agent's runtime injected, interruptions and errors.
-    #[schemars(extend("enum" = ["prompt", "final", "commentary", "other"]))]
-    pub phase: &'static str,
+    pub phase: Phase,
     pub text: String,
     /// User messages: the caller recorded for the intent that sent it, or
     /// `{kind: runtime}` for input the agent's runtime injected. Absent when the message

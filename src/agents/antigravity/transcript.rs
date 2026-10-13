@@ -4,7 +4,7 @@
 
 use crate::agents::history::first_line;
 use crate::agents::strip_provenance;
-use crate::model::{Caller, Error, Message, Result};
+use crate::model::{Caller, Error, Message, Phase, Result, Role};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::{HashSet, VecDeque};
@@ -206,8 +206,8 @@ pub fn messages(lines: &[Entry]) -> Vec<(usize, Message)> {
                 i,
                 msg(
                     item,
-                    "user",
-                    "prompt",
+                    Role::User,
+                    Phase::Prompt,
                     user_text(s.text()).to_string(),
                     None,
                 ),
@@ -217,8 +217,8 @@ pub fn messages(lines: &[Entry]) -> Vec<(usize, Message)> {
                 i,
                 msg(
                     item,
-                    "user",
-                    "other",
+                    Role::User,
+                    Phase::Other,
                     system_text(s.text()).to_string(),
                     Some(Caller::RUNTIME),
                 ),
@@ -226,13 +226,19 @@ pub fn messages(lines: &[Entry]) -> Vec<(usize, Message)> {
         } else if s.is_planner() {
             if !s.text().is_empty() {
                 let phase = if finals.contains(&i) {
-                    "final"
+                    Phase::Final
                 } else {
-                    "commentary"
+                    Phase::Commentary
                 };
                 out.push((
                     i,
-                    msg(item.clone(), "assistant", phase, s.text().to_string(), None),
+                    msg(
+                        item.clone(),
+                        Role::Assistant,
+                        phase,
+                        s.text().to_string(),
+                        None,
+                    ),
                 ));
             }
             if !s.tool_calls.is_empty() {
@@ -242,8 +248,8 @@ pub fn messages(lines: &[Entry]) -> Vec<(usize, Message)> {
                     i,
                     msg(
                         format!("{item}:tools"),
-                        "assistant",
-                        "other",
+                        Role::Assistant,
+                        Phase::Other,
                         text.join("\n"),
                         None,
                     ),
@@ -257,8 +263,8 @@ pub fn messages(lines: &[Entry]) -> Vec<(usize, Message)> {
                 i,
                 msg(
                     item,
-                    "assistant",
-                    "other",
+                    Role::Assistant,
+                    Phase::Other,
                     format!("[{name}] {}", s.status),
                     None,
                 ),
@@ -321,7 +327,7 @@ mod tests {
     fn view(lines: &[Entry]) -> Vec<(usize, String, &'static str, &'static str, String)> {
         messages(lines)
             .into_iter()
-            .map(|(i, m)| (i, m.turn_id, m.role, m.phase, m.text))
+            .map(|(i, m)| (i, m.turn_id, m.role.as_str(), m.phase.as_str(), m.text))
             .collect()
     }
 

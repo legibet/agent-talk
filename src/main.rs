@@ -7,7 +7,7 @@ mod store;
 use agents::history::ReadQuery;
 use agents::{Settings, WaitTarget};
 use clap::{Args, Parser, Subcommand};
-use model::{Approval, Caller, CallerKind, Outcome, Receipt, Turn};
+use model::{Approval, Caller, CallerKind, Outcome, Receipt, Role, Turn};
 use ops::{
     DEFAULT_TIMEOUT, LsArgs, Models, ModelsArgs, NewArgs, Read, ReadArgs, SendArgs, Sessions,
     Status, WaitArgs, caller_from_handle, env_var,
@@ -413,7 +413,7 @@ fn receipt_line(r: &Receipt) -> String {
     format!(
         "{} state={} queue={} turn={}",
         r.receipt_id,
-        r.state.as_str(),
+        r.state,
         or_dash(r.queue_id.as_deref()),
         or_dash(r.turn_id.as_deref())
     )
@@ -532,12 +532,12 @@ fn print_read(
             })
             .unwrap_or_default();
         let label = match (m.role, m.from.as_ref()) {
-            ("user", Some(from)) => match (from.kind, &from.session) {
+            (Role::User, Some(from)) => match (from.kind, &from.session) {
                 (CallerKind::Runtime, _) => "user runtime".to_string(),
                 (CallerKind::Agent, Some(h)) => format!("user from {h}"),
                 _ => "user".to_string(),
             },
-            ("user", None) => "user".to_string(),
+            (Role::User, None) => "user".to_string(),
             (role, _) => format!("{role} {}", m.phase),
         };
         println!("{time}[{label}] {}", m.text);

@@ -29,8 +29,8 @@ use crate::agents::{
     strip_provenance,
 };
 use crate::model::{
-    self, Approval, Error, ErrorCode, Model, Observations, Outcome, Page, ReceiptState, Result,
-    Session,
+    self, Approval, ApprovalOutcome, Error, ErrorCode, Loaded, Model, Observations, Outcome, Page,
+    Progress, ReceiptState, Result, Session, SessionState, TurnStatus,
 };
 use crate::store::{NewIntent, Store};
 use serde::Deserialize;
@@ -319,9 +319,10 @@ impl TurnWatch {
                 if u["sessionUpdate"] == "interaction_resolved" {
                     // Someone answered (or agent-talk's own answer took effect).
                     for a in self.approvals.iter_mut().filter(|a| {
-                        a.outcome == "pending" && a.item_id.as_deref() == u["tool_call_id"].as_str()
+                        a.outcome == ApprovalOutcome::Pending
+                            && a.item_id.as_deref() == u["tool_call_id"].as_str()
                     }) {
-                        a.outcome = "resolved";
+                        a.outcome = ApprovalOutcome::Resolved;
                         record(store, a);
                     }
                 }
@@ -365,9 +366,9 @@ impl TurnWatch {
                     json!({"outcome": {"outcome": "selected", "optionId": option}}),
                 )
                 .await?;
-                "declined"
+                ApprovalOutcome::Declined
             }
-            _ => "pending",
+            _ => ApprovalOutcome::Pending,
         };
         let summary = call["title"]
             .as_str()
@@ -697,7 +698,7 @@ impl<'a> Grok<'a> {
                 Err(e) => Ok(model::Turn {
                     handle: h.clone(),
                     turn_id: intent.client_msg_id.to_string(),
-                    status: "failed",
+                    status: TurnStatus::Failed,
                     error: Some(json!({"message": e.message, "agent_error": e.agent_error})),
                     final_text: (!w.text.is_empty()).then(|| w.text.clone()),
                     duration_ms: None,
@@ -706,11 +707,11 @@ impl<'a> Grok<'a> {
             }
         });
         let progress = if w.running {
-            "running"
+            Progress::Running
         } else if w.accepted {
-            "pending"
+            Progress::Pending
         } else {
-            "unknown"
+            Progress::Unknown
         };
         settle(
             self.store,
@@ -841,7 +842,7 @@ impl<'a> Grok<'a> {
                 res,
                 Some(&w.receipt_id),
                 w.approvals,
-                "running",
+                Progress::Running,
             )
         }
         .await;
@@ -1003,10 +1004,10 @@ impl Agent for Grok<'_> {
             let updates_path = dir.join("updates.jsonl");
             let own_pid = self.own_run(id, &dir)?;
             let state = match (own_pid, lead) {
-                (Some(_), _) => "running",
-                (None, Some(l)) if l.resident && l.activity == "working" => "running",
-                (None, Some(l)) if l.resident && l.activity == "idle" => "idle",
-                _ => "unknown",
+                (Some(_), _) => SessionState::Running,
+                (None, Some(l)) if l.resident && l.activity == "working" => SessionState::Running,
+                (None, Some(l)) if l.resident && l.activity == "idle" => SessionState::Idle,
+                _ => SessionState::Unknown,
             };
             let loaded = own_pid.is_some() || tui || lead.is_some_and(|l| l.resident);
             items.push(Session {
@@ -1017,11 +1018,11 @@ impl Agent for Grok<'_> {
                 preview: first_prompt(&updates_path).map(|p| first_line(strip_provenance(&p), 200)),
                 observations: Observations {
                     history: if updates_path.is_file() {
-                        "visible"
+                        model::History::Visible
                     } else {
-                        "none"
+                        model::History::Absent
                     },
-                    loaded: if loaded { "yes" } else { "no" },
+                    loaded: if loaded { Loaded::Yes } else { Loaded::No },
                     origin: if owned {
                         "agent-talk".into()
                     } else if s.session_kind.as_deref() == Some("headless") {
@@ -1291,10 +1292,13 @@ impl Agent for Grok<'_> {
                 {
                     let (status, message) = match span {
                         Some(_) => (
-                            "interrupted",
+                            TurnStatus::Interrupted,
                             "the turn started but has no turn_completed; Grok marks it interrupted when the session is next loaded",
                         ),
-                        None => ("unknown", "updates.jsonl names no turn for this prompt"),
+                        None => (
+                            TurnStatus::Unknown,
+                            "updates.jsonl names no turn for this prompt",
+                        ),
                     };
                     return Ok(model::Turn {
                         handle: h.clone(),
@@ -1326,7 +1330,7 @@ impl Agent for Grok<'_> {
             res,
             receipt_id.as_deref(),
             Vec::new(),
-            "running",
+            Progress::Running,
         )
     }
 }

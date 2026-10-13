@@ -21,8 +21,9 @@ use crate::agents::{
     WaitTarget,
 };
 use crate::model::{
-    self, Approval, Error, ErrorCode, Message, Model, Observations, Outcome, Page, ReceiptState,
-    Result, Session,
+    self, Approval, ApprovalOutcome, Error, ErrorCode, History, Loaded, Message, Model,
+    Observations, Outcome, Page, Phase, Progress, ReceiptState, Result, Role, Session,
+    SessionState, TurnStatus,
 };
 use crate::store::{NewIntent, Store};
 use serde_json::{Value, json};
@@ -77,11 +78,11 @@ impl<'t> Watch<'t> {
     }
 
     /// Progress reported when the outcome is not known yet.
-    fn progress(&self) -> &'static str {
+    fn progress(&self) -> Progress {
         match (self.submitted, self.delivered) {
-            (false, _) => "unknown",
-            (true, false) => "pending",
-            (true, true) => "running",
+            (false, _) => Progress::Unknown,
+            (true, false) => Progress::Pending,
+            (true, true) => Progress::Running,
         }
     }
 }
@@ -273,20 +274,20 @@ impl Span {
         let (status, ended_at) = match &self.end {
             Some(End::Idle(i)) => (
                 match i["outcome"].as_str() {
-                    Some("succeeded") => "completed",
-                    Some("failed") => "failed",
-                    Some("interrupted") => "interrupted",
-                    _ => "unknown",
+                    Some("succeeded") => TurnStatus::Completed,
+                    Some("failed") => TurnStatus::Failed,
+                    Some("interrupted") => TurnStatus::Interrupted,
+                    _ => TurnStatus::Unknown,
                 },
                 i["time"]["created"].as_i64(),
             ),
             Some(End::Aborted) => (
-                "interrupted",
+                TurnStatus::Interrupted,
                 self.after
                     .last()
                     .and_then(|m| m["time"]["completed"].as_i64()),
             ),
-            None => ("unknown", None),
+            None => (TurnStatus::Unknown, None),
         };
         let started = self.user["time"]["created"].as_i64();
         model::Turn {
@@ -403,7 +404,7 @@ impl<'a> OpenCode<'a> {
             request_id: json!(request_id),
             summary: format!("{action} {}", resources.join(" ")),
             kind: action,
-            outcome: "pending",
+            outcome: ApprovalOutcome::Pending,
             raw: req,
         };
         // Deny only requests of the turn being observed: while the message is still
@@ -419,10 +420,12 @@ impl<'a> OpenCode<'a> {
                 )
                 .await;
             a.outcome = match reply {
-                Ok(_) => "declined",
+                Ok(_) => ApprovalOutcome::Declined,
                 // Gone already: one reject answers every pending request of the session
                 // (DESIGN.md §6.3), or someone else replied first.
-                Err(e) if e.agent_error.as_ref().is_some_and(|v| v.code == 404) => "resolved",
+                Err(e) if e.agent_error.as_ref().is_some_and(|v| v.code == 404) => {
+                    ApprovalOutcome::Resolved
+                }
                 Err(e) => return Err(e),
             };
         }
@@ -626,8 +629,8 @@ impl<'a> OpenCode<'a> {
                         Message {
                             turn_id: id.clone(),
                             item_id: id.clone(),
-                            role: "user",
-                            phase: "prompt",
+                            role: Role::User,
+                            phase: Phase::Prompt,
                             text: text(&m["text"]).unwrap_or_default(),
                             from: self.store.sender_of(&id)?,
                             timestamp,
@@ -639,8 +642,8 @@ impl<'a> OpenCode<'a> {
                     Message {
                         turn_id: turn.clone().unwrap_or_else(|| id.clone()),
                         item_id: id.clone(),
-                        role: "user",
-                        phase: "other",
+                        role: Role::User,
+                        phase: Phase::Other,
                         text: format!("[synthetic] {}", text(&m["text"]).unwrap_or_default()),
                         // Written by the service itself under its own id: no sender.
                         from: None,
@@ -659,14 +662,14 @@ impl<'a> OpenCode<'a> {
                         let (phase, body) = match part["type"].as_str().unwrap_or_default() {
                             "text" => (
                                 if m["finish"] == "stop" && Some(p) == last_text {
-                                    "final"
+                                    Phase::Final
                                 } else {
-                                    "commentary"
+                                    Phase::Commentary
                                 },
                                 text(&part["text"]).unwrap_or_default(),
                             ),
                             "tool" => (
-                                "other",
+                                Phase::Other,
                                 format!(
                                     "[tool {}] {} {}",
                                     part["name"].as_str().unwrap_or("?"),
@@ -681,7 +684,7 @@ impl<'a> OpenCode<'a> {
                             Message {
                                 turn_id: turn_id.clone(),
                                 item_id: format!("{id}#{p}"),
-                                role: "assistant",
+                                role: Role::Assistant,
                                 phase,
                                 text: body,
                                 from: None,
@@ -695,8 +698,8 @@ impl<'a> OpenCode<'a> {
                             Message {
                                 turn_id: turn_id.clone(),
                                 item_id: format!("{id}#error"),
-                                role: "assistant",
-                                phase: "other",
+                                role: Role::Assistant,
+                                phase: Phase::Other,
                                 text: format!("[error] {}", m["error"]),
                                 from: None,
                                 timestamp: completed,
@@ -801,8 +804,8 @@ impl Agent for OpenCode<'_> {
                 name: text(&s["title"]),
                 preview: text(&s["title"]),
                 observations: Observations {
-                    history: "visible",
-                    loaded: "yes",
+                    history: History::Visible,
+                    loaded: Loaded::Yes,
                     origin: match (owned, s["parentID"].as_str(), s["agent"].as_str()) {
                         (true, _, _) => "agent-talk".into(),
                         (false, Some(p), _) => format!("opencode child of {p}"),
@@ -810,7 +813,11 @@ impl Agent for OpenCode<'_> {
                         (false, None, None) => "opencode".into(),
                     },
                 },
-                state: if running { "running" } else { "idle" },
+                state: if running {
+                    SessionState::Running
+                } else {
+                    SessionState::Idle
+                },
                 owned,
             });
         }
@@ -1078,7 +1085,7 @@ mod tests {
         let later = json!({"id":"msg_u2","time":{"created":5000},"text":"two","type":"user"});
         let span = Span::new(user.clone(), vec![assistant.clone(), idle, later.clone()]);
         let t = span.turn("ses_x");
-        assert_eq!(t.status, "completed");
+        assert_eq!(t.status, TurnStatus::Completed);
         assert_eq!(t.final_text.as_deref(), Some("one"));
         assert_eq!(t.duration_ms, Some(1000));
         assert_eq!(t.handle, "opencode:ses_x");
@@ -1092,7 +1099,7 @@ mod tests {
             json!({"id":"msg_j","time":{"created":3000},"type":"idle","outcome":"interrupted"});
         let span = Span::new(user.clone(), vec![interrupted.clone(), idle_interrupted]);
         let t = span.turn("ses_x");
-        assert_eq!(t.status, "interrupted");
+        assert_eq!(t.status, TurnStatus::Interrupted);
         assert_eq!(t.final_text, None);
         assert_eq!(t.error.unwrap()["type"], "aborted");
         assert_eq!(t.duration_ms, Some(2000));
@@ -1104,7 +1111,7 @@ mod tests {
             vec![interrupted.clone(), later, assistant, idle_succeeded(6000)],
         );
         let t = span.turn("ses_x");
-        assert_eq!(t.status, "interrupted");
+        assert_eq!(t.status, TurnStatus::Interrupted);
         assert_eq!(t.final_text, None);
         assert_eq!(t.duration_ms, Some(900));
         assert_eq!(span.after.len(), 1);
@@ -1139,7 +1146,14 @@ mod tests {
         let m = oc.messages(page.iter(), None).unwrap();
         let brief: Vec<(&str, &str, &str, &str)> = m
             .iter()
-            .map(|(_, m)| (m.turn_id.as_str(), m.role, m.phase, m.text.as_str()))
+            .map(|(_, m)| {
+                (
+                    m.turn_id.as_str(),
+                    m.role.as_str(),
+                    m.phase.as_str(),
+                    m.text.as_str(),
+                )
+            })
             .collect();
         assert_eq!(
             brief,

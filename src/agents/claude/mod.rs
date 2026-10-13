@@ -29,8 +29,8 @@ use crate::agents::{
     Agent, AgentStatus, Check, ListFilter, Operation, SendRequest, StartRequest, WaitTarget,
 };
 use crate::model::{
-    self, AgentError, Approval, Error, ErrorCode, Model, Observations, Outcome, Page, ReceiptState,
-    Result, Session,
+    self, AgentError, Approval, ApprovalOutcome, Error, ErrorCode, History, Loaded, Model,
+    Observations, Outcome, Page, Progress, ReceiptState, Result, Session, SessionState, TurnStatus,
 };
 use crate::store::{NewIntent, Store};
 use serde::Deserialize;
@@ -129,7 +129,7 @@ impl RunWatch {
                         (Some(t), None) => t.clone(),
                         _ => "permission-related event".into(),
                     },
-                    outcome: "denied",
+                    outcome: ApprovalOutcome::Denied,
                     raw: raw.clone(),
                 };
                 record(store, &a);
@@ -321,9 +321,9 @@ impl<'a> Claude<'a> {
                     handle: h.clone(),
                     turn_id: watch.turn_id.clone(),
                     status: if status.success() {
-                        "unknown"
+                        TurnStatus::Unknown
                     } else {
-                        "failed"
+                        TurnStatus::Failed
                     },
                     error: Some(json!({
                         "message": "claude exited without a result event",
@@ -356,7 +356,7 @@ impl<'a> Claude<'a> {
             res,
             Some(&watch.receipt_id),
             watch.approvals,
-            "running",
+            Progress::Running,
         )
     }
 }
@@ -533,16 +533,18 @@ impl Agent for Claude<'_> {
             };
             let status = agent.and_then(|a| a.status.as_deref().or(a.state.as_deref()));
             let state = if own_pid.is_some() {
-                "running"
+                SessionState::Running
             } else if live_pid.is_some() {
                 match status {
-                    Some("busy" | "running") => "running",
-                    Some("idle") => "idle",
-                    Some(s) if s.contains("wait") || s.contains("permission") => "waiting",
-                    _ => "unknown",
+                    Some("busy" | "running") => SessionState::Running,
+                    Some("idle") => SessionState::Idle,
+                    Some(s) if s.contains("wait") || s.contains("permission") => {
+                        SessionState::Waiting
+                    }
+                    _ => SessionState::Unknown,
                 }
             } else {
-                "unknown"
+                SessionState::Unknown
             };
             items.push(Session {
                 handle: h,
@@ -552,16 +554,16 @@ impl Agent for Claude<'_> {
                 preview,
                 observations: Observations {
                     history: if row.file.is_some() {
-                        "visible"
+                        History::Visible
                     } else {
-                        "none"
+                        History::Absent
                     },
                     loaded: if live_pid.is_some() || own_pid.is_some() {
-                        "yes"
+                        Loaded::Yes
                     } else if agents_ok {
-                        "no"
+                        Loaded::No
                     } else {
-                        "unknown"
+                        Loaded::Unknown
                     },
                     origin,
                 },
@@ -786,7 +788,7 @@ impl Agent for Claude<'_> {
                         return Ok(model::Turn {
                             handle: h.clone(),
                             turn_id: turn_id.clone(),
-                            status: "unknown",
+                            status: TurnStatus::Unknown,
                             error: Some(json!({
                                 "message": "the claude process exited without a result event and the turn is not in the transcript",
                             })),
@@ -829,7 +831,7 @@ impl Agent for Claude<'_> {
             res,
             receipt_id.as_deref(),
             Vec::new(),
-            "running",
+            Progress::Running,
         )
     }
 }

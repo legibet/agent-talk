@@ -1,7 +1,7 @@
 //! Paging a session's history for `read` (DESIGN.md §5): the query, the page, and how a
 //! page is cut out of an agent's records.
 
-use crate::model::{Error, ErrorCode, Message, Page, Result};
+use crate::model::{Error, ErrorCode, Message, Page, Phase, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -17,7 +17,7 @@ pub struct ReadQuery {
 
 impl ReadQuery {
     pub fn shows(&self, m: &Message) -> bool {
-        self.all || matches!(m.phase, "prompt" | "final")
+        self.all || matches!(m.phase, Phase::Prompt | Phase::Final)
     }
 }
 
@@ -117,8 +117,9 @@ pub fn first_line(s: &str, n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Role;
 
-    fn tagged(items: &[(usize, &'static str, &'static str)]) -> Vec<(usize, Message)> {
+    fn tagged(items: &[(usize, Role, Phase)]) -> Vec<(usize, Message)> {
         items
             .iter()
             .map(|&(record, role, phase)| {
@@ -140,12 +141,12 @@ mod tests {
 
     /// Two turns, the second one a tool call between the prompt and the reply, over
     /// five records; records 0 and 4 hold no message (a hidden marker at each end).
-    const HISTORY: &[(usize, &str, &str)] = &[
-        (1, "user", "prompt"),
-        (1, "assistant", "final"),
-        (2, "user", "prompt"),
-        (3, "assistant", "other"),
-        (3, "assistant", "final"),
+    const HISTORY: &[(usize, Role, Phase)] = &[
+        (1, Role::User, Phase::Prompt),
+        (1, Role::Assistant, Phase::Final),
+        (2, Role::User, Phase::Prompt),
+        (3, Role::Assistant, Phase::Other),
+        (3, Role::Assistant, Phase::Final),
     ];
 
     fn ids(c: &Cut) -> Vec<&str> {

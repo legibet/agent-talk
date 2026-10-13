@@ -15,7 +15,8 @@ use crate::agents::{
     strip_provenance,
 };
 use crate::model::{
-    self, Approval, Error, ErrorCode, Message, Model, Observations, Outcome, Page, Result, Session,
+    self, Approval, ApprovalOutcome, Error, ErrorCode, History, Loaded, Message, Model,
+    Observations, Outcome, Page, Phase, Progress, Result, Role, Session, SessionState, TurnStatus,
 };
 use crate::store::{NewIntent, Store};
 use serde_json::{Value, json};
@@ -51,11 +52,11 @@ enum Target {
 
 impl Target {
     /// Progress reported when the outcome is not known yet.
-    fn progress(&self) -> &'static str {
+    fn progress(&self) -> Progress {
         match self {
-            Target::Turn(_) => "running",
-            Target::Client { queued: true, .. } => "pending",
-            Target::Client { queued: false, .. } => "unknown",
+            Target::Turn(_) => Progress::Running,
+            Target::Client { queued: true, .. } => Progress::Pending,
+            Target::Client { queued: false, .. } => Progress::Unknown,
         }
     }
 }
@@ -225,9 +226,9 @@ impl<'a> Codex<'a> {
         let outcome = match (w.policy, deny_response(&method)) {
             (ApprovalPolicy::Deny, Some(body)) => {
                 conn.respond(&id, body).await?;
-                "declined"
+                ApprovalOutcome::Declined
             }
-            _ => "pending",
+            _ => ApprovalOutcome::Pending,
         };
         let a = Approval {
             handle: handle(params["threadId"].as_str().unwrap_or(w.thread_id)),
@@ -252,7 +253,7 @@ impl<'a> Codex<'a> {
         res: Result<Option<model::Turn>>,
         receipt_id: Option<&str>,
         mut w: Watch<'_>,
-        progress: &'static str,
+        progress: Progress,
     ) -> Result<Outcome> {
         for r in conn.drain_requests() {
             if let Err(e) = self.on_request(&conn, &mut w, r).await {
@@ -447,8 +448,8 @@ impl<'a> Codex<'a> {
                 let message = match Item::parse(item) {
                     Item::User(u) => Message {
                         turn_id: turn_id.into(),
-                        role: "user",
-                        phase: "prompt",
+                        role: Role::User,
+                        phase: Phase::Prompt,
                         text: u.text(),
                         from: match &u.client_id {
                             Some(c) => self.store.sender_of(c)?,
@@ -460,11 +461,11 @@ impl<'a> Codex<'a> {
                     Item::Agent(a) => Message {
                         turn_id: turn_id.into(),
                         item_id: a.id,
-                        role: "assistant",
+                        role: Role::Assistant,
                         phase: match a.phase.as_deref() {
-                            Some("final_answer") => "final",
-                            Some("commentary") => "commentary",
-                            _ => "other",
+                            Some("final_answer") => Phase::Final,
+                            Some("commentary") => Phase::Commentary,
+                            _ => Phase::Other,
                         },
                         text: a.text,
                         from: None,
@@ -510,10 +511,10 @@ fn to_turn(thread_id: &str, t: protocol::Turn) -> model::Turn {
         handle: handle(thread_id),
         turn_id: t.id,
         status: match t.status.as_str() {
-            "completed" => "completed",
-            "failed" => "failed",
-            "interrupted" => "interrupted",
-            _ => "unknown",
+            "completed" => TurnStatus::Completed,
+            "failed" => TurnStatus::Failed,
+            "interrupted" => TurnStatus::Interrupted,
+            _ => TurnStatus::Unknown,
         },
         error: t.error.filter(|e| !e.is_null()),
         final_text,
@@ -530,12 +531,12 @@ async fn run(program: &str, args: &[&str]) -> std::result::Result<String, String
     }
 }
 
-fn session_state(s: &ThreadStatus) -> &'static str {
+fn session_state(s: &ThreadStatus) -> SessionState {
     match s {
-        ThreadStatus::Idle => "idle",
-        ThreadStatus::Active { active_flags } if !active_flags.is_empty() => "waiting",
-        ThreadStatus::Active { .. } => "running",
-        _ => "unknown",
+        ThreadStatus::Idle => SessionState::Idle,
+        ThreadStatus::Active { active_flags } if !active_flags.is_empty() => SessionState::Waiting,
+        ThreadStatus::Active { .. } => SessionState::Running,
+        _ => SessionState::Unknown,
     }
 }
 
@@ -691,8 +692,12 @@ impl Agent for Codex<'_> {
                     .as_deref()
                     .map(|p| strip_provenance(p).to_string()),
                 observations: Observations {
-                    history: "visible",
-                    loaded: if loaded.contains(&t.id) { "yes" } else { "no" },
+                    history: History::Visible,
+                    loaded: if loaded.contains(&t.id) {
+                        Loaded::Yes
+                    } else {
+                        Loaded::No
+                    },
                     origin,
                 },
                 state: session_state(&t.status),
@@ -769,7 +774,7 @@ impl Agent for Codex<'_> {
             Some(d) => bounded(Some(d), work).await,
             None => work.await,
         };
-        let progress = target.as_ref().map_or("unknown", Target::progress);
+        let progress = target.as_ref().map_or(Progress::Unknown, Target::progress);
         self.finish(conn, res, Some(&receipt_id), w, progress).await
     }
 
@@ -906,7 +911,7 @@ impl Agent for Codex<'_> {
             Some(d) => bounded(Some(d), work).await,
             None => work.await,
         };
-        let progress = target.as_ref().map_or("unknown", Target::progress);
+        let progress = target.as_ref().map_or(Progress::Unknown, Target::progress);
         self.finish(conn, res, Some(&receipt_id), w, progress).await
     }
 

@@ -1,7 +1,7 @@
 //! stdout of `agy -p --output-format stream-json`, as written to a run log. Narrow;
 //! unknown events are tolerated.
 
-use crate::model::{self, Approval};
+use crate::model::{self, Approval, ApprovalOutcome, TurnStatus};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::path::Path;
@@ -100,7 +100,11 @@ pub fn result_turn(handle: String, run: &Run, result: &Value) -> model::Turn {
     model::Turn {
         handle,
         turn_id: run.turn_id().unwrap_or_default(),
-        status: if failed { "failed" } else { "completed" },
+        status: if failed {
+            TurnStatus::Failed
+        } else {
+            TurnStatus::Completed
+        },
         error: failed.then(|| json!({"status": result["status"], "error": result["error"]})),
         final_text: run.final_text(),
         // `duration_seconds`, `num_turns` and `usage` are conversation totals on a resumed
@@ -130,7 +134,7 @@ pub fn denials(handle: &str, turn_id: &str, receipt_id: &str, result: &Value) ->
                 d["display_name"].as_str().unwrap_or("tool"),
                 d["action"].as_str().unwrap_or("unknown action")
             ),
-            outcome: "denied",
+            outcome: ApprovalOutcome::Denied,
             raw: d.clone(),
         })
         .collect()
@@ -176,7 +180,7 @@ mod tests {
         assert_eq!(r.turn_id().as_deref(), Some("0"));
         let result = r.result.as_ref().unwrap();
         let t = result_turn("antigravity:x".into(), &r, result);
-        assert_eq!(t.status, "completed");
+        assert_eq!(t.status, TurnStatus::Completed);
         // The last reply, not result.response (which joins the commentary in).
         assert_eq!(t.final_text.as_deref(), Some("DONE1"));
         assert!(denials("antigravity:x", "0", "r", result).is_empty());
@@ -186,14 +190,14 @@ mod tests {
         assert_eq!(a.len(), 1);
         assert_eq!(
             (a[0].outcome, a[0].summary.as_str()),
-            ("denied", "denied: RunCommand (command)")
+            (ApprovalOutcome::Denied, "denied: RunCommand (command)")
         );
 
         let r = run(&[MODEL_ERROR]);
         assert!(r.conversation_id.is_none() && r.turn_id().is_none());
         assert_eq!(
             result_turn("x".into(), &r, r.result.as_ref().unwrap()).status,
-            "failed"
+            TurnStatus::Failed
         );
     }
 }

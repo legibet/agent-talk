@@ -3,7 +3,7 @@
 
 use super::session::{self, Body};
 use crate::agents::child::agent_cmd;
-use crate::model::{self, Error, Result};
+use crate::model::{self, Error, Result, TurnStatus};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::fs::File;
@@ -141,7 +141,7 @@ impl Run {
             handle,
             turn_id,
             status,
-            error: (status != "completed").then(|| {
+            error: (status != TurnStatus::Completed).then(|| {
                 json!({
                     "stop_reason": stop,
                     "message": body.as_ref().and_then(|m| m.error_message.clone()),
@@ -161,8 +161,8 @@ pub fn exited(handle: String, turn_id: String, exit: Option<ExitStatus>) -> mode
         handle,
         turn_id,
         status: match exit {
-            Some(s) if !s.success() => "failed",
-            _ => "unknown",
+            Some(s) if !s.success() => TurnStatus::Failed,
+            _ => TurnStatus::Unknown,
         },
         error: Some(json!({
             "message": "pi exited without an agent_settled event",
@@ -197,12 +197,12 @@ mod tests {
         let t = run.turn("pi:s".into(), "8bd197f0".into());
         assert_eq!(
             (t.status, t.final_text.as_deref()),
-            ("completed", Some("stdin OK"))
+            (TurnStatus::Completed, Some("stdin OK"))
         );
         assert!(t.error.is_none());
         run.apply(ABORTED);
         let t = run.turn("pi:s".into(), "8bd197f0".into());
-        assert_eq!((t.status, t.final_text), ("failed", None));
+        assert_eq!((t.status, t.final_text), (TurnStatus::Failed, None));
         assert_eq!(t.error.unwrap()["message"], "This operation was aborted");
     }
 

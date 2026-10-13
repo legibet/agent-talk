@@ -4,7 +4,7 @@
 
 use crate::agents::history::first_line;
 use crate::agents::strip_provenance;
-use crate::model::{self, Caller, Error, Message, Result};
+use crate::model::{self, Caller, Error, Message, Phase, Result, Role, TurnStatus};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -379,15 +379,15 @@ pub fn transcript_turn(
         .and_then(|m| m.stop_reason.as_deref())
         == Some("end_turn")
     {
-        "completed"
+        TurnStatus::Completed
     } else {
-        "unknown"
+        TurnStatus::Unknown
     };
     let (status, duration_ms, basis) = match end {
         TurnEnd::Duration(i) => {
             let td = &entries[i].raw;
             (
-                "completed",
+                TurnStatus::Completed,
                 td["durationMs"].as_i64(),
                 format!(
                     "transcript-derived, best effort: system/turn_duration after the prompt (pendingBackgroundAgentCount {}; claude agents status {})",
@@ -397,7 +397,7 @@ pub fn transcript_turn(
             )
         }
         TurnEnd::Interrupt(_) => (
-            "interrupted",
+            TurnStatus::Interrupted,
             None,
             "transcript-derived, best effort: '[Request interrupted by user]' after the prompt"
                 .into(),
@@ -465,19 +465,19 @@ fn to_message(line: &Line, turn_id: &str, item_id: &str) -> Option<Message> {
     }
     let body = line.message.as_ref()?;
     let (role, phase, text) = match line.kind.as_str() {
-        "user" if body.tool_result_only() => ("user", "other", tool_result_summary(body)),
-        "user" if line.is_interrupt() => ("user", "other", "[interrupted]".to_string()),
-        "user" if line.is_runtime() => ("user", "other", body.text()),
-        "user" => ("user", "prompt", body.text()),
+        "user" if body.tool_result_only() => (Role::User, Phase::Other, tool_result_summary(body)),
+        "user" if line.is_interrupt() => (Role::User, Phase::Other, "[interrupted]".to_string()),
+        "user" if line.is_runtime() => (Role::User, Phase::Other, body.text()),
+        "user" => (Role::User, Phase::Prompt, body.text()),
         "assistant" => {
             let text = body.text();
             if !text.is_empty() {
                 let phase = if body.stop_reason.as_deref() == Some("end_turn") {
-                    "final"
+                    Phase::Final
                 } else {
-                    "commentary"
+                    Phase::Commentary
                 };
-                ("assistant", phase, text)
+                (Role::Assistant, phase, text)
             } else {
                 let Content::Blocks(blocks) = &body.content else {
                     return None;
@@ -492,7 +492,7 @@ fn to_message(line: &Line, turn_id: &str, item_id: &str) -> Option<Message> {
                 if tools.is_empty() {
                     return None;
                 }
-                ("assistant", "other", tools.join("\n"))
+                (Role::Assistant, Phase::Other, tools.join("\n"))
             }
         }
         _ => return None,
@@ -628,7 +628,7 @@ mod tests {
         let user = line(USER_LINE);
         assert!(user.is_prompt());
         let m = to_message(&user, "t", "fd2165bd-f040-4bc7-95d7-79241d222fbb").unwrap();
-        assert_eq!((m.role, m.phase), ("user", "prompt"));
+        assert_eq!((m.role, m.phase), (Role::User, Phase::Prompt));
         assert_eq!(m.text, "Reply with the single word pong.");
 
         let tool = line(TOOL_RESULT_LINE);
@@ -640,7 +640,7 @@ mod tests {
         let m = to_message(&assistant, "t", "i").unwrap();
         assert_eq!(
             (m.role, m.phase, m.text.as_str()),
-            ("assistant", "final", "pong")
+            (Role::Assistant, Phase::Final, "pong")
         );
     }
 
@@ -653,7 +653,7 @@ mod tests {
         assert_eq!(turn_end(&entries, &live, 0), Some(TurnEnd::NextPrompt(3)));
         assert_eq!(turn_end(&entries, &live, 3), None);
         let t = transcript_turn(handle(), &entries, &live, 0, TurnEnd::NextPrompt(3), None);
-        assert_eq!(t.status, "completed");
+        assert_eq!(t.status, TurnStatus::Completed);
         assert_eq!(t.final_text.as_deref(), Some("pong"));
     }
 
@@ -675,7 +675,10 @@ mod tests {
         let end = turn_end(&entries, &live, 0);
         assert_eq!(end, Some(TurnEnd::Duration(3)));
         let t = transcript_turn(handle(), &entries, &live, 0, end.unwrap(), None);
-        assert_eq!((t.status, t.duration_ms), ("completed", Some(45007)));
+        assert_eq!(
+            (t.status, t.duration_ms),
+            (TurnStatus::Completed, Some(45007))
+        );
     }
 
     /// Probe 1 shape: a concurrent resume (B) branches off A's tool_use; A's later
@@ -749,7 +752,7 @@ mod tests {
         let m = to_message(&task, "t", "i").unwrap();
         assert_eq!(
             (m.role, m.phase, m.from),
-            ("user", "other", Some(Caller::RUNTIME))
+            (Role::User, Phase::Other, Some(Caller::RUNTIME))
         );
         // No flags (older transcripts): the leading tag decides.
         let bare = line(
@@ -808,7 +811,12 @@ mod tests {
         let m = to_message(&l, "t", "i").unwrap();
         assert_eq!(
             (m.role, m.phase, m.text.as_str(), m.from),
-            ("user", "other", "[interrupted]", Some(Caller::RUNTIME))
+            (
+                Role::User,
+                Phase::Other,
+                "[interrupted]",
+                Some(Caller::RUNTIME)
+            )
         );
         let entries = interrupted_turn(INTERRUPT_LINE);
         let live = live_branch(&entries);
@@ -816,7 +824,7 @@ mod tests {
         let end = turn_end(&entries, &live, 0);
         assert_eq!(end, Some(TurnEnd::Interrupt(3)));
         let t = transcript_turn(handle(), &entries, &live, 0, end.unwrap(), None);
-        assert_eq!(t.status, "interrupted");
+        assert_eq!(t.status, TurnStatus::Interrupted);
     }
 
     /// Without `interruptedMessageId` the text alone marks the interrupt.
@@ -837,7 +845,7 @@ mod tests {
         let end = turn_end(&entries, &live, 0);
         assert_eq!(end, Some(TurnEnd::Interrupt(3)));
         let t = transcript_turn(handle(), &entries, &live, 0, end.unwrap(), None);
-        assert_eq!(t.status, "interrupted");
+        assert_eq!(t.status, TurnStatus::Interrupted);
     }
 
     /// A tool_result written after a later prompt still belongs to its own prompt's turn.

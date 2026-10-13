@@ -25,7 +25,8 @@ use crate::agents::{
     Agent, AgentStatus, Check, ListFilter, Operation, SendRequest, StartRequest, WaitTarget,
 };
 use crate::model::{
-    AgentError, Error, ErrorCode, Model, Observations, Outcome, Page, ReceiptState, Result, Session,
+    AgentError, Error, ErrorCode, History, Loaded, Model, Observations, Outcome, Page, Phase,
+    Progress, ReceiptState, Result, Session, SessionState,
 };
 use crate::store::{NewIntent, Store};
 use std::path::{Path, PathBuf};
@@ -254,7 +255,7 @@ impl<'a> Pi<'a> {
             res,
             Some(&watch.receipt_id),
             Vec::new(),
-            "running",
+            Progress::Running,
         )
     }
 }
@@ -390,16 +391,24 @@ impl Agent for Pi<'_> {
                 name,
                 preview,
                 observations: Observations {
-                    history: "visible",
+                    history: History::Visible,
                     // pi keeps no marker of a live process: only agent-talk's own runs are known.
-                    loaded: if running { "yes" } else { "unknown" },
+                    loaded: if running {
+                        Loaded::Yes
+                    } else {
+                        Loaded::Unknown
+                    },
                     origin: if owned {
                         "agent-talk".into()
                     } else {
                         "pi".into()
                     },
                 },
-                state: if running { "running" } else { "unknown" },
+                state: if running {
+                    SessionState::Running
+                } else {
+                    SessionState::Unknown
+                },
                 owned,
                 id: row.id,
             });
@@ -509,7 +518,7 @@ impl Agent for Pi<'_> {
         let branch = live_branch(&entries);
         let mut messages = session::messages(&entries, &branch);
         for (_, m) in &mut messages {
-            if m.phase == "prompt" {
+            if m.phase == Phase::Prompt {
                 m.from = self.store.sender_of(&m.item_id)?;
             }
         }
@@ -647,7 +656,7 @@ impl Agent for Pi<'_> {
             res,
             receipt_id.as_deref(),
             Vec::new(),
-            "running",
+            Progress::Running,
         )
     }
 }

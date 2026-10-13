@@ -2,7 +2,10 @@
 //! agent-talk's semantics (DESIGN.md §4), not an agent's, so they are implemented once here;
 //! the adapters supply the agent plumbing.
 
-use crate::model::{Approval, Error, ErrorCode, Outcome, Receipt, ReceiptState, Result, Turn};
+use crate::model::{
+    Approval, ApprovalOutcome, Error, ErrorCode, Outcome, Progress, Receipt, ReceiptState, Result,
+    Turn,
+};
 use crate::store::Store;
 use serde_json::Value;
 use std::future::Future;
@@ -58,9 +61,9 @@ pub fn record(store: &Store, a: &Approval) {
 pub fn resolve(store: &Store, approvals: &mut [Approval], request_id: &Value) {
     for a in approvals
         .iter_mut()
-        .filter(|a| a.request_id == *request_id && a.outcome == "pending")
+        .filter(|a| a.request_id == *request_id && a.outcome == ApprovalOutcome::Pending)
     {
-        a.outcome = "resolved";
+        a.outcome = ApprovalOutcome::Resolved;
         record(store, a);
     }
 }
@@ -98,7 +101,7 @@ pub fn settle(
     res: Result<Option<Turn>>,
     receipt_id: Option<&str>,
     approvals: Vec<Approval>,
-    progress: &'static str,
+    progress: Progress,
 ) -> Result<Outcome> {
     let unknown_outcome = matches!(&res, Err(e) if e.code.is_unknown_outcome());
     if unknown_outcome && let Some(r) = receipt_id {
@@ -119,11 +122,10 @@ pub fn settle(
         Err(mut e) => {
             e.receipt = e.receipt.or(receipt.map(Box::new));
             if unknown_outcome {
-                e.state = Some(if approvals.iter().any(|a| a.outcome == "pending") {
-                    "waiting"
-                } else {
-                    progress
-                });
+                let waiting = approvals
+                    .iter()
+                    .any(|a| a.outcome == ApprovalOutcome::Pending);
+                e.state = Some(if waiting { Progress::Waiting } else { progress });
             }
             e.approvals = approvals;
             Err(e)

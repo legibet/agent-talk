@@ -3,7 +3,7 @@
 
 use crate::agents::{Outgoing, Settings};
 use crate::model::{
-    AgentError, Approval, Caller, CallerKind, Error, ErrorCode, Receipt, ReceiptState, Result,
+    AgentError, Approval, Caller, CallerKind, Error, Receipt, ReceiptState, Result,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::json;
@@ -76,12 +76,8 @@ impl Store {
         let dir = std::env::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join(".agent-talk");
-        std::fs::create_dir_all(&dir).map_err(|e| {
-            Error::new(
-                ErrorCode::Transport,
-                format!("store: create {}: {e}", dir.display()),
-            )
-        })?;
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| Error::transport(format!("store: create {}", dir.display()), e))?;
         let db = Connection::open(dir.join("store.db"))?;
         db.busy_timeout(std::time::Duration::from_secs(5))?;
         db.pragma_update(None, "journal_mode", "WAL")?;
@@ -176,13 +172,12 @@ impl Store {
                  FROM intents i JOIN receipts r USING (receipt_id) WHERE i.receipt_id = ?1",
                 params![receipt_id],
                 |row| {
-                    let state: String = row.get(3)?;
                     let agent_error: Option<String> = row.get(7)?;
                     Ok(Receipt {
                         receipt_id: row.get(0)?,
                         handle: row.get(1)?,
                         client_msg_id: row.get(2)?,
-                        state: ReceiptState::parse(&state),
+                        state: row.get(3)?,
                         queue_id: row.get(4)?,
                         turn_id: row.get(5)?,
                         item_id: row.get(6)?,
@@ -393,7 +388,7 @@ impl Store {
                 a.request_id.to_string(),
                 a.kind,
                 a.summary,
-                a.outcome,
+                a.outcome.as_str(),
                 a.raw.to_string()
             ],
         )?;

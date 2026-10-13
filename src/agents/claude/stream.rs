@@ -2,7 +2,7 @@
 //! unknown event types and subtypes are tolerated.
 
 use super::transcript::tool_summary;
-use crate::model::{self, Approval};
+use crate::model::{self, Approval, ApprovalOutcome, TurnStatus};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::path::Path;
@@ -77,7 +77,11 @@ pub fn result_turn(handle: String, turn_id: String, ev: &Value) -> model::Turn {
     model::Turn {
         handle,
         turn_id,
-        status: if failed { "failed" } else { "completed" },
+        status: if failed {
+            TurnStatus::Failed
+        } else {
+            TurnStatus::Completed
+        },
         error: failed.then(|| {
             json!({
                 "subtype": ev["subtype"],
@@ -102,7 +106,7 @@ pub fn denial(handle: String, turn_id: String, d: &Value) -> Approval {
         request_id: d["tool_use_id"].clone(),
         kind: "permission_denial".into(),
         summary: format!("denied: {}", tool_summary(tool, &d["tool_input"])),
-        outcome: "denied",
+        outcome: ApprovalOutcome::Denied,
         raw: d.clone(),
     }
 }
@@ -135,14 +139,14 @@ mod tests {
         run.apply(&ev, &raw);
         assert!(run.result.is_some());
         let t = result_turn("claude:s".into(), "fd2165bd".into(), &raw);
-        assert_eq!(t.status, "completed");
+        assert_eq!(t.status, TurnStatus::Completed);
         assert_eq!(t.final_text.as_deref(), Some("pong"));
         assert!(t.error.is_none());
         let mut failed = raw.clone();
         failed["subtype"] = json!("error_max_turns");
         assert_eq!(
             result_turn("x".into(), "y".into(), &failed).status,
-            "failed"
+            TurnStatus::Failed
         );
         let (ev, _) = decode(PERMISSION_DENIED);
         assert!(matches!(
