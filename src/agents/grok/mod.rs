@@ -23,6 +23,7 @@ use self::sessions::{Active, Summary};
 use self::updates::{History, first_prompt};
 use self::watch::{End, Watch};
 use crate::agents::child::{cli_version, lock, pid_alive};
+use crate::agents::decode::or_default;
 use crate::agents::history::{ReadPage, ReadQuery, cut, first_line};
 use crate::agents::lifecycle::{
     ApprovalPolicy, approval_policy, bounded, note_waiting, reject, settle, wait_receipt,
@@ -36,8 +37,7 @@ use crate::model::{
     Result, Session, SessionState, TurnStatus,
 };
 use crate::store::{NewIntent, Store};
-use serde::de::DeserializeOwned;
-use serde::{Deserialize, Deserializer};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use std::fmt::Write as _;
 use std::fs::File;
@@ -93,15 +93,6 @@ async fn set_config(conn: &Conn, id: &str, config: &str, value: &str) -> Result<
             Err(e)
         }
     }
-}
-
-/// A field that is missing or does not fit reads as its default, so a non-essential field
-/// never drops the record it is part of. For
-/// `#[serde(default, deserialize_with = "or_default")]`.
-fn or_default<'de, D: Deserializer<'de>, T: DeserializeOwned + Default>(
-    d: D,
-) -> std::result::Result<T, D::Error> {
-    Ok(T::deserialize(Value::deserialize(d)?).unwrap_or_default())
 }
 
 /// One entry of the `initialize` response's `_meta.modelState.availableModels`.

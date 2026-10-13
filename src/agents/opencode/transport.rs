@@ -3,6 +3,7 @@
 //! response decoded, and the `/api/event` stream.
 
 use crate::agents::child::pid_alive;
+use crate::agents::decode::entries;
 use crate::model::{AgentError, Error, ErrorCode, Result};
 use futures_util::StreamExt;
 use serde::de::{DeserializeOwned, IgnoredAny};
@@ -43,24 +44,6 @@ pub fn text<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<Option<Strin
         Value::String(s) if !s.is_empty() => Some(s),
         _ => None,
     })
-}
-
-/// The entries of an array field that decode: one odd entry does not fail the whole
-/// response, and a value other than an array has none.
-fn entries<'de, D: Deserializer<'de>, T: DeserializeOwned>(
-    d: D,
-) -> std::result::Result<Vec<T>, D::Error> {
-    let Value::Array(items) = Value::deserialize(d)? else {
-        return Ok(Vec::new());
-    };
-    Ok(items
-        .into_iter()
-        .filter_map(|v| {
-            T::deserialize(v)
-                .inspect_err(|e| tracing::warn!("opencode service: skipped an entry: {e}"))
-                .ok()
-        })
-        .collect())
 }
 
 /// A stored model: one that does not name both its provider and its id reads as none.

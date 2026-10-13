@@ -6,6 +6,7 @@
 use super::acp::{Conn, Event, Response};
 use super::handle;
 use super::updates::{self, SessionUpdate, ToolCall};
+use crate::agents::decode::or_default;
 use crate::agents::history::first_line;
 use crate::agents::lifecycle::{ApprovalPolicy, record};
 use crate::model::{self, Approval, ApprovalOutcome, Error, ErrorCode, Progress, Result};
@@ -65,15 +66,15 @@ pub struct End {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct QueueChanged {
-    #[serde(default, deserialize_with = "super::or_default")]
+    #[serde(default, deserialize_with = "or_default")]
     entries: Vec<QueueEntry>,
-    #[serde(default, deserialize_with = "super::or_default")]
+    #[serde(default, deserialize_with = "or_default")]
     running_prompt_id: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct QueueEntry {
-    #[serde(default, deserialize_with = "super::or_default")]
+    #[serde(default, deserialize_with = "or_default")]
     id: Option<String>,
 }
 
@@ -81,18 +82,18 @@ struct QueueEntry {
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PermissionRequest {
-    #[serde(default, deserialize_with = "super::or_default")]
+    #[serde(default, deserialize_with = "or_default")]
     tool_call: ToolCall,
-    #[serde(default, deserialize_with = "super::or_default")]
+    #[serde(default, deserialize_with = "or_default")]
     options: Vec<PermissionOption>,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PermissionOption {
-    #[serde(default, deserialize_with = "super::or_default")]
+    #[serde(default, deserialize_with = "or_default")]
     option_id: Option<String>,
-    #[serde(default, deserialize_with = "super::or_default")]
+    #[serde(default, deserialize_with = "or_default")]
     kind: String,
 }
 

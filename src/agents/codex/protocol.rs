@@ -2,9 +2,10 @@
 //! narrow structs for responses and notifications (unknown fields are ignored; callers
 //! keep the raw `Value`), plus the few request pieces shared by several call sites.
 
+use crate::agents::decode::{entries, or_default};
 use crate::model::{AgentError, Error, ErrorCode};
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 // ---- requests ----
@@ -70,29 +71,6 @@ pub struct CursorPage<T> {
     #[serde(deserialize_with = "entries")]
     pub data: Vec<T>,
     pub next_cursor: Option<String>,
-}
-
-/// The entries of a list that decode: one odd entry (a turn without an id, a model without
-/// its name) does not fail the whole list, and `null` is an empty list. For
-/// `#[serde(deserialize_with = "entries")]`.
-fn entries<'de, D: Deserializer<'de>, T: DeserializeOwned>(d: D) -> Result<Vec<T>, D::Error> {
-    let items = Option::<Vec<Value>>::deserialize(d)?.unwrap_or_default();
-    Ok(items
-        .into_iter()
-        .filter_map(|v| {
-            T::deserialize(v)
-                .inspect_err(|e| tracing::warn!("codex: skipped a list entry: {e}"))
-                .ok()
-        })
-        .collect())
-}
-
-/// A field whose value does not fit reads as its default. For
-/// `#[serde(default, deserialize_with = "or_default")]`.
-fn or_default<'de, D: Deserializer<'de>, T: DeserializeOwned + Default>(
-    d: D,
-) -> Result<T, D::Error> {
-    Ok(T::deserialize(Value::deserialize(d)?).unwrap_or_default())
 }
 
 #[derive(Deserialize, Debug)]

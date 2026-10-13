@@ -2,10 +2,11 @@
 //! live branch, turn boundaries and normalized messages. Pure; the records are narrow and
 //! unknown fields, line types and block types are tolerated.
 
+use crate::agents::decode::or_default;
 use crate::agents::history::first_line;
 use crate::agents::strip_provenance;
 use crate::model::{self, Caller, Error, Message, Phase, Result, Role, TurnStatus};
-use serde::{Deserialize, Deserializer};
+use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -77,18 +78,12 @@ enum Block {
     ToolResult {
         #[serde(default)]
         content: Value,
-        #[serde(default, deserialize_with = "flag")]
+        #[serde(default, deserialize_with = "or_default")]
         is_error: bool,
     },
     /// thinking, image, …
     #[serde(other)]
     Other,
-}
-
-/// A boolean flag: absent or `null` reads as false. For
-/// `#[serde(default, deserialize_with = "flag")]`.
-fn flag<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<bool, D::Error> {
-    Ok(Option::<bool>::deserialize(d)?.unwrap_or(false))
 }
 
 impl Body {
@@ -110,9 +105,9 @@ struct Line {
     logical_parent_uuid: Option<String>,
     /// Shared by a turn's prompt line and its tool_result lines.
     prompt_id: Option<String>,
-    #[serde(default, deserialize_with = "flag")]
+    #[serde(default, deserialize_with = "or_default")]
     is_sidechain: bool,
-    #[serde(default, deserialize_with = "flag")]
+    #[serde(default, deserialize_with = "or_default")]
     is_meta: bool,
     message: Option<Body>,
     cwd: Option<String>,

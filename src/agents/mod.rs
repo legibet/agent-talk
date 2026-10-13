@@ -2,6 +2,7 @@ pub mod antigravity;
 pub mod child;
 pub mod claude;
 pub mod codex;
+pub mod decode;
 pub mod grok;
 pub mod history;
 pub mod lifecycle;

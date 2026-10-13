@@ -11,6 +11,7 @@
 //! prompt id where they carry one and by position otherwise, and the last
 //! `turn_completed` of a prompt id is its end.
 
+use crate::agents::decode::or_default;
 use crate::agents::history::first_line;
 use crate::model::{self, Error, Message, Phase, Result, Role, TurnStatus};
 use serde::Deserialize;
@@ -27,29 +28,29 @@ use std::path::Path;
 #[serde(tag = "sessionUpdate", rename_all = "snake_case")]
 pub enum SessionUpdate {
     UserMessageChunk {
-        #[serde(default, deserialize_with = "super::or_default")]
+        #[serde(default, deserialize_with = "or_default")]
         content: Content,
-        #[serde(rename = "_meta", default, deserialize_with = "super::or_default")]
+        #[serde(rename = "_meta", default, deserialize_with = "or_default")]
         meta: PromptMeta,
     },
     AgentMessageChunk {
-        #[serde(default, deserialize_with = "super::or_default")]
+        #[serde(default, deserialize_with = "or_default")]
         content: Content,
     },
     ToolCall(ToolCall),
     #[serde(rename_all = "camelCase")]
     ToolCallUpdate {
-        #[serde(default, deserialize_with = "super::or_default")]
+        #[serde(default, deserialize_with = "or_default")]
         tool_call_id: Option<String>,
-        #[serde(default, deserialize_with = "super::or_default")]
+        #[serde(default, deserialize_with = "or_default")]
         status: Option<String>,
     },
     TurnCompleted {
-        #[serde(default, deserialize_with = "super::or_default")]
+        #[serde(default, deserialize_with = "or_default")]
         prompt_id: Option<String>,
-        #[serde(default, deserialize_with = "super::or_default")]
+        #[serde(default, deserialize_with = "or_default")]
         stop_reason: Option<String>,
-        #[serde(default, deserialize_with = "super::or_default")]
+        #[serde(default, deserialize_with = "or_default")]
         elapsed_ms: Option<i64>,
     },
     /// Live only: the permission request of this tool call was answered.
@@ -76,9 +77,9 @@ impl SessionUpdate {
 
 #[derive(Debug, Default, Deserialize)]
 pub struct Content {
-    #[serde(default, deserialize_with = "super::or_default")]
+    #[serde(default, deserialize_with = "or_default")]
     pub text: Option<String>,
-    #[serde(rename = "_meta", default, deserialize_with = "super::or_default")]
+    #[serde(rename = "_meta", default, deserialize_with = "or_default")]
     meta: ContentMeta,
 }
 
@@ -86,16 +87,16 @@ pub struct Content {
 #[serde(rename_all = "camelCase")]
 struct ContentMeta {
     /// A steer message's own text; `text` wraps it in instructions to the model.
-    #[serde(default, deserialize_with = "super::or_default")]
+    #[serde(default, deserialize_with = "or_default")]
     display_text: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PromptMeta {
-    #[serde(default, deserialize_with = "super::or_default")]
+    #[serde(default, deserialize_with = "or_default")]
     prompt_index: Option<u64>,
-    #[serde(default, deserialize_with = "super::or_default")]
+    #[serde(default, deserialize_with = "or_default")]
     interjection: bool,
 }
 
@@ -103,27 +104,27 @@ pub struct PromptMeta {
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolCall {
-    #[serde(default, deserialize_with = "super::or_default")]
+    #[serde(default, deserialize_with = "or_default")]
     pub tool_call_id: Option<String>,
-    #[serde(default, deserialize_with = "super::or_default")]
+    #[serde(default, deserialize_with = "or_default")]
     title: Option<String>,
     #[serde(default)]
     raw_input: Value,
-    #[serde(default, deserialize_with = "super::or_default")]
+    #[serde(default, deserialize_with = "or_default")]
     status: Option<String>,
-    #[serde(rename = "_meta", default, deserialize_with = "super::or_default")]
+    #[serde(rename = "_meta", default, deserialize_with = "or_default")]
     meta: ToolMeta,
 }
 
 #[derive(Debug, Default, Deserialize)]
 struct ToolMeta {
-    #[serde(rename = "x.ai/tool", default, deserialize_with = "super::or_default")]
+    #[serde(rename = "x.ai/tool", default, deserialize_with = "or_default")]
     tool: Option<ToolInfo>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ToolInfo {
-    #[serde(default, deserialize_with = "super::or_default")]
+    #[serde(default, deserialize_with = "or_default")]
     name: Option<String>,
 }
 
