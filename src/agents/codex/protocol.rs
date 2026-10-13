@@ -3,12 +3,28 @@
 //! keep the raw `Value`), plus the few request pieces shared by several call sites.
 
 use crate::model::{AgentError, Error, ErrorCode};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 // ---- requests ----
-// Request bodies are built with `json!` at the call sites; optional fields are omitted
-// rather than sent as `null`.
+// Request bodies are built with `json!` at the call sites, or with a struct when the call
+// site would add several optional fields; optional fields are omitted rather than sent as
+// `null`.
+
+/// `turn/start` params. The settings are `None` (omitted) unless this turn changes them.
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnStartParams<'a> {
+    pub thread_id: &'a str,
+    pub input: Value,
+    pub client_user_message_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sandbox_policy: Option<Value>,
+}
 
 /// Text-only `UserInput` list.
 pub fn text_input(text: &str) -> Value {
@@ -455,6 +471,58 @@ mod tests {
         let v = incoming(STALE_STEER).error.unwrap();
         let e = resume_error(Error::from_agent(classify_error(&v), v));
         assert_eq!(e.code, ErrorCode::Precondition);
+    }
+
+    fn error(frame: &str) -> Error {
+        let v = incoming(frame).error.unwrap();
+        Error::from_agent(classify_error(&v), v)
+    }
+
+    /// The new-thread window's two shapes are retried or read as no history; the same
+    /// codes with other messages are real failures.
+    #[test]
+    fn history_not_ready_errors() {
+        // The shape recorded in DESIGN.md §6.1; the text before "rollout at" was not kept.
+        let empty = r#"{"error":{"code":-32603,"message":"failed to load thread: rollout at /Users/me/.codex/sessions/2026/10/03/rollout-2026-10-03T06-38-37-01a101c5-fcb5-77c1-804d-5c1bd9358f1f.jsonl is empty"},"id":4}"#;
+        let no_row =
+            r#"{"error":{"code":-32601,"message":"list_turns is not supported yet"},"id":4}"#;
+        assert!(history_not_ready(&error(empty)));
+        assert!(history_not_ready(&error(no_row)));
+
+        let store = r#"{"error":{"code":-32603,"message":"failed to read thread store"},"id":4}"#;
+        let unknown = r#"{"error":{"code":-32601,"message":"Unknown method thread/foo"},"id":4}"#;
+        assert!(!history_not_ready(&error(store)));
+        assert!(!history_not_ready(&error(unknown)));
+        assert!(!history_not_ready(&Error::new(ErrorCode::Timeout, "x")));
+    }
+
+    /// Only the two `thread/queue/start` refusals that mean nothing is dormant are
+    /// swallowed; any other refusal reaches the caller.
+    #[test]
+    fn nothing_dormant_errors() {
+        let started = r#"{"error":{"code":-32600,"message":"queued submission not found: 01a101d3-6fea-78b3-b5d8-74a38dd99438"},"id":6}"#;
+        let behind = r#"{"error":{"code":-32600,"message":"thread already has an active or pending turn"},"id":6}"#;
+        assert!(nothing_dormant(&error(started)));
+        assert!(nothing_dormant(&error(behind)));
+        assert!(!nothing_dormant(&error(STALE_STEER)));
+        assert!(!nothing_dormant(&error(NO_EXPERIMENTAL)));
+    }
+
+    /// Settings a turn does not change are left out, not sent as `null`.
+    #[test]
+    fn turn_start_omits_unset_settings() {
+        let p = TurnStartParams {
+            thread_id: "t",
+            input: text_input("hi"),
+            client_user_message_id: "c",
+            model: None,
+            effort: Some("low"),
+            sandbox_policy: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&p).unwrap(),
+            json!({"threadId": "t", "input": text_input("hi"), "clientUserMessageId": "c", "effort": "low"})
+        );
     }
 
     #[test]

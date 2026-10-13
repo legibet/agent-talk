@@ -364,7 +364,8 @@ intent; `wait` leaves its receipt as it was).
   ignores `sandbox` (0.161.0). `thread/queue/add` accepts all four fields and silently ignores
   them (0.161.0).
 - `thread/name/set` fails for a moment after `turn/start` (empty rollout), so `new` names the
-  thread between `thread/start` and `turn/start`.
+  thread between `thread/start` and `turn/start`, and records it as owned only once naming
+  succeeded (a thread with no turn has no rollout and is listed nowhere).
 - History (`thread/turns/list`, `itemsView: full`) needs no resume and works on not-loaded
   threads. For about a second after `turn/start` on a new thread it is unreadable:
   `thread/resume` and `thread/turns/list` fail with `-32603 "... rollout at <path> is empty"`, and
@@ -406,8 +407,10 @@ intent; `wait` leaves its receipt as it was).
   for one behind an active turn.
 - A turn ends at `turn/completed` with matching thread and turn id, carrying `status` and summary
   items; full items come from history. The `idle` status change before it is not a turn end.
-  `wait` reads history first, then resumes and observes; a turn an accepted receipt names is
-  observed even while history is still empty, and a turn id nobody vouches for is refused.
+  `wait` reads history first, newest turn first, then resumes and observes; a turn an accepted
+  receipt names is observed even while history is still empty, and a turn id nobody vouches
+  for is refused. (Paging oldest first took about 105 s on a thread of about 700 turns,
+  0.162.1.)
 - `-32600` is reused for: not initialized, missing experimental capability, stale turn id, idle
   steer, `no rollout found` (a thread with no turn yet), `already has an active writer`, and both
   `thread/queue/start` refusals. agent-talk maps it by method and message.

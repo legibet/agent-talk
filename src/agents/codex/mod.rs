@@ -6,8 +6,9 @@ mod transport;
 use self::protocol::{
     ALL_SOURCE_KINDS, AgentMessage, AgentPhase, CursorPage, DEFAULT_SOURCE_KINDS, Item,
     ItemNotification, ModelInfo, QueuedEntry, Thread, ThreadQueueAddResponse, ThreadStartResponse,
-    ThreadStatus, TurnCompletedNotification, TurnResponse, TurnSteerResponse, deny_response,
-    history_not_ready, nothing_dormant, resume_error, resume_latest_turn, text_input,
+    ThreadStatus, TurnCompletedNotification, TurnResponse, TurnStartParams, TurnSteerResponse,
+    deny_response, history_not_ready, nothing_dormant, resume_error, resume_latest_turn,
+    text_input,
 };
 use self::transport::{Conn, Event, ServerRequest, decode};
 use crate::agents::child::{agent_cmd, cli_version};
@@ -16,8 +17,8 @@ use crate::agents::lifecycle::{
     ApprovalPolicy, approval_policy, bounded, record, reject, resolve, settle, wait_receipt,
 };
 use crate::agents::{
-    Agent, AgentStatus, Check, ListFilter, Operation, SendRequest, StartRequest, WaitTarget,
-    strip_provenance,
+    Agent, AgentStatus, Check, ListFilter, Operation, SendRequest, Settings, StartRequest,
+    WaitTarget, strip_provenance,
 };
 use crate::model::{
     self, Approval, ApprovalOutcome, Error, ErrorCode, History, Loaded, Message, Model,
@@ -153,14 +154,31 @@ impl<'a> Codex<'a> {
             .and_then(|p| p.data.into_iter().next()))
     }
 
-    /// `turn/start`, accepted with the turn it started.
-    async fn start_turn(&self, conn: &Conn, receipt_id: &str, params: Value) -> Result<Target> {
+    /// `turn/start`, accepted with the turn it started. What `settings` sets becomes the
+    /// thread's setting for its later turns too (DESIGN.md §6.1).
+    async fn start_turn(
+        &self,
+        conn: &Conn,
+        thread_id: &str,
+        intent: &NewIntent<'_>,
+        settings: &Settings,
+    ) -> Result<Target> {
+        let params = TurnStartParams {
+            thread_id,
+            input: text_input(intent.message.delivered),
+            client_user_message_id: intent.client_msg_id,
+            model: settings.model.as_deref(),
+            effort: settings.effort.as_deref(),
+            sandbox_policy: settings
+                .full_access
+                .then(|| json!({"type": "dangerFullAccess"})),
+        };
         let started: TurnResponse = conn
             .call("turn/start", params)
             .await
-            .map_err(|e| reject(self.store, receipt_id, e))?;
+            .map_err(|e| reject(self.store, intent.receipt_id, e))?;
         self.store
-            .accept(receipt_id, None, Some(&started.turn.id), None)?;
+            .accept(intent.receipt_id, None, Some(&started.turn.id), None)?;
         Ok(Target::Turn(started.turn.id))
     }
 
@@ -326,15 +344,16 @@ impl<'a> Codex<'a> {
         )
     }
 
-    /// Search persisted history (ascending, full items) for the target. A client
-    /// id found in history is resolved to its turn.
+    /// Search persisted history for the target, newest turn first (full items), until it
+    /// is found or history ends (DESIGN.md §7). A client id found in history is resolved
+    /// to its turn.
     async fn lookup(&self, conn: &Conn, thread_id: &str, target: &mut Target) -> Result<Lookup> {
         let mut pages = conn.pages(
             "thread/turns/list",
             json!({
                 "threadId": thread_id,
-                "limit": 50,
-                "sortDirection": "asc",
+                "limit": 20,
+                "sortDirection": "desc",
                 "itemsView": "full",
             }),
         );
@@ -564,7 +583,7 @@ impl Agent for Codex<'_> {
     async fn models(&self) -> Result<Vec<Model>> {
         let conn = self.connect().await?;
         let mut models = Vec::new();
-        let mut pages = conn.pages("model/list", json!({"cursor": null, "limit": 100}));
+        let mut pages = conn.pages("model/list", json!({"limit": 100}));
         while let Some(page) = pages.next::<ModelInfo>().await? {
             models.extend(page.into_iter().map(|m| {
                 Model {
@@ -730,7 +749,6 @@ impl Agent for Codex<'_> {
         let started: ThreadStartResponse = conn.call("thread/start", params).await?;
         let thread_id = started.thread.id;
         let handle = handle(&thread_id);
-        self.store.insert_owned(&handle, req.cwd, req.settings)?;
         if let Some(name) = req.name {
             // Before turn/start: right after it the rollout file is still empty and the
             // daemon cannot update thread metadata (DESIGN.md §6.1).
@@ -740,37 +758,38 @@ impl Agent for Codex<'_> {
             )
             .await?;
         }
+        // Recorded once the thread will get its first turn: a thread whose naming failed
+        // has no rollout and is listed nowhere.
+        self.store.insert_owned(&handle, req.cwd, req.settings)?;
         let mut w = Watch::new(&thread_id, ApprovalPolicy::Deny);
         let receipt_id = uuid::Uuid::new_v4().to_string();
         let client_msg_id = uuid::Uuid::new_v4().to_string();
+        let intent = NewIntent {
+            receipt_id: &receipt_id,
+            handle: &handle,
+            client_msg_id: &client_msg_id,
+            message: &req.message,
+        };
+        // thread/start took the model and sandbox but takes no effort.
+        let effort = Settings {
+            effort: req.settings.effort.clone(),
+            ..Settings::default()
+        };
         // Set once the agent accepted the submission.
         let mut target = None;
         let work = async {
-            self.store.insert_intent(&NewIntent {
-                receipt_id: &receipt_id,
-                handle: &handle,
-                client_msg_id: &client_msg_id,
-                message: &req.message,
-            })?;
-            let params = json!({
-                "threadId": thread_id,
-                "input": text_input(req.message.delivered),
-                "clientUserMessageId": client_msg_id,
-                // thread/start takes no effort; this one applies to the thread's later
-                // turns too.
-                "effort": req.settings.effort,
-            });
-            let target = target.insert(self.start_turn(&conn, &receipt_id, params).await?);
+            self.store.insert_intent(&intent)?;
+            let submitted = self.start_turn(&conn, &thread_id, &intent, &effort).await?;
+            let target = target.insert(submitted);
             if deadline.is_none() {
                 return Ok(None);
             }
             // thread/start already subscribed this connection.
             self.observe(&mut conn, &mut w, target).await.map(Some)
         };
-        let res = match deadline {
-            Some(d) => bounded(Some(d), work).await,
-            None => work.await,
-        };
+        // Without a deadline only a signal ends the work early; the receipt then becomes
+        // `unknown` like after a deadline.
+        let res = bounded(deadline, work).await;
         let progress = target.as_ref().map_or(Progress::Unknown, Target::progress);
         self.finish(conn, res, Some(&receipt_id), w, progress).await
     }
@@ -828,24 +847,11 @@ impl Agent for Codex<'_> {
             self.store.insert_intent(&intent)?;
             let submitted = match steer_into {
                 Some(turn) => self.steer(&conn, thread_id, &intent, &turn).await?,
+                // The sandbox stays only until the thread unloads, so subscribe passes it
+                // again (DESIGN.md §6.1).
                 None if change => {
-                    // The thread keeps these for its later turns; the sandbox only until
-                    // it unloads, so subscribe passes it again (DESIGN.md §6.1).
-                    let mut params = json!({
-                        "threadId": thread_id,
-                        "input": text_input(req.message.delivered),
-                        "clientUserMessageId": client_msg_id,
-                    });
-                    if let Some(m) = &req.change.model {
-                        params["model"] = json!(m);
-                    }
-                    if let Some(e) = &req.change.effort {
-                        params["effort"] = json!(e);
-                    }
-                    if req.change.full_access {
-                        params["sandboxPolicy"] = json!({"type": "dangerFullAccess"});
-                    }
-                    self.start_turn(&conn, &receipt_id, params).await?
+                    self.start_turn(&conn, thread_id, &intent, req.change)
+                        .await?
                 }
                 None => self.queue(&mut conn, &mut w, &intent, idle).await?,
             };
@@ -855,10 +861,8 @@ impl Agent for Codex<'_> {
             }
             self.observe(&mut conn, &mut w, target).await.map(Some)
         };
-        let res = match deadline {
-            Some(d) => bounded(Some(d), work).await,
-            None => work.await,
-        };
+        // Without a deadline only a signal ends the work early (as in `start`).
+        let res = bounded(deadline, work).await;
         let progress = target.as_ref().map_or(Progress::Unknown, Target::progress);
         self.finish(conn, res, Some(&receipt_id), w, progress).await
     }
@@ -954,5 +958,77 @@ impl Agent for Codex<'_> {
         let progress = target.progress();
         self.finish(conn, res, receipt_id.as_deref(), w, progress)
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A full-items turn in the shape of `thread/turns/list` (codex-cli 0.162.1): a
+    // commentary, a tool call, the final answer, then a malformed and a phase-less agent
+    // message.
+    const FULL_TURN: &str = r#"{"id":"01a13552-4235-74b1-8363-86f62efed88f","items":[{"type":"userMessage","id":"01a13552-4236-7a52-8b0c-1f2e3d4c5b6a","clientId":null,"content":[{"type":"text","text":"check the build","text_elements":[]},{"type":"image","url":"data:,"}]},{"type":"agentMessage","id":"msg_1","text":"Running the build.","phase":"commentary","memoryCitation":null,"delivery":null,"questions":null},{"type":"commandExecution","id":"call_1","command":"cargo build","status":"completed"},{"type":"agentMessage","id":"msg_2","text":"The build passes.","phase":"final_answer","memoryCitation":null,"delivery":null,"questions":null},{"type":"agentMessage","text":"no id"},{"type":"agentMessage","id":"msg_3","text":"One more note.","phase":null}],"itemsView":"full","status":"completed","error":null,"startedAt":1791895945,"completedAt":1791895962,"durationMs":16416}"#;
+
+    fn turn(frame: &str) -> protocol::Turn {
+        serde_json::from_str(frame).unwrap()
+    }
+
+    /// The final text is the last `final_answer`, not the last agent message; without one
+    /// it is the last agent message.
+    #[test]
+    fn final_text_prefers_the_final_answer() {
+        let t = to_turn("t", turn(FULL_TURN));
+        assert_eq!(t.status, TurnStatus::Completed);
+        assert_eq!(t.final_text.as_deref(), Some("The build passes."));
+        assert!(t.error.is_none());
+
+        let interrupted = r#"{"id":"01a12b26-bedd-71f3-a3f5-bd73360b8677","items":[{"type":"agentMessage","id":"msg_1","text":"Looking.","phase":"commentary"},{"type":"agentMessage","id":"msg_2","text":"Still looking.","phase":"commentary"}],"status":"interrupted","error":null,"durationMs":900}"#;
+        let t = to_turn("t", turn(interrupted));
+        assert_eq!(t.status, TurnStatus::Interrupted);
+        assert_eq!(t.final_text.as_deref(), Some("Still looking."));
+    }
+
+    /// Prompts carry the turn's start time, replies its end; the agent's phase decides the
+    /// message phase, and items that are not messages or do not decode are skipped.
+    #[test]
+    fn messages_map_items_and_phases() {
+        let store = Store::memory();
+        let codex = Codex::new(&store);
+        let raw: Value = serde_json::from_str(FULL_TURN).unwrap();
+        let messages = codex.messages(&[raw]).unwrap();
+        let got: Vec<_> = messages
+            .iter()
+            .map(|(i, m)| (*i, m.item_id.as_str(), m.role, m.phase, m.text.as_str()))
+            .collect();
+        let prompt_id = "01a13552-4236-7a52-8b0c-1f2e3d4c5b6a";
+        assert_eq!(
+            got,
+            [
+                (0, prompt_id, Role::User, Phase::Prompt, "check the build"),
+                (
+                    0,
+                    "msg_1",
+                    Role::Assistant,
+                    Phase::Commentary,
+                    "Running the build."
+                ),
+                (
+                    0,
+                    "msg_2",
+                    Role::Assistant,
+                    Phase::Final,
+                    "The build passes."
+                ),
+                (0, "msg_3", Role::Assistant, Phase::Other, "One more note."),
+            ]
+        );
+        let (_, prompt) = &messages[0];
+        assert_eq!(prompt.turn_id, "01a13552-4235-74b1-8363-86f62efed88f");
+        assert_eq!(prompt.timestamp.as_deref(), Some("2026-10-13T12:52:25Z"));
+        assert_eq!(
+            messages[2].1.timestamp.as_deref(),
+            Some("2026-10-13T12:52:42Z")
+        );
     }
 }
