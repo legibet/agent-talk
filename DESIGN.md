@@ -104,9 +104,9 @@ own request. A record read for a few fields whose shape must be tolerated stays 
 with a few accessors, as do payloads agent-talk only passes through. The tolerance rules are the
 same either way, so that a field an agent writes differently does not lose a record, a listing or
 the end of a turn: a field that does not fit reads as absent or as its default and never drops its
-record (in a struct through `agents/decode.rs`), an odd list entry is skipped on its own, a record
-without the id it is used by is skipped, the raw record is kept for `read --raw` and error data,
-and content that is not recognized never counts as the end of a turn.
+record (in a struct through `agents/decode.rs`), an odd list entry is skipped on its own, a listed
+session, model or request without the id that addresses it is skipped, the raw record is kept for
+`read --raw` and error data, and content that is not recognized never counts as the end of a turn.
 
 ## 4. Model
 
