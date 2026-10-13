@@ -53,8 +53,9 @@ pub enum Event {
     StepUpdate {
         step_update: StepUpdate,
     },
-    /// Turn end.
+    /// Turn end, whatever its payload holds.
     Result {
+        #[serde(default)]
         result: Value,
     },
     #[serde(other)]
@@ -301,6 +302,19 @@ mod tests {
 
         // No result yet: no turn.
         assert!(run(&[INIT, SLEEP_RUN[0]]).turn("x".into()).is_none());
+    }
+
+    /// A result event ends the turn whatever its payload holds: odd fields read as absent,
+    /// and a result without a payload is a failed turn, not a turn left running.
+    #[test]
+    fn any_result_ends_the_turn() {
+        let odd = r#"{"event":"result","result":{"status":"SUCCESS","response":7,"denied_actions":null,"duration_seconds":"x"}}"#;
+        let r = run(&[INIT, SLEEP_RUN[0], odd]);
+        assert_eq!(r.turn("x".into()).unwrap().status, TurnStatus::Completed);
+        assert!(r.denials("x", "r").is_empty());
+
+        let t = run(&[INIT, r#"{"event":"result"}"#]).turn("x".into());
+        assert_eq!(t.unwrap().status, TurnStatus::Failed);
     }
 
     #[test]
