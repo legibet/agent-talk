@@ -23,7 +23,8 @@ use self::transcript::{TurnEnd, head, live_branch, load, slug, transcript_turn, 
 use crate::agents::child::{Runs, cli_version, lock, observe, tail};
 use crate::agents::history::{ReadPage, ReadQuery, cut, first_line};
 use crate::agents::lifecycle::{
-    ApprovalPolicy, approval_policy, bounded, note_waiting, record, reject, settle, wait_receipt,
+    ApprovalPolicy, approval_policy, bounded, note_waiting, record, reject_unstarted, settle,
+    wait_receipt,
 };
 use crate::agents::{
     Agent, AgentStatus, Check, ListFilter, Operation, SendRequest, Settings, StartRequest,
@@ -254,12 +255,10 @@ impl<'a> Claude<'a> {
     ) -> Result<Outcome> {
         let h = handle(&watch.id);
         let log = self.runs.log(&watch.receipt_id);
-        let mut child = self.runs.spawn(
-            self.store,
-            &mut process::command(args),
-            cwd,
-            &watch.receipt_id,
-        )?;
+        let mut child = self
+            .runs
+            .spawn(&mut process::command(args), cwd, &watch.receipt_id)
+            .map_err(|e| reject_unstarted(self.store, &watch.receipt_id, e))?;
         if let Some(pid) = child.id() {
             self.store.insert_process(&watch.receipt_id, &h, pid)?;
         }
@@ -280,7 +279,7 @@ impl<'a> Claude<'a> {
             if !watch.run.init && watch.run.result.is_none() {
                 let e = self.runs.startup_error(&watch.receipt_id, Some(status));
                 let e = Error::from_agent(ErrorCode::Precondition, e);
-                return Err(reject(self.store, &watch.receipt_id, e));
+                return Err(reject_unstarted(self.store, &watch.receipt_id, e));
             }
             let Some(r) = &watch.run.result else {
                 return Ok(model::Turn {

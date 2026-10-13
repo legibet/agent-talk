@@ -28,7 +28,9 @@ use self::transcript::{
 };
 use crate::agents::child::{Runs, agent_cmd, cli_version, lock, observe, pid_alive, tail};
 use crate::agents::history::{ReadPage, ReadQuery, cut};
-use crate::agents::lifecycle::{bounded, note_waiting, record, reject, settle, wait_receipt};
+use crate::agents::lifecycle::{
+    bounded, note_waiting, record, reject_unstarted, settle, wait_receipt,
+};
 use crate::agents::{
     Agent, AgentStatus, Check, ListFilter, Operation, SendRequest, Settings, StartRequest,
     WaitTarget,
@@ -323,7 +325,7 @@ impl<'a> Antigravity<'a> {
         let Some(turn_id) = run.turn_id() else {
             let e = agent_error(&self.runs, receipt_id, run, status);
             let e = Error::from_agent(ErrorCode::Precondition, e);
-            return Err(reject(self.store, receipt_id, e));
+            return Err(reject_unstarted(self.store, receipt_id, e));
         };
         let Some(result) = &run.result else {
             let turn = model::Turn {
@@ -623,12 +625,9 @@ impl Agent for Antigravity<'_> {
             req.settings.full_access,
         );
         // No intent yet, so a spawn failure has no receipt to settle.
-        let mut child = self.runs.spawn(
-            self.store,
-            agent_cmd("agy").args(&args),
-            req.cwd,
-            &receipt_id,
-        )?;
+        let mut child = self
+            .runs
+            .spawn(agent_cmd("agy").args(&args), req.cwd, &receipt_id)?;
         // The conversation id exists only once agy reports it; the intent is written then,
         // before the message is.
         let id = match bounded(deadline, wait_init(&mut child, &self.runs, &receipt_id)).await {
@@ -722,7 +721,8 @@ impl Agent for Antigravity<'_> {
         })?;
         let child = self
             .runs
-            .spawn(self.store, agent_cmd("agy").args(&args), &cwd, &receipt_id)?;
+            .spawn(agent_cmd("agy").args(&args), &cwd, &receipt_id)
+            .map_err(|e| reject_unstarted(self.store, &receipt_id, e))?;
         let watch = RunWatch {
             id: id.to_string(),
             receipt_id,

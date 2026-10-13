@@ -2,8 +2,7 @@
 //! lock and the run log a child writes.
 
 use crate::agents::lifecycle::bounded;
-use crate::model::{AgentError, Error, ErrorCode, ReceiptState, Result, Turn};
-use crate::store::Store;
+use crate::model::{AgentError, Error, ErrorCode, Result, Turn};
 use std::fs::{File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
@@ -126,35 +125,20 @@ impl Runs {
 
     /// Spawn `cmd` (an `agent_cmd` of the program, arguments set) in `cwd` for `receipt_id`:
     /// stdout to its run log, stderr next to it, stdin piped for the message, and in its own
-    /// process group so that Ctrl-C on agent-talk stops observing, not the turn. A failure
-    /// settles the receipt `rejected`, since nothing ran (DESIGN.md §3); before the intent
-    /// is written there is no receipt to settle.
-    pub fn spawn(
-        &self,
-        store: &Store,
-        cmd: &mut Command,
-        cwd: &str,
-        receipt_id: &str,
-    ) -> Result<Child> {
+    /// process group so that Ctrl-C on agent-talk stops observing, not the turn.
+    pub fn spawn(&self, cmd: &mut Command, cwd: &str, receipt_id: &str) -> Result<Child> {
         let log = self.log(receipt_id);
         let stderr = log.with_extension("stderr");
-        let spawned = (|| {
-            std::fs::create_dir_all(&self.dir)
-                .map_err(|e| Error::transport("create run dir", e))?;
-            let out = File::create(&log).map_err(|e| Error::transport(log.display(), e))?;
-            let err = File::create(&stderr).map_err(|e| Error::transport(stderr.display(), e))?;
-            cmd.current_dir(cwd)
-                .stdin(Stdio::piped())
-                .stdout(out)
-                .stderr(err)
-                .process_group(0)
-                .spawn()
-                .map_err(|e| Error::transport(format!("spawn {}", self.program), e))
-        })();
-        if spawned.is_err() {
-            store.settle_unaccepted(receipt_id, ReceiptState::Rejected, None)?;
-        }
-        spawned
+        std::fs::create_dir_all(&self.dir).map_err(|e| Error::transport("create run dir", e))?;
+        let out = File::create(&log).map_err(|e| Error::transport(log.display(), e))?;
+        let err = File::create(&stderr).map_err(|e| Error::transport(stderr.display(), e))?;
+        cmd.current_dir(cwd)
+            .stdin(Stdio::piped())
+            .stdout(out)
+            .stderr(err)
+            .process_group(0)
+            .spawn()
+            .map_err(|e| Error::transport(format!("spawn {}", self.program), e))
     }
 
     /// Write `message` to the child's stdin and close it: Claude and agy exit after the turn

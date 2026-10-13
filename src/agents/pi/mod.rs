@@ -20,7 +20,7 @@ use self::run::Run;
 use self::session::{check_id, head, live_branch, load, transcript_turn, turn_end};
 use crate::agents::child::{Runs, agent_cmd, cli_version, lock, observe, pid_alive, tail};
 use crate::agents::history::{ReadPage, ReadQuery, cut};
-use crate::agents::lifecycle::{bounded, note_waiting, reject, settle, wait_receipt};
+use crate::agents::lifecycle::{bounded, note_waiting, reject_unstarted, settle, wait_receipt};
 use crate::agents::{
     Agent, AgentStatus, Check, ListFilter, Operation, SendRequest, StartRequest, WaitTarget,
 };
@@ -135,7 +135,7 @@ impl<'a> Pi<'a> {
     /// the reason (DESIGN.md §3).
     fn reject_startup(&self, receipt_id: &str, status: Option<ExitStatus>) -> Error {
         let e = self.runs.startup_error(receipt_id, status);
-        reject(
+        reject_unstarted(
             self.store,
             receipt_id,
             Error::from_agent(ErrorCode::Precondition, e),
@@ -189,12 +189,10 @@ impl<'a> Pi<'a> {
     ) -> Result<Outcome> {
         let h = handle(&watch.id);
         let log = self.runs.log(&watch.receipt_id);
-        let mut child = self.runs.spawn(
-            self.store,
-            agent_cmd("pi").args(args),
-            cwd,
-            &watch.receipt_id,
-        )?;
+        let mut child = self
+            .runs
+            .spawn(agent_cmd("pi").args(args), cwd, &watch.receipt_id)
+            .map_err(|e| reject_unstarted(self.store, &watch.receipt_id, e))?;
         if let Some(pid) = child.id() {
             self.store.insert_process(&watch.receipt_id, &h, pid)?;
         }

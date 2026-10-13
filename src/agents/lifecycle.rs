@@ -51,6 +51,17 @@ pub fn reject(store: &Store, receipt_id: &str, e: Error) -> Error {
     e
 }
 
+/// The agent child that was to take the message failed to spawn or exited before taking
+/// it: `rejected` whatever the error, since nothing ran (DESIGN.md §3).
+pub fn reject_unstarted(store: &Store, receipt_id: &str, e: Error) -> Error {
+    let agent_error = e.agent_error.as_deref();
+    if let Err(store_err) = store.settle_unaccepted(receipt_id, ReceiptState::Rejected, agent_error)
+    {
+        tracing::warn!("{store_err}");
+    }
+    e
+}
+
 pub fn record(store: &Store, a: &Approval) {
     if let Err(e) = store.insert_approval(a) {
         tracing::warn!("{e}");
