@@ -1,7 +1,8 @@
-//! pi session files, `<agent dir>/sessions/--<cwd>--/<timestamp>_<id>.jsonl`: decoding, the
-//! live branch, turn boundaries and normalized messages (DESIGN.md §6.6). Pure. The records
-//! are narrow: every field defaults when absent, unknown entry types, roles, content shapes
-//! and block types are tolerated, and content of an unknown shape never ends a turn.
+//! pi session files, `<agent dir>/sessions/--<cwd>--/<timestamp>_<id>.jsonl`: finding and
+//! decoding them, the live branch, turn boundaries and normalized messages (DESIGN.md §6.6).
+//! The records are narrow: every field defaults when absent, unknown entry types, roles,
+//! content shapes and block types are tolerated, and content of an unknown shape never ends a
+//! turn.
 
 use crate::agents::history::first_line;
 use crate::agents::strip_provenance;
@@ -22,16 +23,11 @@ pub struct Body {
     pub role: String,
     #[serde(default)]
     content: Content,
-    #[serde(default)]
     pub stop_reason: Option<String>,
-    #[serde(default)]
     pub error_message: Option<String>,
-    #[serde(default)]
     pub is_error: Option<bool>,
-    #[serde(default)]
     pub tool_name: Option<String>,
     /// Unix milliseconds; the one value shared by a run-log event and the persisted entry.
-    #[serde(default)]
     pub timestamp: Option<i64>,
 }
 
@@ -68,10 +64,10 @@ enum Block {
     Other,
 }
 
-impl Body {
+impl Content {
     /// The text blocks joined; a string content as is.
-    pub fn text(&self) -> String {
-        match &self.content {
+    fn text(&self) -> String {
+        match self {
             Content::Text(s) => s.clone(),
             Content::Blocks(blocks) => blocks
                 .iter()
@@ -83,6 +79,12 @@ impl Body {
                 .join("\n"),
             Content::Other(_) => String::new(),
         }
+    }
+}
+
+impl Body {
+    pub fn text(&self) -> String {
+        self.content.text()
     }
 
     fn tool_calls(&self) -> Vec<String> {
@@ -116,30 +118,22 @@ impl Body {
 pub struct Line {
     #[serde(rename = "type", default)]
     pub kind: String,
-    #[serde(default)]
     pub id: Option<String>,
-    #[serde(default)]
     pub parent_id: Option<String>,
     /// ISO 8601.
-    #[serde(default)]
     pub timestamp: Option<String>,
-    #[serde(default)]
     pub message: Option<Body>,
     /// `session` header: the working directory pi runs the session in.
-    #[serde(default)]
     pub cwd: Option<String>,
     /// `session_info`: the display name.
-    #[serde(default)]
     pub name: Option<String>,
     /// `context_edit`: the entry whose content later model context sees edited, or, with a
     /// `null` replacement, not at all (an auto-retried failure).
-    #[serde(default)]
     pub target_id: Option<String>,
     #[serde(default)]
     pub replacement: Value,
     /// `custom_message`: text an extension injected into the context.
-    #[serde(default)]
-    pub content: Option<Value>,
+    content: Option<Content>,
 }
 
 impl Line {
@@ -156,14 +150,18 @@ pub struct Entry {
 
 pub fn load(path: &Path) -> Result<Vec<Entry>> {
     let text = std::fs::read_to_string(path).map_err(|e| Error::transport(path.display(), e))?;
-    Ok(text
-        .lines()
+    Ok(parse(&text))
+}
+
+/// The entries of a session file's text; lines that are not JSON are skipped.
+pub fn parse(text: &str) -> Vec<Entry> {
+    text.lines()
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())
         .map(|raw| Entry {
             line: Line::deserialize(&raw).unwrap_or_default(),
             raw,
         })
-        .collect())
+        .collect()
 }
 
 /// Indices of the live branch: the newest entry (the leaf pi takes on load) and its
@@ -228,7 +226,7 @@ pub fn turn_end(entries: &[Entry], branch: &HashSet<usize>, start: usize) -> Opt
 }
 
 /// Turn status pi's `stopReason` means.
-pub fn status(stop_reason: Option<&str>) -> TurnStatus {
+fn status(stop_reason: Option<&str>) -> TurnStatus {
     match stop_reason {
         Some("stop" | "length") => TurnStatus::Completed,
         Some("error") => TurnStatus::Failed,
@@ -237,8 +235,34 @@ pub fn status(stop_reason: Option<&str>) -> TurnStatus {
     }
 }
 
-/// Turn derived from the live branch, from the prompt at `start` to `end`. No duration:
-/// pi stamps an assistant message when its request starts (DESIGN.md §6.6).
+/// Turn ended by the assistant message `reply`, from a run log or the session file: its
+/// `stopReason` gives the status, its text the reply. No duration: pi stamps an assistant
+/// message when its request starts, not when the reply ends (DESIGN.md §6.6).
+pub fn reply_turn(
+    handle: String,
+    turn_id: String,
+    reply: Option<&Body>,
+    basis: String,
+) -> model::Turn {
+    let stop = reply.and_then(|m| m.stop_reason.as_deref());
+    let status = status(stop);
+    model::Turn {
+        handle,
+        turn_id,
+        status,
+        error: (status != TurnStatus::Completed).then(|| {
+            serde_json::json!({
+                "stop_reason": stop,
+                "message": reply.and_then(|m| m.error_message.as_deref()),
+            })
+        }),
+        final_text: reply.map(Body::text).filter(|t| !t.is_empty()),
+        duration_ms: None,
+        basis: Some(basis),
+    }
+}
+
+/// Turn derived from the live branch, from the prompt at `start` to `end`.
 pub fn transcript_turn(
     handle: String,
     entries: &[Entry],
@@ -248,27 +272,15 @@ pub fn transcript_turn(
     let turn_id = entries[start].line.id.clone().unwrap_or_default();
     match end {
         TurnEnd::Reply(i) => {
-            let body = entries[i].line.message.as_ref();
-            let stop = body.and_then(|m| m.stop_reason.as_deref());
-            let status = status(stop);
-            model::Turn {
-                handle,
-                turn_id,
-                status,
-                error: (status != TurnStatus::Completed).then(|| {
-                    serde_json::json!({
-                        "stop_reason": stop,
-                        "message": body.and_then(|m| m.error_message.clone()),
-                    })
-                }),
-                final_text: body.map(Body::text).filter(|t| !t.is_empty()),
-                duration_ms: None,
-                basis: Some(format!(
-                    "session file: assistant message {} without tool calls, stopReason {} (best effort; a pi process may still be writing)",
-                    entries[i].line.id.as_deref().unwrap_or("?"),
-                    stop.unwrap_or("absent")
-                )),
-            }
+            let reply = entries[i].line.message.as_ref();
+            let basis = format!(
+                "session file: assistant message {} without tool calls, stopReason {} (best effort; a pi process may still be writing)",
+                entries[i].line.id.as_deref().unwrap_or("?"),
+                reply
+                    .and_then(|m| m.stop_reason.as_deref())
+                    .unwrap_or("absent")
+            );
+            reply_turn(handle, turn_id, reply, basis)
         }
         TurnEnd::LaterPrompt(i) => model::Turn {
             handle,
@@ -362,18 +374,15 @@ fn to_message(line: &Line, turn_id: &str, item_id: &str) -> Option<Message> {
                 _ => return None,
             }
         }
-        "custom_message" => {
-            let text = match line.content.as_ref()? {
-                Value::String(s) => s.clone(),
-                Value::Array(items) => items
-                    .iter()
-                    .filter_map(|i| i["text"].as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-                _ => return None,
-            };
-            (Role::User, Phase::Other, text, Some(Caller::RUNTIME))
-        }
+        "custom_message" => match line.content.as_ref()? {
+            Content::Other(_) => return None,
+            content => (
+                Role::User,
+                Phase::Other,
+                content.text(),
+                Some(Caller::RUNTIME),
+            ),
+        },
         _ => return None,
     };
     Some(Message {
@@ -396,30 +405,52 @@ pub fn tool_summary(name: &str, arguments: &Value) -> String {
     format!("[tool_call {name}]{detail}")
 }
 
-/// cwd, name and first prompt of a session file. The name is the newest `session_info`
-/// (`--name` and `/name` append one at any point).
-pub fn head(path: &Path) -> (Option<String>, Option<String>, Option<String>) {
-    let (mut cwd, mut name, mut preview) = (None, None, None);
+/// What `ls` shows of a session file.
+#[derive(Default)]
+pub struct Head {
+    /// The working directory the `session` header records.
+    pub cwd: Option<String>,
+    /// The newest `session_info` (`--name` and `/name` append one at any point).
+    pub name: Option<String>,
+    /// The first prompt's first line.
+    pub preview: Option<String>,
+}
+
+pub fn head(path: &Path) -> Head {
+    let mut head = Head::default();
     let Ok(f) = File::open(path) else {
-        return (cwd, name, preview);
+        return head;
     };
     for l in BufReader::new(f).lines().map_while(std::result::Result::ok) {
         let Ok(line) = serde_json::from_str::<Line>(&l) else {
             continue;
         };
         match line.kind.as_str() {
-            "session" => cwd = cwd.or(line.cwd.clone()),
-            "session_info" => name = line.name.clone(),
+            "session" if head.cwd.is_none() => head.cwd = line.cwd,
+            "session_info" => head.name = line.name,
+            _ if head.preview.is_none() && line.is_prompt() => {
+                head.preview = line
+                    .message
+                    .map(|m| first_line(strip_provenance(&m.text()), 200));
+            }
             _ => {}
         }
-        if preview.is_none() && line.is_prompt() {
-            preview = line
-                .message
-                .as_ref()
-                .map(|m| first_line(strip_provenance(&m.text()), 200));
-        }
     }
-    (cwd, name, preview)
+    head
+}
+
+/// The working directory the session header, the file's first line, records.
+pub fn cwd(path: &Path) -> Option<String> {
+    let first = BufReader::new(File::open(path).ok()?)
+        .lines()
+        .next()?
+        .ok()?;
+    let header: Line = serde_json::from_str(&first).ok()?;
+    if header.kind == "session" {
+        header.cwd
+    } else {
+        None
+    }
 }
 
 /// The directory pi keeps a cwd's sessions in: the leading separator removed and `/`, `\`
@@ -458,6 +489,23 @@ pub fn check_id(id: &str) -> Result<()> {
             ),
         ))
     }
+}
+
+/// Every session file under `sessions`, with its id: `<cwd dir>/<timestamp>_<id>.jsonl`.
+/// pi's timestamp has no `_` (`:` and `.` become `-`), so the id is what follows the first
+/// one; a name without a valid id is skipped.
+pub fn files(sessions: &Path) -> impl Iterator<Item = (String, PathBuf)> {
+    std::fs::read_dir(sessions)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .flat_map(|d| std::fs::read_dir(d.path()).into_iter().flatten().flatten())
+        .filter_map(|f| {
+            let name = f.file_name().into_string().ok()?;
+            let id = name.strip_suffix(".jsonl")?.split_once('_')?.1;
+            check_id(id).ok()?;
+            Some((id.to_string(), f.path()))
+        })
 }
 
 /// The session file `*_<id>.jsonl` under any cwd directory of `sessions`. Ids are unique
@@ -516,18 +564,6 @@ mod tests {
 {"type":"message","id":"87eef124","parentId":"ce000002","timestamp":"2026-10-07T12:34:10.000Z","message":{"role":"user","content":[{"type":"text","text":"Reply with exactly A"}],"timestamp":1791376450000}}
 "#;
 
-    fn entries() -> Vec<Entry> {
-        FILE.lines()
-            .map(|l| {
-                let raw: Value = serde_json::from_str(l).unwrap();
-                Entry {
-                    line: Line::deserialize(&raw).unwrap(),
-                    raw,
-                }
-            })
-            .collect()
-    }
-
     fn idx(entries: &[Entry], id: &str) -> usize {
         entries
             .iter()
@@ -540,7 +576,7 @@ mod tests {
     /// that replaces the final's content does not hide it.
     #[test]
     fn live_branch_turns_and_messages() {
-        let e = entries();
+        let e = parse(FILE);
         let branch = live_branch(&e);
         assert!(branch.contains(&idx(&e, "87eef124")));
         assert!(branch.contains(&idx(&e, "3cdeb9ba")));
@@ -600,6 +636,26 @@ mod tests {
         let bare: Body =
             serde_json::from_str(r#"{"role":"assistant","content":[{"type":"text"}]}"#).unwrap();
         assert!(bare.is_reply() && bare.text().is_empty());
+    }
+
+    /// `custom_message` content is a string or blocks, read like a message's; content of
+    /// another shape yields no message.
+    #[test]
+    fn custom_messages() {
+        let e = parse(concat!(
+            r#"{"type":"custom_message","id":"c1","customType":"x","content":"summary","display":true}"#,
+            "\n",
+            r#"{"type":"custom_message","id":"c2","parentId":"c1","content":[{"type":"text","text":"a"},{"type":"image","data":""},{"type":"text","text":"b"}]}"#,
+            "\n",
+            r#"{"type":"custom_message","id":"c3","parentId":"c2","content":{"odd":1}}"#,
+        ));
+        let msgs = messages(&e, &live_branch(&e));
+        let view: Vec<(&str, &str)> = msgs
+            .iter()
+            .map(|(_, m)| (m.item_id.as_str(), m.text.as_str()))
+            .collect();
+        assert_eq!(view, [("c1", "summary"), ("c2", "a\nb")]);
+        assert_eq!(msgs[0].1.from, Some(Caller::RUNTIME));
     }
 
     #[test]

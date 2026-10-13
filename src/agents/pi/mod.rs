@@ -6,8 +6,8 @@
 //! the process keeps running if the command stops observing (deadline, Ctrl-C), and its
 //! pid is recorded so later commands know the run is still alive. The turn id is the id of
 //! the user message's entry in the session file, learned when pi reports the message
-//! taken. History, turn boundaries and listings come from the session files under
-//! `~/.pi/agent/sessions`.
+//! taken. History, turn boundaries and listings come from the session files under pi's
+//! agent dir.
 //!
 //! pi has no permission prompts (tools run with the process's rights) and no marker of a
 //! live process, so there are no approvals to record and a session open in a TUI cannot be
@@ -17,21 +17,22 @@ mod run;
 mod session;
 
 use self::run::Run;
-use self::session::{check_id, head, live_branch, load, transcript_turn, turn_end};
+use self::session::{Entry, check_id, live_branch, load, transcript_turn, turn_end};
 use crate::agents::child::{Runs, agent_cmd, cli_version, lock, observe, pid_alive, tail};
 use crate::agents::history::{ReadPage, ReadQuery, cut};
 use crate::agents::lifecycle::{bounded, note_waiting, reject_unstarted, settle, wait_receipt};
 use crate::agents::{
-    Agent, AgentStatus, Check, ListFilter, Operation, SendRequest, StartRequest, WaitTarget,
+    Agent, AgentStatus, Check, ListFilter, Operation, Outgoing, SendRequest, StartRequest,
+    WaitTarget,
 };
 use crate::model::{
     Error, ErrorCode, History, Loaded, Model, Observations, Outcome, Page, Phase, Progress, Result,
-    Session, SessionState,
+    Session, SessionState, Turn,
 };
 use crate::store::{NewIntent, Store};
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 use tokio::time::Instant;
 
 /// Why agent-talk refuses a second writer of its own (DESIGN.md §6.6).
@@ -42,13 +43,12 @@ const EFFORTS: [&str; 7] = ["off", "minimal", "low", "medium", "high", "xhigh", 
 
 pub struct Pi<'a> {
     store: &'a Store,
-    /// `<agent dir>/sessions`; the agent dir is `$PI_CODING_AGENT_DIR`, else `~/.pi/agent`.
+    /// `$PI_CODING_AGENT_DIR`, else `~/.pi/agent`.
+    agent_dir: PathBuf,
+    /// `<agent dir>/sessions`
     sessions: PathBuf,
     /// `~/.agent-talk/pi-runs`
     runs: Runs,
-    /// Set when pi is configured to keep sessions in a flat custom directory, which
-    /// agent-talk does not read (DESIGN.md §8): the setting, for the refusal.
-    custom_dir: Option<String>,
 }
 
 fn handle(id: &str) -> String {
@@ -77,7 +77,11 @@ impl RunWatch {
             if self.file.is_none() {
                 self.file = session::find(sessions, &self.id)?;
             }
-            self.turn_id = self.file.as_deref().and_then(|f| self.run.turn_id(f));
+            self.turn_id = self
+                .file
+                .as_deref()
+                .and_then(|f| session::load(f).ok())
+                .and_then(|e| self.run.turn_id(&e));
             if self.turn_id.is_none() {
                 tracing::warn!(
                     "pi took the message but its entry was not found in the session file; the turn id is recovered by wait"
@@ -90,37 +94,49 @@ impl RunWatch {
     }
 }
 
+/// What the run log of the pi process agent-talk started for a receipt says, when the
+/// process did take the message.
+enum RunState {
+    /// The process still runs the turn.
+    Running(u32),
+    /// `agent_settled`: the turn as the run log has it.
+    Settled(Turn),
+    /// Gone without `agent_settled`: the session file says what it left behind.
+    Exited,
+}
+
 impl<'a> Pi<'a> {
     pub fn new(store: &'a Store) -> Self {
         let home = std::env::home_dir().unwrap_or_default();
         let agent_dir = match std::env::var("PI_CODING_AGENT_DIR") {
-            // pi expands a leading `~` itself.
+            // pi expands a leading `~/`, and so does agent-talk.
             Ok(d) if !d.is_empty() => match d.strip_prefix("~/") {
                 Some(rest) => home.join(rest),
                 None => PathBuf::from(d),
             },
             _ => home.join(".pi/agent"),
         };
-        let custom_dir = match std::env::var("PI_CODING_AGENT_SESSION_DIR") {
+        Pi {
+            store,
+            sessions: agent_dir.join("sessions"),
+            agent_dir,
+            runs: Runs::new("pi", "pi"),
+        }
+    }
+
+    /// Refuse while pi is configured to keep its sessions in a flat custom directory, which
+    /// agent-talk does not read (DESIGN.md §8). Checked by every pi operation but `models`.
+    fn check_layout(&self) -> Result<()> {
+        let custom = match std::env::var("PI_CODING_AGENT_SESSION_DIR") {
             Ok(d) if !d.is_empty() => Some(format!("PI_CODING_AGENT_SESSION_DIR={d}")),
-            _ => std::fs::read_to_string(agent_dir.join("settings.json"))
+            _ => std::fs::read_to_string(self.agent_dir.join("settings.json"))
                 .ok()
                 .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
                 .and_then(|v| v["sessionDir"].as_str().map(String::from))
                 .filter(|d| !d.is_empty())
                 .map(|d| format!("the sessionDir setting, {d}")),
         };
-        Pi {
-            store,
-            sessions: agent_dir.join("sessions"),
-            runs: Runs::new("pi", "pi"),
-            custom_dir,
-        }
-    }
-
-    /// Refuse while pi keeps its sessions where agent-talk does not look (DESIGN.md §8).
-    fn default_layout(&self) -> Result<()> {
-        match &self.custom_dir {
+        match custom {
             None => Ok(()),
             Some(why) => Err(Error::new(
                 ErrorCode::Unsupported,
@@ -163,43 +179,63 @@ impl<'a> Pi<'a> {
         }
     }
 
-    fn require_file(&self, id: &str) -> Result<PathBuf> {
-        session::find(&self.sessions, id)?.ok_or_else(|| {
-            Error::new(
-                ErrorCode::Precondition,
-                format!(
-                    "no session file for {} under {}",
-                    handle(id),
-                    self.sessions.display()
-                ),
-            )
-        })
+    fn missing_file(&self, id: &str) -> Error {
+        Error::new(
+            ErrorCode::Precondition,
+            format!(
+                "no session file for {} under {}",
+                handle(id),
+                self.sessions.display()
+            ),
+        )
     }
 
-    /// Run one `pi --mode json` turn to completion (or until `deadline` / Ctrl-C, after
-    /// which the process keeps running and is tracked by its pid), then settle the receipt.
-    /// The caller holds the session lock.
+    fn require_file(&self, id: &str) -> Result<PathBuf> {
+        session::find(&self.sessions, id)?.ok_or_else(|| self.missing_file(id))
+    }
+
+    /// Record the intent, then run one `pi --mode json` turn of session `id` to completion
+    /// (or until `deadline` / Ctrl-C, after which the process keeps running and is tracked
+    /// by its pid), and settle the receipt. `file` is the session file, `None` for a new
+    /// session. The caller holds the session lock.
     async fn execute(
         &self,
+        id: String,
+        file: Option<PathBuf>,
         cwd: &str,
         args: &[String],
-        mut watch: RunWatch,
-        prompt: &str,
+        message: &Outgoing<'_>,
         deadline: Option<Instant>,
     ) -> Result<Outcome> {
-        let h = handle(&watch.id);
-        let log = self.runs.log(&watch.receipt_id);
+        let h = handle(&id);
+        let receipt_id = uuid::Uuid::new_v4().to_string();
+        self.store.insert_intent(&NewIntent {
+            receipt_id: &receipt_id,
+            handle: &h,
+            client_msg_id: &uuid::Uuid::new_v4().to_string(),
+            message,
+        })?;
+        let log = self.runs.log(&receipt_id);
         let mut child = self
             .runs
-            .spawn(agent_cmd("pi").args(args), cwd, &watch.receipt_id)
-            .map_err(|e| reject_unstarted(self.store, &watch.receipt_id, e))?;
+            .spawn(agent_cmd("pi").args(args), cwd, &receipt_id)
+            .map_err(|e| reject_unstarted(self.store, &receipt_id, e))?;
         if let Some(pid) = child.id() {
-            self.store.insert_process(&watch.receipt_id, &h, pid)?;
+            self.store.insert_process(&receipt_id, &h, pid)?;
         }
+        let mut watch = RunWatch {
+            id,
+            receipt_id,
+            file,
+            run: Run::default(),
+            turn_id: None,
+        };
         let work = async {
             // pi reads piped stdin to EOF as the prompt, which keeps `@file` and option
             // parsing away from the text (DESIGN.md §6.6).
-            self.runs.deliver(&mut child, prompt.as_bytes()).await?;
+            self.runs
+                .deliver(&mut child, message.delivered.as_bytes())
+                .await?;
             let status = tail(&mut child, &log, |l| {
                 watch.on_line(self.store, &self.sessions, l)
             })
@@ -223,6 +259,76 @@ impl<'a> Pi<'a> {
             Progress::Running,
         )
     }
+
+    /// What the run log of the process agent-talk started for `receipt_id` says, `None`
+    /// without a log. While the turn id is unknown (the sending command stopped observing
+    /// before pi took the message) and the log shows the message taken, the entry is looked
+    /// up in `file` and the receipt accepted with it. A process gone before taking the
+    /// message is a startup failure.
+    fn run_state(
+        &self,
+        h: &str,
+        receipt_id: &str,
+        turn_id: &mut Option<String>,
+        file: Option<&Path>,
+    ) -> Result<Option<RunState>> {
+        let log = self.runs.log(receipt_id);
+        if !log.is_file() {
+            return Ok(None);
+        }
+        let run = Run::from_log(&log);
+        if turn_id.is_none()
+            && run.user.is_some()
+            && let Some(t) = file
+                .and_then(|f| load(f).ok())
+                .and_then(|e| run.turn_id(&e))
+        {
+            self.store.accept(receipt_id, None, Some(&t), Some(&t))?;
+            *turn_id = Some(t);
+        }
+        if run.settled {
+            let turn = run.turn(h.into(), turn_id.clone().unwrap_or_default());
+            return Ok(Some(RunState::Settled(turn)));
+        }
+        match self
+            .store
+            .process(receipt_id)?
+            .filter(|&pid| pid_alive(pid))
+        {
+            Some(pid) => Ok(Some(RunState::Running(pid))),
+            None if run.user.is_none() => Err(self.reject_startup(receipt_id, None)),
+            None => Ok(Some(RunState::Exited)),
+        }
+    }
+}
+
+/// The turn `turn_id` names, from the session file: `None` while nothing on the live branch
+/// ends it. Only the live branch is read: a prompt on a branch a later load left behind has
+/// no answer of its own there.
+fn file_turn(h: &str, entries: &[Entry], turn_id: &str) -> Result<Option<Turn>> {
+    let branch = live_branch(entries);
+    let start = match entries
+        .iter()
+        .position(|e| e.line.id.as_deref() == Some(turn_id) && e.line.is_prompt())
+    {
+        Some(i) if branch.contains(&i) => i,
+        Some(_) => {
+            return Err(Error::new(
+                ErrorCode::Precondition,
+                format!(
+                    "turn {turn_id} is on a branch of this session the newest entry does not descend from"
+                ),
+            ));
+        }
+        None => {
+            return Err(Error::new(
+                ErrorCode::Precondition,
+                format!("turn {turn_id} is not a user message in this session"),
+            ));
+        }
+    };
+    // A reply without tool calls or a later prompt closes the turn.
+    Ok(turn_end(entries, &branch, start).map(|end| transcript_turn(h.into(), entries, start, end)))
 }
 
 impl Agent for Pi<'_> {
@@ -251,7 +357,7 @@ impl Agent for Pi<'_> {
     async fn status(&self) -> AgentStatus {
         let version = cli_version("pi").await;
         let cli: Check = version.as_ref().map(|_| ()).map_err(String::clone);
-        let layout: Check = self.default_layout().map_err(|e| e.message);
+        let layout: Check = self.check_layout().map_err(|e| e.message);
         let files: Check = layout.clone().and(if self.sessions.is_dir() {
             Ok(())
         } else {
@@ -282,79 +388,43 @@ impl Agent for Pi<'_> {
         limit: u32,
         cursor: Option<&str>,
     ) -> Result<Page<Session>> {
-        self.default_layout()?;
-        struct Row {
-            id: String,
-            file: PathBuf,
-            mtime_ms: i64,
-        }
+        self.check_layout()?;
         let want_dir = filter.cwd.map(session::dir_name);
-        let mut rows = Vec::new();
-        for dir in std::fs::read_dir(&self.sessions)
-            .into_iter()
-            .flatten()
-            .flatten()
-        {
-            if let Some(d) = &want_dir
-                && dir.file_name().to_string_lossy() != d.as_str()
-            {
-                continue;
-            }
-            for f in std::fs::read_dir(dir.path())
-                .into_iter()
-                .flatten()
-                .flatten()
-            {
-                let path = f.path();
-                let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-                    continue;
-                };
-                // `<timestamp>_<id>.jsonl`
-                let Some(id) = name
-                    .strip_suffix(".jsonl")
-                    .and_then(|n| n.split_once('_'))
-                    .map(|(_, id)| id)
-                else {
-                    continue;
-                };
-                if check_id(id).is_err() {
-                    continue;
-                }
-                let mtime_ms = f
-                    .metadata()
-                    .and_then(|m| m.modified())
-                    .ok()
-                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                    .map(|d| d.as_millis() as i64)
-                    .unwrap_or(0);
-                rows.push(Row {
-                    id: id.to_string(),
-                    file: path,
-                    mtime_ms,
-                });
-            }
-        }
-        rows.sort_by(|a, b| b.mtime_ms.cmp(&a.mtime_ms).then(a.id.cmp(&b.id)));
+        let mut files: Vec<(SystemTime, String, PathBuf)> = session::files(&self.sessions)
+            .filter(|(_, path)| {
+                want_dir.as_deref().is_none_or(|d| {
+                    path.parent()
+                        .and_then(|p| p.file_name())
+                        .is_some_and(|n| n == d)
+                })
+            })
+            .map(|(id, path)| {
+                let mtime = path.metadata().and_then(|m| m.modified());
+                (mtime.unwrap_or(SystemTime::UNIX_EPOCH), id, path)
+            })
+            .collect();
+        // Newest first.
+        files.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
         let offset: usize = match cursor {
             Some(c) => c
                 .parse()
                 .map_err(|_| Error::new(ErrorCode::Precondition, format!("invalid cursor {c}")))?,
             None => 0,
         };
-        let end = (offset + limit as usize).min(rows.len());
-        let next_cursor = (end < rows.len()).then(|| end.to_string());
+        let end = (offset + limit as usize).min(files.len());
+        let next_cursor = (end < files.len()).then(|| end.to_string());
         let mut items = Vec::new();
-        for row in rows.into_iter().skip(offset).take(limit as usize) {
-            let h = handle(&row.id);
+        for (_, id, path) in files.into_iter().skip(offset).take(limit as usize) {
+            let h = handle(&id);
             let owned = self.store.is_owned(&h)?;
-            let (cwd, name, preview) = head(&row.file);
+            let head = session::head(&path);
             let running = self.own_run(&self.store.processes(&h)?).is_some();
             items.push(Session {
                 handle: h,
                 agent: "pi",
-                cwd,
-                name,
-                preview,
+                cwd: head.cwd,
+                name: head.name,
+                preview: head.preview,
                 observations: Observations {
                     history: History::Visible,
                     // pi keeps no marker of a live process: only agent-talk's own runs are known.
@@ -375,41 +445,26 @@ impl Agent for Pi<'_> {
                     SessionState::Unknown
                 },
                 owned,
-                id: row.id,
+                id,
             });
         }
         Ok(Page { items, next_cursor })
     }
 
     async fn start(&self, req: &StartRequest<'_>, deadline: Option<Instant>) -> Result<Outcome> {
-        self.default_layout()?;
+        self.check_layout()?;
         let id = uuid::Uuid::new_v4().to_string();
         let h = handle(&id);
         let _lock = lock(&h, SECOND_WRITER)?;
         // pi has no permission prompts, so full access changes nothing; recorded as given.
         self.store.insert_owned(&h, req.cwd, req.settings)?;
-        let receipt_id = uuid::Uuid::new_v4().to_string();
-        let client_msg_id = uuid::Uuid::new_v4().to_string();
-        self.store.insert_intent(&NewIntent {
-            receipt_id: &receipt_id,
-            handle: &h,
-            client_msg_id: &client_msg_id,
-            message: &req.message,
-        })?;
         let args = run::args(
             ["--session-id", &id],
             req.settings.model.as_deref(),
             req.settings.effort.as_deref(),
             req.name,
         );
-        let watch = RunWatch {
-            id,
-            receipt_id,
-            file: None,
-            run: Run::default(),
-            turn_id: None,
-        };
-        self.execute(req.cwd, &args, watch, req.message.delivered, deadline)
+        self.execute(id, None, req.cwd, &args, &req.message, deadline)
             .await
     }
 
@@ -420,7 +475,7 @@ impl Agent for Pi<'_> {
         deadline: Option<Instant>,
     ) -> Result<Outcome> {
         check_id(id)?;
-        self.default_layout()?;
+        self.check_layout()?;
         if req.steer {
             return Err(Error::new(
                 ErrorCode::NoSteer,
@@ -433,7 +488,7 @@ impl Agent for Pi<'_> {
         self.refuse_own_live(id)?;
         // pi runs a resumed session in the directory its header records and refuses when
         // that directory is gone; the check here gives the clearer message.
-        let cwd = match head(&path).0 {
+        let cwd = match session::cwd(&path) {
             Some(c) if Path::new(&c).is_dir() => c,
             Some(c) => {
                 return Err(Error::new(
@@ -448,14 +503,6 @@ impl Agent for Pi<'_> {
                 ));
             }
         };
-        let receipt_id = uuid::Uuid::new_v4().to_string();
-        let client_msg_id = uuid::Uuid::new_v4().to_string();
-        self.store.insert_intent(&NewIntent {
-            receipt_id: &receipt_id,
-            handle: &h,
-            client_msg_id: &client_msg_id,
-            message: &req.message,
-        })?;
         // pi restores the model from the session file, so only a change passes it; the
         // thinking level is not restored and comes from the session's settings.
         let effort = req.settings.and_then(|s| s.effort.as_deref());
@@ -465,20 +512,13 @@ impl Agent for Pi<'_> {
             effort,
             None,
         );
-        let watch = RunWatch {
-            id: id.to_string(),
-            receipt_id,
-            file: Some(path),
-            run: Run::default(),
-            turn_id: None,
-        };
-        self.execute(&cwd, &args, watch, req.message.delivered, deadline)
+        self.execute(id.into(), Some(path), &cwd, &args, &req.message, deadline)
             .await
     }
 
     async fn read(&self, id: &str, q: &ReadQuery) -> Result<ReadPage> {
         check_id(id)?;
-        self.default_layout()?;
+        self.check_layout()?;
         let entries = load(&self.require_file(id)?)?;
         let branch = live_branch(&entries);
         let mut messages = session::messages(&entries, &branch);
@@ -500,7 +540,7 @@ impl Agent for Pi<'_> {
 
     async fn wait(&self, id: &str, target: &WaitTarget, deadline: Instant) -> Result<Outcome> {
         check_id(id)?;
-        self.default_layout()?;
+        self.check_layout()?;
         let h = handle(id);
         let (mut turn_id, receipt) = match target {
             WaitTarget::Turn(t) => (Some(t.clone()), self.store.receipt_by_turn(&h, t)?),
@@ -509,95 +549,48 @@ impl Agent for Pi<'_> {
                 (rec.turn_id.clone(), Some(rec))
             }
         };
+        let receipt_id = receipt.map(|r| r.receipt_id);
         // What the last poll was waiting for, reported at the deadline.
         let mut waiting_for = String::new();
         let work = async {
             loop {
                 let file = session::find(&self.sessions, id)?;
                 // 1. Own run: while the process lives only its run log counts (the file
-                // may hold a failed message pi is about to retry), and the log names the
-                // turn when the sending command stopped observing before pi took the message.
-                let mut exited = false;
-                if let Some(r) = &receipt
-                    && self.runs.log(&r.receipt_id).is_file()
-                {
-                    let run = Run::from_log(&self.runs.log(&r.receipt_id));
-                    if turn_id.is_none()
-                        && run.user.is_some()
-                        && let Some(t) = file.as_deref().and_then(|f| run.turn_id(f))
-                    {
-                        self.store.accept(&r.receipt_id, None, Some(&t), Some(&t))?;
-                        turn_id = Some(t);
-                    }
-                    if run.settled {
-                        return Ok(run.turn(h.clone(), turn_id.clone().unwrap_or_default()));
-                    }
-                    let pid = self.store.process(&r.receipt_id)?;
-                    if pid.is_some_and(pid_alive) {
+                // may hold a failed message pi is about to retry).
+                let run = match &receipt_id {
+                    Some(r) => self.run_state(&h, r, &mut turn_id, file.as_deref())?,
+                    None => None,
+                };
+                let exited = match run {
+                    Some(RunState::Settled(turn)) => return Ok(turn),
+                    Some(RunState::Running(pid)) => {
                         waiting_for = format!(
-                            "waiting for the agent_settled event of the pi process agent-talk started (pid {})",
-                            pid.unwrap_or_default()
+                            "waiting for the agent_settled event of the pi process agent-talk started (pid {pid})"
                         );
                         tokio::time::sleep(Duration::from_secs(1)).await;
                         continue;
                     }
-                    // Gone without settling: a startup failure if it never took the
-                    // message, otherwise the file says what it left behind.
-                    if run.user.is_none() {
-                        return Err(self.reject_startup(&r.receipt_id, None));
-                    }
-                    exited = true;
-                }
-                let Some(file) = &file else {
-                    if exited {
-                        return Ok(run::exited(
-                            h.clone(),
-                            turn_id.clone().unwrap_or_default(),
-                            None,
-                        ));
-                    }
-                    return Err(Error::new(
-                        ErrorCode::Precondition,
-                        format!("no session file for {h} under {}", self.sessions.display()),
-                    ));
+                    Some(RunState::Exited) => true,
+                    None => false,
                 };
-                let entries = load(file)?;
-                let branch = live_branch(&entries);
-                // Only the live branch is read: a prompt on a branch a later load left
-                // behind has no answer of its own there.
-                let found = turn_id.as_deref().and_then(|t| {
-                    entries
-                        .iter()
-                        .position(|e| e.line.id.as_deref() == Some(t) && e.line.is_prompt())
-                });
-                let start = found.filter(|i| branch.contains(i));
-                if start.is_none() && receipt.is_none() {
-                    return Err(Error::new(
+                // 2. The session file.
+                let turn = match (&file, turn_id.as_deref()) {
+                    (Some(f), Some(t)) => file_turn(&h, &load(f)?, t),
+                    (Some(_), None) => Err(Error::new(
                         ErrorCode::Precondition,
-                        match found {
-                            Some(_) => format!(
-                                "turn {} is on a branch of this session the newest entry does not descend from",
-                                turn_id.as_deref().unwrap_or("?")
-                            ),
-                            None => format!(
-                                "turn {} is not a user message in this session",
-                                turn_id.as_deref().unwrap_or("?")
-                            ),
-                        },
-                    ));
-                }
-                // 2. A reply without tool calls or a later prompt closes the turn.
-                if let Some(s) = start
-                    && let Some(end) = turn_end(&entries, &branch, s)
-                {
-                    return Ok(transcript_turn(h.clone(), &entries, s, end));
-                }
-                if exited {
-                    return Ok(run::exited(
-                        h.clone(),
-                        turn_id.clone().unwrap_or_default(),
-                        None,
-                    ));
+                        "the receipt has no turn id and no run log; its outcome cannot be recovered",
+                    )),
+                    (None, _) => Err(self.missing_file(id)),
+                };
+                match turn {
+                    Ok(Some(turn)) => return Ok(turn),
+                    // What the file does not tell of a run that exited is unknown.
+                    _ if exited => {
+                        let turn_id = turn_id.clone().unwrap_or_default();
+                        return Ok(run::exited(h.clone(), turn_id, None));
+                    }
+                    Err(e) if receipt_id.is_none() || file.is_none() => return Err(e),
+                    _ => {}
                 }
                 waiting_for = "session file: waiting for an assistant message without tool calls or a later user message after the prompt (best effort; pi records no process liveness)".into();
                 tokio::time::sleep(Duration::from_secs(1)).await;
@@ -607,7 +600,6 @@ impl Agent for Pi<'_> {
             .await
             .map(Some)
             .map_err(|e| note_waiting(e, &waiting_for));
-        let receipt_id = receipt.map(|r| r.receipt_id);
         settle(
             self.store,
             h,

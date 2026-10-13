@@ -1,26 +1,25 @@
 //! The `pi --mode json` child: command line, and what the run log (its stdout) says about
 //! the turn. Spawning into the run log and reading it are `agents::child`.
 
-use super::session::{self, Body};
+use super::session::{self, Body, Entry};
 use crate::model::{self, TurnStatus};
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::json;
 use std::path::Path;
 use std::process::ExitStatus;
 
 /// `pi --mode json` arguments for one turn; `session` is `--session-id <id>` for a new
 /// session or `--session <path>` to resume one. A resumed session takes the model of its
-/// newest assistant message, but the thinking level only from a `thinking_level_change`
-/// entry, which only the first run writes (DESIGN.md §6.6).
+/// newest `model_change` entry or assistant message, whichever is later, but the thinking
+/// level only from a `thinking_level_change` entry, which only the first run writes
+/// (DESIGN.md §6.6).
 pub fn args(
-    session: [&str; 2],
+    [flag, session]: [&str; 2],
     model: Option<&str>,
     effort: Option<&str>,
     name: Option<&str>,
 ) -> Vec<String> {
-    let mut args: Vec<String> = ["--mode", "json", session[0], session[1]]
-        .map(String::from)
-        .to_vec();
+    let mut args: Vec<String> = ["--mode", "json", flag, session].map(String::from).to_vec();
     if let Some(m) = model {
         args.extend(["--model".into(), m.into()]);
     }
@@ -37,7 +36,7 @@ pub fn args(
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Event {
     MessageEnd {
-        message: Value,
+        message: Body,
     },
     AgentSettled,
     #[serde(other)]
@@ -47,11 +46,11 @@ enum Event {
 /// What a run log says about one `pi --mode json` process.
 #[derive(Default)]
 pub struct Run {
-    /// The user message pi took, as the event carried it: the receipt is accepted at this
-    /// point, and the persisted entry is found by its `timestamp` and text.
-    pub user: Option<Value>,
+    /// The user message pi took: the receipt is accepted at this point, and the persisted
+    /// entry is found by its `timestamp` and text.
+    pub user: Option<Body>,
     /// The newest assistant message; the turn's status and reply once the run settled.
-    pub assistant: Option<Value>,
+    pub assistant: Option<Body>,
     /// `agent_settled`: pi has no automatic work left and exits.
     pub settled: bool,
 }
@@ -70,13 +69,10 @@ impl Run {
 
     /// Apply one run-log line; non-JSON and unknown events are ignored.
     pub fn apply(&mut self, line: &str) {
-        let Ok(raw) = serde_json::from_str::<Value>(line) else {
-            return;
-        };
-        match Event::deserialize(&raw) {
-            Ok(Event::MessageEnd { message }) => match message["role"].as_str() {
-                Some("user") if self.user.is_none() => self.user = Some(message),
-                Some("assistant") => self.assistant = Some(message),
+        match serde_json::from_str(line) {
+            Ok(Event::MessageEnd { message }) => match message.role.as_str() {
+                "user" if self.user.is_none() => self.user = Some(message),
+                "assistant" => self.assistant = Some(message),
                 _ => {}
             },
             Ok(Event::AgentSettled) => self.settled = true,
@@ -87,9 +83,8 @@ impl Run {
     /// The id of the session entry holding the user message this run took: the entry
     /// with the same `message.timestamp` and text. pi appends the entry before it writes
     /// the event, so the entry is on disk once the event is.
-    pub fn turn_id(&self, session_file: &Path) -> Option<String> {
-        let user = Body::deserialize(self.user.as_ref()?).ok()?;
-        let entries = session::load(session_file).ok()?;
+    pub fn turn_id(&self, entries: &[Entry]) -> Option<String> {
+        let user = self.user.as_ref()?;
         entries
             .iter()
             .rev()
@@ -103,29 +98,14 @@ impl Run {
             .and_then(|e| e.line.id.clone())
     }
 
-    /// Turn from a settled run. No duration: pi stamps an assistant message when its
-    /// request starts, not when the reply ends (DESIGN.md §6.6).
+    /// Turn from a settled run.
     pub fn turn(&self, handle: String, turn_id: String) -> model::Turn {
-        let body = self
-            .assistant
-            .as_ref()
-            .and_then(|a| Body::deserialize(a).ok());
-        let stop = body.as_ref().and_then(|m| m.stop_reason.as_deref());
-        let status = session::status(stop);
-        model::Turn {
+        session::reply_turn(
             handle,
             turn_id,
-            status,
-            error: (status != TurnStatus::Completed).then(|| {
-                json!({
-                    "stop_reason": stop,
-                    "message": body.as_ref().and_then(|m| m.error_message.clone()),
-                })
-            }),
-            final_text: body.as_ref().map(Body::text).filter(|t| !t.is_empty()),
-            duration_ms: None,
-            basis: Some("agent_settled event of the pi process agent-talk started".into()),
-        }
+            self.assistant.as_ref(),
+            "agent_settled event of the pi process agent-talk started".into(),
+        )
     }
 }
 
@@ -179,6 +159,27 @@ mod tests {
         let t = run.turn("pi:s".into(), "8bd197f0".into());
         assert_eq!((t.status, t.final_text), (TurnStatus::Failed, None));
         assert_eq!(t.error.unwrap()["message"], "This operation was aborted");
+    }
+
+    /// The run's user message is the prompt entry with the same `message.timestamp` and
+    /// text, whatever the content's shape: not a prompt with that text at another time, a
+    /// system message or another prompt sharing the timestamp.
+    #[test]
+    fn turn_id_by_timestamp_and_text() {
+        let entries = session::parse(concat!(
+            r#"{"type":"message","id":"u0","message":{"role":"user","content":[{"type":"text","text":"Reply with exactly OK"}],"timestamp":1791376000000}}"#,
+            "\n",
+            r#"{"type":"message","id":"u1","message":{"role":"user","content":"Reply with exactly OK","timestamp":1791376687658}}"#,
+            "\n",
+            r#"{"type":"message","id":"s1","message":{"role":"system","content":"Reply with exactly OK","timestamp":1791376687658}}"#,
+            "\n",
+            r#"{"type":"message","id":"u2","message":{"role":"user","content":"Reply with exactly KO","timestamp":1791376687658}}"#,
+        ));
+        let mut run = Run::default();
+        assert_eq!(run.turn_id(&entries), None);
+        run.apply(USER);
+        assert_eq!(run.turn_id(&entries).as_deref(), Some("u1"));
+        assert_eq!(run.turn_id(&entries[..1]), None);
     }
 
     #[test]
