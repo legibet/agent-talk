@@ -23,7 +23,6 @@ use self::sessions::{Active, Summary};
 use self::updates::{History, first_prompt};
 use self::watch::{End, Watch};
 use crate::agents::child::{cli_version, lock, pid_alive};
-use crate::agents::decode::{entries, or_default};
 use crate::agents::history::{ReadPage, ReadQuery, cut, first_line};
 use crate::agents::lifecycle::{
     ApprovalPolicy, approval_policy, bounded, note_waiting, reject, settle, wait_receipt,
@@ -37,7 +36,6 @@ use crate::model::{
     Result, Session, SessionState, TurnStatus,
 };
 use crate::store::{NewIntent, Store};
-use serde::Deserialize;
 use serde_json::{Value, json};
 use std::fmt::Write as _;
 use std::fs::File;
@@ -95,61 +93,26 @@ async fn set_config(conn: &Conn, id: &str, config: &str, value: &str) -> Result<
     }
 }
 
-/// One entry of the `initialize` response's `_meta.modelState.availableModels`.
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct AvailableModel {
-    #[serde(default)]
-    model_id: String,
-    #[serde(rename = "_meta", default, deserialize_with = "or_default")]
-    meta: ModelMeta,
-}
-
-#[derive(Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ModelMeta {
-    #[serde(default, deserialize_with = "entries")]
-    reasoning_efforts: Vec<Effort>,
-}
-
-#[derive(Deserialize)]
-struct Effort {
-    #[serde(default, deserialize_with = "or_default")]
-    value: Option<String>,
-}
-
 /// A session as `_x.ai/sessions/list` describes it. `resident` and `activity` describe
 /// the process that answers, so they mean something only through a leader (DESIGN.md
 /// §6.4).
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct Listed {
     session_id: String,
-    #[serde(default, deserialize_with = "or_default")]
     resident: bool,
-    #[serde(default, deserialize_with = "or_default")]
-    activity: Activity,
+    /// `working`, `idle`, `dormant`; `unknown` when the row names none.
+    activity: String,
 }
 
-#[derive(Clone, Copy, Default, Deserialize, PartialEq)]
-#[serde(rename_all = "lowercase")]
-enum Activity {
-    Working,
-    Idle,
-    Dormant,
-    #[default]
-    #[serde(other)]
-    Unknown,
-}
-
-impl Activity {
-    fn as_str(self) -> &'static str {
-        match self {
-            Activity::Working => "working",
-            Activity::Idle => "idle",
-            Activity::Dormant => "dormant",
-            Activity::Unknown => "unknown",
-        }
+impl Listed {
+    /// A row of the list; none without a session id. A `resident` or `activity` that does
+    /// not fit keeps the row: residency decides the route, and a dropped row would pick a
+    /// direct child beside the leader.
+    fn new(row: &Value) -> Option<Listed> {
+        Some(Listed {
+            session_id: row["sessionId"].as_str()?.to_string(),
+            resident: row["resident"] == true,
+            activity: row["activity"].as_str().unwrap_or("unknown").to_string(),
+        })
     }
 }
 
@@ -262,7 +225,7 @@ impl<'a> Grok<'a> {
             .as_array()
             .into_iter()
             .flatten()
-            .filter_map(|s| Listed::deserialize(s).ok())
+            .filter_map(Listed::new)
             .collect())
     }
 
@@ -533,13 +496,13 @@ impl<'a> Grok<'a> {
         let res = async {
             let listed = self.listed(&conn).await?;
             match listed.iter().find(|s| s.session_id == id) {
-                Some(l) if l.resident && l.activity == Activity::Working => {}
+                Some(l) if l.resident && l.activity == "working" => {}
                 Some(l) if l.resident => {
                     return Err(Error::new(
                         ErrorCode::Precondition,
                         format!(
                             "{h} is {} in the leader; steer needs a running turn (Grok would start a fallback turn instead); send without --steer",
-                            l.activity.as_str()
+                            l.activity
                         ),
                     ));
                 }
@@ -642,9 +605,9 @@ impl<'a> Grok<'a> {
             .find(|l| l.session_id == id)
             .filter(|l| l.resident);
         let own_pid = self.own_run(&id, dir)?;
-        let state = match (own_pid, resident.map(|l| l.activity)) {
-            (Some(_), _) | (None, Some(Activity::Working)) => SessionState::Running,
-            (None, Some(Activity::Idle)) => SessionState::Idle,
+        let state = match (own_pid, resident.map(|l| l.activity.as_str())) {
+            (Some(_), _) | (None, Some("working")) => SessionState::Running,
+            (None, Some("idle")) => SessionState::Idle,
             _ => SessionState::Unknown,
         };
         let loaded = own_pid.is_some() || tui || resident.is_some();
@@ -700,15 +663,17 @@ impl Agent for Grok<'_> {
             .as_array()
             .into_iter()
             .flatten()
-            .filter_map(|m| AvailableModel::deserialize(m).ok())
-            .map(|m| Model {
-                id: m.model_id,
-                efforts: m
-                    .meta
-                    .reasoning_efforts
-                    .into_iter()
-                    .filter_map(|e| e.value)
-                    .collect(),
+            .filter_map(|m| {
+                Some(Model {
+                    id: m["modelId"].as_str()?.to_string(),
+                    efforts: m["_meta"]["reasoningEfforts"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|e| e["value"].as_str())
+                        .map(String::from)
+                        .collect(),
+                })
             })
             .collect();
         // Dropping kills the child: a clean exit takes about 4 s and there is nothing to
@@ -1095,15 +1060,14 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// A leader row whose activity (or residency) does not fit keeps the row: residency
-    /// decides the route, and dropping the row would pick a direct child beside the leader.
+    /// A leader row whose activity (or residency) does not fit keeps the row.
     #[test]
     fn odd_listed_fields_keep_the_row() {
-        let row =
-            |s: &str| Listed::deserialize(&serde_json::from_str::<Value>(s).unwrap()).unwrap();
-        let l = row(r#"{"sessionId":"s1","resident":true,"activity":null}"#);
-        assert!(l.session_id == "s1" && l.resident && l.activity == Activity::Unknown);
-        let l = row(r#"{"sessionId":"s1","resident":null,"activity":"sleeping"}"#);
-        assert!(!l.resident && l.activity == Activity::Unknown);
+        let row = |s: &str| Listed::new(&serde_json::from_str::<Value>(s).unwrap());
+        let l = row(r#"{"sessionId":"s1","resident":true,"activity":null}"#).unwrap();
+        assert!(l.session_id == "s1" && l.resident && l.activity == "unknown");
+        let l = row(r#"{"sessionId":"s1","resident":null,"activity":7}"#).unwrap();
+        assert!(!l.resident && l.activity == "unknown");
+        assert!(row(r#"{"resident":true,"activity":"working"}"#).is_none());
     }
 }
