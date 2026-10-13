@@ -1,26 +1,17 @@
 pub mod antigravity;
+pub mod child;
 pub mod claude;
 pub mod codex;
 pub mod grok;
+pub mod history;
+pub mod lifecycle;
 pub mod opencode;
 pub mod pi;
 
-use crate::model::{
-    Approval, Caller, CallerKind, Error, ErrorCode, Message, Model, Outcome, Page, Receipt,
-    ReceiptState, Result, Session, Turn,
-};
+use self::history::{ReadPage, ReadQuery};
+use crate::model::{Caller, CallerKind, Error, ErrorCode, Model, Outcome, Page, Result, Session};
 use crate::store::Store;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use std::fs::{File, OpenOptions, TryLockError};
-use std::future::Future;
-use std::path::Path;
-use std::process::ExitStatus;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
-use tokio::io::AsyncBufReadExt;
-use tokio::process::{Child, Command};
-use tokio::signal::unix::{SignalKind, signal};
 use tokio::time::Instant;
 
 /// The text delivered for `text` from `from`: agent senders get a one-line provenance
@@ -50,170 +41,6 @@ pub fn strip_provenance(text: &str) -> &str {
         }
         _ => text,
     }
-}
-
-/// Whether a process with this pid exists (a pid we may not signal counts as alive).
-pub fn pid_alive(pid: u32) -> bool {
-    let Some(p) = i32::try_from(pid)
-        .ok()
-        .and_then(rustix::process::Pid::from_raw)
-    else {
-        return false;
-    };
-    match rustix::process::test_kill_process(p) {
-        Ok(()) => true,
-        Err(e) => e == rustix::io::Errno::PERM,
-    }
-}
-
-/// The environment variables naming the session an agent-talk command runs in, with
-/// the agent each one belongs to, in the order the CLI derives its sender from them (DESIGN.md §4).
-pub const SESSION_VARS: [(&str, &str); 6] = [
-    ("CODEX_THREAD_ID", "codex"),
-    ("OPENCODE_SESSION_ID", "opencode"),
-    ("GROK_SESSION_ID", "grok"),
-    ("ANTIGRAVITY_CONVERSATION_ID", "antigravity"),
-    ("PI_SESSION_ID", "pi"),
-    ("CLAUDE_CODE_SESSION_ID", "claude"),
-];
-
-/// An agent CLI as a child of agent-talk. The environment is passed through except
-/// `AGENT_TALK_CALLER` and the session variables: the agent would pass them on to its own
-/// shell commands and MCP servers, attributing the child session's messages to the
-/// caller of this command. Each agent sets its own variable for its children itself.
-pub fn agent_cmd(program: &str) -> Command {
-    let mut cmd = Command::new(program);
-    cmd.env_remove("AGENT_TALK_CALLER");
-    for (var, _) in SESSION_VARS {
-        cmd.env_remove(var);
-    }
-    cmd
-}
-
-/// `<program> --version`, or why it cannot run.
-pub async fn cli_version(program: &str) -> std::result::Result<String, String> {
-    match agent_cmd(program)
-        .arg("--version")
-        .stdin(std::process::Stdio::null())
-        .output()
-        .await
-    {
-        Ok(o) if o.status.success() => Ok(String::from_utf8_lossy(&o.stdout).trim().into()),
-        Ok(o) => Err(format!(
-            "`{program} --version` failed: {}",
-            String::from_utf8_lossy(&o.stderr).trim()
-        )),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            Err(format!("`{program}` is not on PATH"))
-        }
-        Err(e) => Err(format!("cannot run `{program}`: {e}")),
-    }
-}
-
-/// Non-blocking exclusive OS lock on a session, held for the duration of the command so
-/// two agent-talk commands never write to one session at once (DESIGN.md §3): the file
-/// `~/.agent-talk/locks/<agent>-<id>`, opened with O_CLOEXEC so an agent child does
-/// not inherit it (a run that outlives the command is tracked by pid). `why` says what a
-/// second writer would break.
-pub fn lock(handle: &str, why: &str) -> Result<File> {
-    let io_err =
-        |what: &str, e: std::io::Error| Error::new(ErrorCode::Transport, format!("{what}: {e}"));
-    let dir = std::env::home_dir()
-        .unwrap_or_default()
-        .join(".agent-talk/locks");
-    std::fs::create_dir_all(&dir).map_err(|e| io_err("create lock dir", e))?;
-    let path = dir.join(handle.replacen(':', "-", 1));
-    let f = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&path)
-        .map_err(|e| io_err(&path.display().to_string(), e))?;
-    match f.try_lock() {
-        Ok(()) => Ok(f),
-        Err(TryLockError::WouldBlock) => Err(Error::new(
-            ErrorCode::Locked,
-            format!(
-                "another agent-talk command holds {handle} ({}); {why}",
-                path.display()
-            ),
-        )),
-        Err(TryLockError::Error(e)) => Err(io_err(&path.display().to_string(), e)),
-    }
-}
-
-/// The first non-blank line of `s`, trimmed and cut to `n` characters.
-pub fn first_line(s: &str, n: usize) -> String {
-    let line = s
-        .lines()
-        .find(|l| !l.trim().is_empty())
-        .unwrap_or("")
-        .trim();
-    if line.chars().count() > n {
-        format!("{}…", line.chars().take(n).collect::<String>())
-    } else {
-        line.to_string()
-    }
-}
-
-/// Feed each line of a child's run log (its stdout, redirected to `log`) to `on_line` as it
-/// is written, until the process exits (Claude and Antigravity runs).
-pub async fn tail(
-    child: &mut Child,
-    log: &Path,
-    mut on_line: impl FnMut(&str) -> Result<()>,
-) -> Result<ExitStatus> {
-    let file = tokio::fs::File::open(log)
-        .await
-        .map_err(|e| Error::new(ErrorCode::Transport, format!("{}: {e}", log.display())))?;
-    let mut reader = tokio::io::BufReader::new(file);
-    let mut buf = String::new();
-    let mut exited = None;
-    loop {
-        let n = reader
-            .read_line(&mut buf)
-            .await
-            .map_err(|e| Error::new(ErrorCode::Transport, format!("read run log: {e}")))?;
-        if n > 0 {
-            // A partial line is completed by the next read, unless the process is gone.
-            if buf.ends_with('\n') || exited.is_some() {
-                if !buf.trim().is_empty() {
-                    on_line(buf.trim())?;
-                }
-                buf.clear();
-            }
-            continue;
-        }
-        // End of what has been written so far.
-        if let Some(status) = exited {
-            if !buf.trim().is_empty() {
-                on_line(buf.trim())?;
-            }
-            return Ok(status);
-        }
-        match child
-            .try_wait()
-            .map_err(|e| Error::new(ErrorCode::Transport, format!("child process: {e}")))?
-        {
-            // Read once more: output written just before exit.
-            Some(status) => exited = Some(status),
-            None => tokio::time::sleep(Duration::from_millis(50)).await,
-        }
-    }
-}
-
-/// How agent-talk treats approval requests that reach it while it observes a turn
-/// (DESIGN.md §4). Every subscribed client receives them, and any answer resolves them for
-/// all.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ApprovalPolicy {
-    /// Never answer; record the request and report it as pending. Sessions agent-talk did
-    /// not start: the user answers in their own client.
-    Observe,
-    /// Decline, never accept: Codex answers `decline`, OpenCode `reject` with a message,
-    /// Claude gets `--permission-prompts none`, Grok `reject_once`; Antigravity has nothing
-    /// to answer. Sessions agent-talk started, where nobody else would answer.
-    Deny,
 }
 
 /// The adapters, dispatched by agent name.
@@ -407,27 +234,30 @@ impl Settings {
     }
 }
 
-pub struct StartRequest<'a> {
-    pub cwd: &'a str,
-    /// The caller's text, as recorded in the intent.
-    pub prompt: &'a str,
-    /// What reaches the agent: `prompt`, with a provenance header for agent senders.
-    pub delivered: &'a str,
-    /// Title the agent stores for the session (Codex `thread/name/set`, Claude `--name`,
-    /// OpenCode `title`, Grok `_x.ai/session/rename`; Antigravity has none and refuses it);
-    /// `ls` shows it as `name`.
-    pub name: Option<&'a str>,
-    pub settings: &'a Settings,
-    pub from: &'a Caller,
-    /// Hop depth of the first prompt (`Store::hop_depth`).
-    pub depth: u32,
-}
-
-pub struct SendRequest<'a> {
+/// A message on its way to a session: what the caller wrote and what reaches the agent.
+pub struct Outgoing<'a> {
     /// The caller's text, as recorded in the intent.
     pub text: &'a str,
     /// What reaches the agent: `text`, with a provenance header for agent senders.
     pub delivered: &'a str,
+    pub from: &'a Caller,
+    /// Hop depth of this message (`Store::hop_depth`).
+    pub depth: u32,
+}
+
+pub struct StartRequest<'a> {
+    pub cwd: &'a str,
+    /// The first prompt.
+    pub message: Outgoing<'a>,
+    /// Title the agent stores for the session (Codex `thread/name/set`, Claude `--name`,
+    /// OpenCode `title`, Grok `_x.ai/session/rename`, pi `--name`; Antigravity has none and
+    /// refuses it); `ls` shows it as `name`.
+    pub name: Option<&'a str>,
+    pub settings: &'a Settings,
+}
+
+pub struct SendRequest<'a> {
+    pub message: Outgoing<'a>,
     /// Into the running turn (`send --steer`) instead of queued after it.
     pub steer: bool,
     /// What this send changes; empty unless the session is one agent-talk started.
@@ -435,103 +265,6 @@ pub struct SendRequest<'a> {
     /// The session's settings, `change` included; `None` for a session agent-talk did not
     /// start, which runs as the agent has it.
     pub settings: Option<&'a Settings>,
-    pub from: &'a Caller,
-    /// Hop depth of this message (`Store::hop_depth`).
-    pub depth: u32,
-}
-
-/// What `read` returns: the newest `limit` messages, or the newest before the page a
-/// previous read's `next_cursor` names (DESIGN.md §5).
-pub struct ReadQuery {
-    pub limit: usize,
-    /// The cursor: an item id, or a `Boundary` for Codex and OpenCode.
-    pub before: Option<String>,
-    /// Every message; the default is prompts and final replies.
-    pub all: bool,
-}
-
-impl ReadQuery {
-    pub fn shows(&self, m: &Message) -> bool {
-        self.all || matches!(m.phase, "prompt" | "final")
-    }
-}
-
-pub struct ReadPage {
-    pub messages: Page<Message>,
-    /// The agent's raw records covering the same span (Codex turns, Claude and Antigravity
-    /// transcript lines, Grok `updates.jsonl` lines, OpenCode message rows), for `--raw`.
-    pub raw: Vec<Value>,
-}
-
-/// One page cut out of a history whose messages are tagged with the index of the record
-/// they came from, oldest first.
-pub struct Cut {
-    pub messages: Vec<(usize, Message)>,
-    /// The records the page spans: from the first kept message's record through the
-    /// cursor's record or the newest kept message's, whichever is later, else to the end.
-    pub records: std::ops::Range<usize>,
-    /// Shown messages exist before the page.
-    pub more: bool,
-}
-
-impl Cut {
-    /// The message the next page ends before, when there is a next page.
-    pub fn cursor_item(&self) -> Option<&(usize, Message)> {
-        self.more.then(|| self.messages.first()).flatten()
-    }
-}
-
-/// Cuts the page `q` asks for. `records` is the number of records the messages came from
-/// and `older` whether records exist before them (a remote history fetched newest first
-/// stops once the page is full).
-pub fn cut(
-    q: &ReadQuery,
-    messages: Vec<(usize, Message)>,
-    records: usize,
-    older: bool,
-) -> Result<Cut> {
-    let end = match &q.before {
-        Some(c) => messages
-            .iter()
-            .position(|(_, m)| m.item_id == *c)
-            .ok_or_else(|| Error::new(ErrorCode::Precondition, format!("unknown cursor {c}")))?,
-        None => messages.len(),
-    };
-    let cursor_record = messages.get(end).map_or(records, |(i, _)| *i);
-    let mut shown: Vec<_> = messages
-        .into_iter()
-        .take(end)
-        .filter(|(_, m)| q.shows(m))
-        .collect();
-    let page = shown.split_off(shown.len().saturating_sub(q.limit));
-    let start = page.first().map_or(cursor_record, |(i, _)| *i);
-    let end = page
-        .last()
-        .map_or(cursor_record, |(i, _)| cursor_record.max(i + 1));
-    Ok(Cut {
-        messages: page,
-        records: start..end,
-        more: older || !shown.is_empty(),
-    })
-}
-
-/// `read` cursor of a remote history: the item a page starts with and the agent's cursor
-/// that fetched the page holding it, so the next read refetches at most one extra page.
-#[derive(Serialize, serde::Deserialize)]
-pub struct Boundary {
-    pub item: String,
-    pub page: Option<String>,
-}
-
-impl Boundary {
-    pub fn parse(cursor: &str) -> Result<Boundary> {
-        serde_json::from_str(cursor)
-            .map_err(|_| Error::new(ErrorCode::Precondition, format!("invalid cursor {cursor}")))
-    }
-
-    pub fn encode(&self) -> String {
-        serde_json::to_string(self).unwrap()
-    }
 }
 
 /// One agent's entry in `status`: the installed version, the state of the shared process
@@ -593,243 +326,9 @@ pub trait Agent {
     async fn wait(&self, id: &str, target: &WaitTarget, deadline: Instant) -> Result<Outcome>;
 }
 
-// Receipt and approval lifecycle shared by every adapter. The semantics are agent-talk's
-// (DESIGN.md §4), not an agent's, so they live here and the adapters only supply agent plumbing.
-
-/// Deny on sessions agent-talk started, observe on the others.
-pub fn approval_policy(store: &Store, handle: &str) -> Result<ApprovalPolicy> {
-    Ok(if store.is_owned(handle)? {
-        ApprovalPolicy::Deny
-    } else {
-        ApprovalPolicy::Observe
-    })
-}
-
-/// The submission failed. An agent response is a definitive refusal: `rejected`. A lost
-/// outcome (connection lost, HTTP 5xx, undecodable reply, no response in time, Ctrl-C)
-/// is `unknown`, to be recovered with `wait --receipt`.
-pub fn reject(store: &Store, receipt_id: &str, e: Error) -> Error {
-    let state = match e.code {
-        ErrorCode::Transport | ErrorCode::Timeout | ErrorCode::Interrupted => ReceiptState::Unknown,
-        _ => ReceiptState::Rejected,
-    };
-    if let Err(store_err) = store.settle_unaccepted(receipt_id, state, e.agent_error.as_deref()) {
-        tracing::warn!("{store_err}");
-    }
-    e
-}
-
-pub fn record(store: &Store, a: &Approval) {
-    if let Err(e) = store.insert_approval(a) {
-        tracing::warn!("{e}");
-    }
-}
-
-/// Another client answered the request: pending approvals with this id are resolved.
-pub fn resolve(store: &Store, approvals: &mut [Approval], request_id: &Value) {
-    for a in approvals
-        .iter_mut()
-        .filter(|a| a.request_id == *request_id && a.outcome == "pending")
-    {
-        a.outcome = "resolved";
-        record(store, a);
-    }
-}
-
-/// The receipt a `wait --receipt` targets: known, on this handle, not rejected.
-pub fn wait_receipt(store: &Store, handle: &str, receipt_id: &str) -> Result<Receipt> {
-    let rec = store.receipt(receipt_id)?.ok_or_else(|| {
-        Error::new(
-            ErrorCode::Precondition,
-            format!("unknown receipt {receipt_id}"),
-        )
-    })?;
-    if rec.handle != handle {
-        return Err(Error::new(
-            ErrorCode::Precondition,
-            format!("receipt {receipt_id} belongs to {}", rec.handle),
-        ));
-    }
-    if rec.state == ReceiptState::Rejected {
-        let mut e = Error::new(ErrorCode::Precondition, "the intent was rejected");
-        e.agent_error = rec.agent_error.clone().map(Box::new);
-        e.receipt = Some(Box::new(rec));
-        return Err(e);
-    }
-    Ok(rec)
-}
-
-/// Settle an observed turn. The receipt is reloaded; when the outcome is unknown
-/// (deadline, Ctrl-C, transport loss) a still-pending receipt becomes `unknown` and the
-/// error reports `progress` (`waiting` while an approval is unanswered). Approvals seen
-/// during the observation travel with the outcome either way.
-pub fn settle(
-    store: &Store,
-    handle: String,
-    res: Result<Option<Turn>>,
-    receipt_id: Option<&str>,
-    approvals: Vec<Approval>,
-    progress: &'static str,
-) -> Result<Outcome> {
-    let unknown_outcome = matches!(
-        &res,
-        Err(e) if matches!(e.code, ErrorCode::Timeout | ErrorCode::Interrupted | ErrorCode::Transport)
-    );
-    if unknown_outcome && let Some(r) = receipt_id {
-        store.settle_unaccepted(r, ReceiptState::Unknown, None)?;
-    }
-    let receipt = match receipt_id {
-        Some(r) => store.receipt(r)?,
-        None => None,
-    };
-    match res {
-        Ok(turn) => Ok(Outcome {
-            handle,
-            receipt,
-            turn,
-            approvals,
-            from: None,
-        }),
-        Err(mut e) => {
-            e.receipt = e.receipt.or(receipt.map(Box::new));
-            if unknown_outcome {
-                e.state = Some(if approvals.iter().any(|a| a.outcome == "pending") {
-                    "waiting"
-                } else {
-                    progress
-                });
-            }
-            e.approvals = approvals;
-            Err(e)
-        }
-    }
-}
-
-/// Whether Ctrl-C and SIGTERM end observation. Once tokio listens for a signal, its default
-/// action never returns for the life of the process, so only the CLI, which exits after one
-/// operation, listens; `agent-talk mcp` keeps the default actions (DESIGN.md §4).
-static INTERRUPTIBLE: AtomicBool = AtomicBool::new(false);
-
-/// Let Ctrl-C and SIGTERM end observation in this process.
-pub fn interrupt_on_signals() {
-    INTERRUPTIBLE.store(true, Ordering::Relaxed);
-}
-
-/// Resolves on Ctrl-C or SIGTERM (Claude Code's Bash tool sends SIGTERM when it stops a
-/// background command); never when signals are not enabled for this process.
-async fn interrupted() {
-    if !INTERRUPTIBLE.load(Ordering::Relaxed) {
-        return std::future::pending().await;
-    }
-    let term = async {
-        match signal(SignalKind::terminate()) {
-            Ok(mut s) => {
-                s.recv().await;
-            }
-            Err(_) => std::future::pending().await,
-        }
-    };
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
-        _ = term => {}
-    }
-}
-
-/// Run `fut` until it finishes, the deadline passes, or Ctrl-C or SIGTERM arrives. Without a
-/// deadline only a signal ends it early.
-pub async fn bounded<T>(
-    deadline: Option<Instant>,
-    fut: impl Future<Output = Result<T>>,
-) -> Result<T> {
-    let until = async {
-        match deadline {
-            Some(d) => tokio::time::sleep_until(d).await,
-            None => std::future::pending().await,
-        }
-    };
-    tokio::select! {
-        r = fut => r,
-        _ = until => Err(Error::new(
-            ErrorCode::Timeout,
-            "deadline passed before the turn completed; outcome unknown, receipt retained",
-        )),
-        _ = interrupted() => Err(Error::new(
-            ErrorCode::Interrupted,
-            "interrupted; outcome unknown, receipt retained",
-        )),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{AgentError, Caller};
-    use crate::store::NewIntent;
-
-    fn tagged(items: &[(usize, &'static str, &'static str)]) -> Vec<(usize, Message)> {
-        items
-            .iter()
-            .map(|&(record, role, phase)| {
-                (
-                    record,
-                    Message {
-                        turn_id: String::new(),
-                        item_id: format!("{record}-{phase}"),
-                        role,
-                        phase,
-                        text: String::new(),
-                        from: None,
-                        timestamp: None,
-                    },
-                )
-            })
-            .collect()
-    }
-
-    /// Two turns, the second one a tool call between the prompt and the reply, over
-    /// five records; records 0 and 4 hold no message (a hidden marker at each end).
-    const HISTORY: &[(usize, &str, &str)] = &[
-        (1, "user", "prompt"),
-        (1, "assistant", "final"),
-        (2, "user", "prompt"),
-        (3, "assistant", "other"),
-        (3, "assistant", "final"),
-    ];
-
-    fn ids(c: &Cut) -> Vec<&str> {
-        c.messages.iter().map(|(_, m)| m.item_id.as_str()).collect()
-    }
-
-    #[test]
-    fn read_pages_newest_first_counting_shown_messages() {
-        let q = ReadQuery {
-            limit: 2,
-            before: None,
-            all: false,
-        };
-        // The newest two shown messages skip the tool call; the raw span runs to the end.
-        let c = cut(&q, tagged(HISTORY), 5, false).unwrap();
-        assert_eq!(ids(&c), ["2-prompt", "3-final"]);
-        assert_eq!((c.records.clone(), c.more), (2..5, true));
-        let older = ReadQuery {
-            before: Some("2-prompt".into()),
-            ..q
-        };
-        let c = cut(&older, tagged(HISTORY), 5, false).unwrap();
-        assert_eq!(ids(&c), ["1-prompt", "1-final"]);
-        assert_eq!((c.records.clone(), c.more), (1..2, false));
-        // With every message, a page can end inside a record, which the raw span then
-        // includes; a remote history that may hold older records reports more.
-        let all = ReadQuery {
-            limit: 2,
-            before: Some("3-final".into()),
-            all: true,
-        };
-        let c = cut(&all, tagged(HISTORY), 5, true).unwrap();
-        assert_eq!(ids(&c), ["2-prompt", "3-other"]);
-        assert_eq!((c.records.clone(), c.more), (2..4, true));
-        assert!(cut(&older, tagged(&HISTORY[3..]), 5, false).is_err());
-    }
 
     #[test]
     fn provenance_header_only_for_agents() {
@@ -851,55 +350,5 @@ mod tests {
             strip_provenance("[from the top] again"),
             "[from the top] again"
         );
-    }
-
-    fn pending(store: &Store, id: &str) {
-        store
-            .insert_intent(&NewIntent {
-                receipt_id: id,
-                handle: "codex:t",
-                client_msg_id: &format!("c-{id}"),
-                text: "x",
-                from: &Caller::UNKNOWN,
-                depth: 0,
-                delivered_text: None,
-            })
-            .unwrap();
-    }
-
-    fn state(store: &Store, id: &str) -> ReceiptState {
-        store.receipt(id).unwrap().unwrap().state
-    }
-
-    /// A lost outcome keeps the intent recoverable, only an agent refusal is final, and
-    /// neither overwrites an acceptance another command already recorded.
-    #[test]
-    fn submission_failures_settle_by_certainty() {
-        let s = Store::memory();
-        pending(&s, "lost");
-        reject(&s, "lost", Error::new(ErrorCode::Timeout, "no response"));
-        assert_eq!(state(&s, "lost"), ReceiptState::Unknown);
-        // Later proof of delivery (history, queue, inbox, run log).
-        s.accept("lost", None, Some("turn-1"), None).unwrap();
-        assert_eq!(state(&s, "lost"), ReceiptState::Accepted);
-
-        pending(&s, "refused");
-        let agent_error = AgentError {
-            code: -32600,
-            message: "stale turn".into(),
-            data: None,
-        };
-        reject(
-            &s,
-            "refused",
-            Error::from_agent(ErrorCode::Precondition, agent_error),
-        );
-        assert_eq!(state(&s, "refused"), ReceiptState::Rejected);
-
-        pending(&s, "raced");
-        s.accept("raced", Some("q1"), None, None).unwrap();
-        s.settle_unaccepted("raced", ReceiptState::Unknown, None)
-            .unwrap();
-        assert_eq!(state(&s, "raced"), ReceiptState::Accepted);
     }
 }

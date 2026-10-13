@@ -5,10 +5,14 @@ pub mod transport;
 
 use self::protocol::*;
 use self::transport::{Conn, Event, ServerRequest, decode};
-use super::{
-    Agent, AgentStatus, ApprovalPolicy, Boundary, Check, ListFilter, Operation, ReadPage,
-    ReadQuery, SendRequest, StartRequest, WaitTarget, approval_policy, bounded, cli_version, cut,
-    record, reject, resolve, settle, strip_provenance, wait_receipt,
+use crate::agents::child::cli_version;
+use crate::agents::history::{Boundary, ReadPage, ReadQuery, cut};
+use crate::agents::lifecycle::{
+    ApprovalPolicy, approval_policy, bounded, record, reject, resolve, settle, wait_receipt,
+};
+use crate::agents::{
+    Agent, AgentStatus, Check, ListFilter, Operation, SendRequest, StartRequest, WaitTarget,
+    strip_provenance,
 };
 use crate::model::{
     self, Approval, Error, ErrorCode, Message, Model, Observations, Outcome, Page, Result, Session,
@@ -736,17 +740,14 @@ impl Agent for Codex<'_> {
                 receipt_id: &receipt_id,
                 handle: &handle,
                 client_msg_id: &client_msg_id,
-                text: req.prompt,
-                delivered_text: (req.delivered != req.prompt).then_some(req.delivered),
-                from: req.from,
-                depth: req.depth,
+                message: &req.message,
             })?;
             let started: TurnStartResponse = conn
                 .call(
                     "turn/start",
                     json!({
                         "threadId": thread_id,
-                        "input": text_input(req.delivered),
+                        "input": text_input(req.message.delivered),
                         "clientUserMessageId": client_msg_id,
                         // thread/start takes no effort; this one applies to the thread's
                         // later turns too.
@@ -823,10 +824,7 @@ impl Agent for Codex<'_> {
                 receipt_id: &receipt_id,
                 handle: &handle,
                 client_msg_id: &client_msg_id,
-                text: req.text,
-                delivered_text: (req.delivered != req.text).then_some(req.delivered),
-                from: req.from,
-                depth: req.depth,
+                message: &req.message,
             })?;
             let target = target.insert(match expected_turn {
                 None if change => {
@@ -834,7 +832,7 @@ impl Agent for Codex<'_> {
                     // it unloads, so subscribe passes it again (DESIGN.md §6.1).
                     let mut params = json!({
                         "threadId": thread_id,
-                        "input": text_input(req.delivered),
+                        "input": text_input(req.message.delivered),
                         "clientUserMessageId": client_msg_id,
                     });
                     if let Some(m) = &req.change.model {
@@ -861,7 +859,7 @@ impl Agent for Codex<'_> {
                             json!({
                                 "threadId": thread_id,
                                 "clientUserMessageId": client_msg_id,
-                                "input": text_input(req.delivered),
+                                "input": text_input(req.message.delivered),
                             }),
                         )
                         .await
@@ -888,7 +886,7 @@ impl Agent for Codex<'_> {
                             json!({
                                 "threadId": thread_id,
                                 "expectedTurnId": expected,
-                                "input": text_input(req.delivered),
+                                "input": text_input(req.message.delivered),
                                 "clientUserMessageId": client_msg_id,
                             }),
                         )
@@ -983,11 +981,11 @@ impl Agent for Codex<'_> {
                     Some(t) => Target::Turn(t),
                     None => Target::Client {
                         client_id: rec.client_msg_id,
-                        receipt_id: r.clone(),
+                        receipt_id: rec.receipt_id.clone(),
                         queued: false,
                     },
                 };
-                (target, Some(r.clone()))
+                (target, Some(rec.receipt_id))
             }
         };
         let mut w = Watch::new(thread_id, approval_policy(self.store, &handle)?);

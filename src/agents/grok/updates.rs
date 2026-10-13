@@ -11,8 +11,8 @@
 //! prompt id where they carry one and by position otherwise, and the last
 //! `turn_completed` of a prompt id is its end.
 
-use crate::agents::first_line;
-use crate::model::{self, Message, Result};
+use crate::agents::history::first_line;
+use crate::model::{self, Error, Message, Result};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
@@ -41,7 +41,7 @@ pub fn load(path: &Path) -> Result<Vec<Line>> {
     match std::fs::read_to_string(path) {
         Ok(t) => Ok(parse(&t)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-        Err(e) => Err(super::io_err(&path.display().to_string(), e)),
+        Err(e) => Err(Error::transport(path.display(), e)),
     }
 }
 

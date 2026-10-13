@@ -1,10 +1,9 @@
 //! The `pi --mode json` child: command line, spawn into a run log, and what the run log
-//! (its stdout) says about the turn. Reading the log as it is written is `agents::tail`.
+//! (its stdout) says about the turn. Reading the log as it is written is `agents::child::tail`.
 
-use super::io_err;
 use super::session::{self, Body};
-use crate::agents::agent_cmd;
-use crate::model::{self, Result};
+use crate::agents::child::agent_cmd;
+use crate::model::{self, Error, Result};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::fs::File;
@@ -43,11 +42,11 @@ pub fn args(
 /// parsing away from the text.
 pub fn spawn(cwd: &str, args: &[String], log: &Path) -> Result<Child> {
     if let Some(dir) = log.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| io_err("create run dir", e))?;
+        std::fs::create_dir_all(dir).map_err(|e| Error::transport("create run dir", e))?;
     }
-    let out = File::create(log).map_err(|e| io_err(&log.display().to_string(), e))?;
+    let out = File::create(log).map_err(|e| Error::transport(log.display(), e))?;
     let err = File::create(log.with_extension("stderr"))
-        .map_err(|e| io_err(&log.display().to_string(), e))?;
+        .map_err(|e| Error::transport(log.display(), e))?;
     agent_cmd("pi")
         .args(args)
         .current_dir(cwd)
@@ -56,7 +55,7 @@ pub fn spawn(cwd: &str, args: &[String], log: &Path) -> Result<Child> {
         .stderr(err)
         .process_group(0)
         .spawn()
-        .map_err(|e| io_err("spawn pi", e))
+        .map_err(|e| Error::transport("spawn pi", e))
 }
 
 #[derive(Debug, Deserialize)]

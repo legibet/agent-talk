@@ -3,8 +3,8 @@
 //! are narrow: every field defaults when absent, unknown entry types, roles, content shapes
 //! and block types are tolerated, and content of an unknown shape never ends a turn.
 
-use super::io_err;
-use crate::agents::{first_line, strip_provenance};
+use crate::agents::history::first_line;
+use crate::agents::strip_provenance;
 use crate::model::{self, Caller, Error, ErrorCode, Message, Result};
 use serde::Deserialize;
 use serde::de::IgnoredAny;
@@ -155,7 +155,7 @@ pub struct Entry {
 }
 
 pub fn load(path: &Path) -> Result<Vec<Entry>> {
-    let text = std::fs::read_to_string(path).map_err(|e| io_err(&path.display().to_string(), e))?;
+    let text = std::fs::read_to_string(path).map_err(|e| Error::transport(path.display(), e))?;
     Ok(text
         .lines()
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())

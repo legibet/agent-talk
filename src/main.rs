@@ -4,13 +4,15 @@ mod model;
 mod ops;
 mod store;
 
-use agents::{ReadQuery, Settings, WaitTarget};
+use agents::history::ReadQuery;
+use agents::{Settings, WaitTarget};
 use clap::{Args, Parser, Subcommand};
 use model::{Approval, Caller, CallerKind, Outcome, Receipt, Turn};
 use ops::{
-    DEFAULT_TIMEOUT, LsArgs, Models, ModelsArgs, NewArgs, Output, Read, ReadArgs, Request,
-    SendArgs, Sessions, WaitArgs, caller_from_handle, env_var,
+    DEFAULT_TIMEOUT, LsArgs, Models, ModelsArgs, NewArgs, Read, ReadArgs, SendArgs, Sessions,
+    Status, WaitArgs, caller_from_handle, env_var,
 };
+use serde::Serialize;
 use serde_json::json;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -230,20 +232,13 @@ fn main() -> ExitCode {
             }
         };
     }
-    agents::interrupt_on_signals();
+    agents::lifecycle::interrupt_on_signals();
     let res = rt.block_on(async {
         let store = Store::open()?;
-        ops::run(&store, request(cli.cmd)?).await
+        run(&store, cli.cmd, json).await
     });
     match res {
-        Ok(out) => {
-            if json {
-                println!("{}", serde_json::to_string_pretty(&out).unwrap());
-            } else {
-                print_human(&out);
-            }
-            ExitCode::SUCCESS
-        }
+        Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             if json {
                 println!(
@@ -279,7 +274,7 @@ fn cli_caller(explicit: Option<&str>) -> model::Result<Caller> {
     {
         return caller_from_handle(&h);
     }
-    for (var, agent) in agents::SESSION_VARS {
+    for (var, agent) in agents::child::SESSION_VARS {
         if let Some(id) = env_var(var) {
             return Ok(Caller::agent(&format!("{agent}:{id}")));
         }
@@ -287,36 +282,43 @@ fn cli_caller(explicit: Option<&str>) -> model::Result<Caller> {
     Ok(Caller::UNKNOWN)
 }
 
-fn request(cmd: Cmd) -> model::Result<Request> {
-    Ok(match cmd {
-        Cmd::Status => Request::Status {
-            sender: cli_caller(None)?,
-        },
-        Cmd::Mcp { .. } => unreachable!("handled in main"),
+/// Run one command and print its result: `--json` as is, else the command's text.
+async fn run(store: &Store, cmd: Cmd, json: bool) -> model::Result<()> {
+    match cmd {
+        Cmd::Status => {
+            let out = ops::status(store, cli_caller(None)?).await;
+            print(json, &out, print_status);
+        }
         Cmd::Models {
             agent,
             query,
             limit,
             cursor,
-        } => Request::Models(ModelsArgs {
-            agent,
-            query,
-            limit,
-            cursor,
-        }),
+        } => {
+            let args = ModelsArgs {
+                agent,
+                query,
+                limit,
+                cursor,
+            };
+            print(json, &ops::models(store, args).await?, print_models);
+        }
         Cmd::Ls {
             agent,
             cwd,
             all,
             limit,
             cursor,
-        } => Request::Ls(LsArgs {
-            agent,
-            cwd,
-            all,
-            limit,
-            cursor,
-        }),
+        } => {
+            let args = LsArgs {
+                agent,
+                cwd,
+                all,
+                limit,
+                cursor,
+            };
+            print(json, &ops::ls(store, args).await?, print_sessions);
+        }
         Cmd::New {
             agent,
             prompt,
@@ -325,15 +327,18 @@ fn request(cmd: Cmd) -> model::Result<Request> {
             settings,
             wait,
             sender,
-        } => Request::New(NewArgs {
-            agent,
-            cwd,
-            prompt,
-            name,
-            settings: settings.settings(),
-            wait: wait.duration(),
-            from: cli_caller(sender.from.as_deref())?,
-        }),
+        } => {
+            let args = NewArgs {
+                agent,
+                cwd,
+                prompt,
+                name,
+                settings: settings.settings(),
+                wait: wait.duration(),
+                from: cli_caller(sender.from.as_deref())?,
+            };
+            print(json, &ops::new(store, args).await?, print_outcome);
+        }
         Cmd::Send {
             handle,
             text,
@@ -341,44 +346,63 @@ fn request(cmd: Cmd) -> model::Result<Request> {
             settings,
             wait,
             sender,
-        } => Request::Send(SendArgs {
-            handle,
-            text,
-            steer,
-            settings: settings.settings(),
-            wait: wait.duration(),
-            from: cli_caller(sender.from.as_deref())?,
-        }),
+        } => {
+            let args = SendArgs {
+                handle,
+                text,
+                steer,
+                settings: settings.settings(),
+                wait: wait.duration(),
+                from: cli_caller(sender.from.as_deref())?,
+            };
+            print(json, &ops::send(store, args).await?, print_outcome);
+        }
         Cmd::Read {
             handle,
             limit,
             cursor,
             all,
             raw,
-        } => Request::Read(ReadArgs {
-            handle,
-            query: ReadQuery {
-                limit,
-                before: cursor,
-                all,
-            },
-            raw,
-        }),
+        } => {
+            let args = ReadArgs {
+                handle,
+                query: ReadQuery {
+                    limit,
+                    before: cursor,
+                    all,
+                },
+                raw,
+            };
+            print(json, &ops::read(store, args).await?, print_read);
+        }
         Cmd::Wait {
             handle,
             turn,
             receipt,
             timeout,
-        } => Request::Wait(WaitArgs {
-            handle,
-            target: match (turn, receipt) {
-                (Some(t), _) => WaitTarget::Turn(t),
-                (None, Some(r)) => WaitTarget::Receipt(r),
-                (None, None) => unreachable!("clap requires --turn or --receipt"),
-            },
-            timeout: Duration::from_secs(timeout),
-        }),
-    })
+        } => {
+            let args = WaitArgs {
+                handle,
+                target: match (turn, receipt) {
+                    (Some(t), _) => WaitTarget::Turn(t),
+                    (None, Some(r)) => WaitTarget::Receipt(r),
+                    (None, None) => unreachable!("clap requires --turn or --receipt"),
+                },
+                timeout: Duration::from_secs(timeout),
+            };
+            print(json, &ops::wait(store, args).await?, print_outcome);
+        }
+        Cmd::Mcp { .. } => unreachable!("handled in main"),
+    }
+    Ok(())
+}
+
+fn print<T: Serialize>(json: bool, out: &T, human: fn(&T)) {
+    if json {
+        println!("{}", serde_json::to_string_pretty(out).unwrap());
+    } else {
+        human(out);
+    }
 }
 
 fn or_dash(v: Option<&str>) -> &str {
@@ -399,112 +423,66 @@ fn approval_line(a: &Approval) -> String {
     format!("approval {}: {} ({})", a.outcome, a.summary, a.kind)
 }
 
-fn print_human(out: &Output) {
-    match out {
-        Output::Status { agents, sender } => {
-            for p in agents {
-                println!(
-                    "{:<12} {}",
-                    p.agent,
-                    p.version.as_deref().unwrap_or("version unknown")
-                );
-                if let Some(shared) = &p.shared {
-                    println!("{:<12} {shared}", "");
-                }
-                let available: Vec<&str> = p
-                    .operations
-                    .iter()
-                    .filter(|o| o.available)
-                    .map(|o| o.name)
-                    .collect();
-                if !available.is_empty() {
-                    println!("{:<12} available: {}", "", available.join(" "));
-                }
-                // Operations blocked for the same reason share one line.
-                let mut blocked: Vec<(&str, Vec<&str>)> = Vec::new();
-                for o in p.operations.iter().filter(|o| !o.available) {
-                    let reason = o.reason.as_deref().unwrap_or("unavailable");
-                    match blocked.iter_mut().find(|(r, _)| *r == reason) {
-                        Some((_, names)) => names.push(o.name),
-                        None => blocked.push((reason, vec![o.name])),
-                    }
-                }
-                for (reason, names) in blocked {
-                    println!("{:<12} {}: {reason}", "", names.join(", "));
-                }
-            }
-            println!(
-                "{:<12} {}",
-                "sender",
-                sender.session.as_deref().unwrap_or("unknown")
-            );
+fn print_status(Status { agents, sender }: &Status) {
+    for p in agents {
+        println!(
+            "{:<12} {}",
+            p.agent,
+            p.version.as_deref().unwrap_or("version unknown")
+        );
+        if let Some(shared) = &p.shared {
+            println!("{:<12} {shared}", "");
         }
-        Output::Models(Models {
-            models,
-            next_cursor,
-        }) => {
-            for m in models {
-                println!("{:<48} {}", m.id, m.efforts.join(" "));
-            }
-            if let Some(c) = next_cursor {
-                println!("next cursor: {c}");
+        let available: Vec<&str> = p
+            .operations
+            .iter()
+            .filter(|o| o.available)
+            .map(|o| o.name)
+            .collect();
+        if !available.is_empty() {
+            println!("{:<12} available: {}", "", available.join(" "));
+        }
+        // Operations blocked for the same reason share one line.
+        let mut blocked: Vec<(&str, Vec<&str>)> = Vec::new();
+        for o in p.operations.iter().filter(|o| !o.available) {
+            let reason = o.reason.as_deref().unwrap_or("unavailable");
+            match blocked.iter_mut().find(|(r, _)| *r == reason) {
+                Some((_, names)) => names.push(o.name),
+                None => blocked.push((reason, vec![o.name])),
             }
         }
-        Output::Sessions(Sessions {
-            sessions,
-            next_cursors,
-            errors,
-        }) => {
-            print_sessions(sessions);
-            for (p, c) in next_cursors {
-                if let Some(c) = c {
-                    println!("next cursor ({p}): {c}");
-                }
-            }
-            for e in errors {
-                println!("{}: {}", e.agent, e.error.message);
-            }
+        for (reason, names) in blocked {
+            println!("{:<12} {}: {reason}", "", names.join(", "));
         }
-        Output::Read(Read {
-            messages,
-            raw,
-            next_cursor,
-            ..
-        }) => {
-            for m in messages.iter().flatten() {
-                let time = m
-                    .timestamp
-                    .as_deref()
-                    .and_then(|t| t.parse::<jiff::Timestamp>().ok())
-                    .map(|t| {
-                        t.to_zoned(jiff::tz::TimeZone::system())
-                            .strftime("%H:%M:%S ")
-                            .to_string()
-                    })
-                    .unwrap_or_default();
-                let label = match (m.role, m.from.as_ref()) {
-                    ("user", Some(from)) => match (from.kind, &from.session) {
-                        (CallerKind::Runtime, _) => "user runtime".to_string(),
-                        (CallerKind::Agent, Some(h)) => format!("user from {h}"),
-                        _ => "user".to_string(),
-                    },
-                    ("user", None) => "user".to_string(),
-                    (role, _) => format!("{role} {}", m.phase),
-                };
-                println!("{time}[{label}] {}", m.text);
-            }
-            if let Some(rows) = raw {
-                println!("{}", serde_json::to_string_pretty(rows).unwrap());
-            }
-            if let Some(c) = next_cursor {
-                println!("next cursor: {c}");
-            }
-        }
-        Output::Outcome(o) => print_outcome(o),
+    }
+    println!(
+        "{:<12} {}",
+        "sender",
+        sender.session.as_deref().unwrap_or("unknown")
+    );
+}
+
+fn print_models(
+    Models {
+        models,
+        next_cursor,
+    }: &Models,
+) {
+    for m in models {
+        println!("{:<48} {}", m.id, m.efforts.join(" "));
+    }
+    if let Some(c) = next_cursor {
+        println!("next cursor: {c}");
     }
 }
 
-fn print_sessions(sessions: &[model::Session]) {
+fn print_sessions(
+    Sessions {
+        sessions,
+        next_cursors,
+        errors,
+    }: &Sessions,
+) {
     for x in sessions {
         let label = x
             .name
@@ -523,6 +501,52 @@ fn print_sessions(sessions: &[model::Session]) {
             or_dash(x.cwd.as_deref()),
             label.chars().take(60).collect::<String>()
         );
+    }
+    for (p, c) in next_cursors {
+        if let Some(c) = c {
+            println!("next cursor ({p}): {c}");
+        }
+    }
+    for e in errors {
+        println!("{}: {}", e.agent, e.error.message);
+    }
+}
+
+fn print_read(
+    Read {
+        messages,
+        raw,
+        next_cursor,
+        ..
+    }: &Read,
+) {
+    for m in messages.iter().flatten() {
+        let time = m
+            .timestamp
+            .as_deref()
+            .and_then(|t| t.parse::<jiff::Timestamp>().ok())
+            .map(|t| {
+                t.to_zoned(jiff::tz::TimeZone::system())
+                    .strftime("%H:%M:%S ")
+                    .to_string()
+            })
+            .unwrap_or_default();
+        let label = match (m.role, m.from.as_ref()) {
+            ("user", Some(from)) => match (from.kind, &from.session) {
+                (CallerKind::Runtime, _) => "user runtime".to_string(),
+                (CallerKind::Agent, Some(h)) => format!("user from {h}"),
+                _ => "user".to_string(),
+            },
+            ("user", None) => "user".to_string(),
+            (role, _) => format!("{role} {}", m.phase),
+        };
+        println!("{time}[{label}] {}", m.text);
+    }
+    if let Some(rows) = raw {
+        println!("{}", serde_json::to_string_pretty(rows).unwrap());
+    }
+    if let Some(c) = next_cursor {
+        println!("next cursor: {c}");
     }
 }
 

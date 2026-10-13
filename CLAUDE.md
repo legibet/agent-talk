@@ -47,7 +47,7 @@ in `tests/live.py`. Add a test only when it would catch a real regression. Pytho
 
 ## Conventions
 
-- Receipt and approval semantics live once in `src/agents/mod.rs`; each adapter keeps its own
+- Receipt and approval semantics live once in `src/agents/lifecycle.rs`; each adapter keeps its own
   observe loop (DESIGN.md §3, §7).
 - File records and events are decoded into small structs where that reads better than
   `Value` indexing: optional fields default, unknown variants are tolerated, the raw record is

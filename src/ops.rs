@@ -1,8 +1,9 @@
 //! The operations behind both front-ends (CLI and MCP): handle parsing, sender
 //! provenance header, hop limit, agent dispatch, typed output.
 
+use crate::agents::history::ReadQuery;
 use crate::agents::{
-    Adapter, Agent, AgentStatus, ListFilter, ReadQuery, SendRequest, Settings, StartRequest,
+    Adapter, Agent, AgentStatus, ListFilter, Outgoing, SendRequest, Settings, StartRequest,
     WaitTarget, delivered,
 };
 use crate::model::{
@@ -24,19 +25,6 @@ pub const MAX_HOPS: u32 = 3;
 pub const LS_LIMIT: u32 = 25;
 pub const READ_LIMIT: usize = 20;
 pub const MODELS_LIMIT: usize = 50;
-
-pub enum Request {
-    /// `sender` is who this shell's `new` and `send` would be attributed to.
-    Status {
-        sender: Caller,
-    },
-    Models(ModelsArgs),
-    Ls(LsArgs),
-    New(NewArgs),
-    Send(SendArgs),
-    Read(ReadArgs),
-    Wait(WaitArgs),
-}
 
 pub struct ModelsArgs {
     pub agent: String,
@@ -96,18 +84,12 @@ pub struct WaitArgs {
     pub timeout: Duration,
 }
 
-/// What a request produces; `--json` prints it as is.
+/// Result of `status`: each agent's entry and who this shell's `new` and `send` would be
+/// attributed to.
 #[derive(Serialize)]
-#[serde(untagged)]
-pub enum Output {
-    Status {
-        agents: Vec<AgentStatus>,
-        sender: Caller,
-    },
-    Models(Models),
-    Sessions(Sessions),
-    Read(Read),
-    Outcome(Box<Outcome>),
+pub struct Status {
+    pub agents: Vec<AgentStatus>,
+    pub sender: Caller,
 }
 
 /// Result of `models`: one page of an agent's models, sorted by id.
@@ -149,26 +131,18 @@ pub struct Read {
     pub raw: Option<Vec<Value>>,
 }
 
-pub async fn run(store: &Store, req: Request) -> Result<Output> {
-    match req {
-        Request::Status { sender } => {
-            let adapters = Adapter::all(store);
-            let agents = join_all(adapters.iter().map(|p| p.status())).await;
-            Ok(Output::Status { agents, sender })
-        }
-        Request::Models(a) => {
-            let all = Adapter::named(store, &a.agent)?.models().await?;
-            Ok(Output::Models(page_models(all, &a)?))
-        }
-        Request::Ls(a) => ls(store, a).await,
-        Request::New(a) => new(store, a).await,
-        Request::Send(a) => send(store, a).await,
-        Request::Read(a) => read(store, a).await,
-        Request::Wait(a) => wait(store, a).await,
-    }
+pub async fn status(store: &Store, sender: Caller) -> Status {
+    let adapters = Adapter::all(store);
+    let agents = join_all(adapters.iter().map(|p| p.status())).await;
+    Status { agents, sender }
 }
 
-async fn ls(store: &Store, a: LsArgs) -> Result<Output> {
+pub async fn models(store: &Store, a: ModelsArgs) -> Result<Models> {
+    let all = Adapter::named(store, &a.agent)?.models().await?;
+    page_models(all, &a)
+}
+
+pub async fn ls(store: &Store, a: LsArgs) -> Result<Sessions> {
     let cwd = a.cwd.as_deref().map(absolute).transpose()?;
     let filter = ListFilter {
         cwd: cwd.as_deref(),
@@ -177,11 +151,11 @@ async fn ls(store: &Store, a: LsArgs) -> Result<Output> {
     if let Some(name) = &a.agent {
         let agent = Adapter::named(store, name)?;
         let page = agent.list(&filter, a.limit, a.cursor.as_deref()).await?;
-        return Ok(Output::Sessions(Sessions {
+        return Ok(Sessions {
             sessions: page.items,
             next_cursors: BTreeMap::from([(agent.name(), page.next_cursor)]),
             errors: Vec::new(),
-        }));
+        });
     }
     if a.cursor.is_some() {
         return Err(Error::new(
@@ -206,32 +180,34 @@ async fn ls(store: &Store, a: LsArgs) -> Result<Output> {
             }),
         }
     }
-    Ok(Output::Sessions(Sessions {
+    Ok(Sessions {
         sessions,
         next_cursors,
         errors,
-    }))
+    })
 }
 
-async fn new(store: &Store, a: NewArgs) -> Result<Output> {
+pub async fn new(store: &Store, a: NewArgs) -> Result<Outcome> {
     let agent = Adapter::named(store, &a.agent)?;
     let cwd = absolute(&a.cwd)?;
     let delivered = delivered(&a.from, &a.prompt);
     let req = StartRequest {
         cwd: &cwd,
-        prompt: &a.prompt,
-        delivered: &delivered,
+        message: Outgoing {
+            text: &a.prompt,
+            delivered: &delivered,
+            from: &a.from,
+            depth: hop_depth(store, &a.from)?,
+        },
         name: a.name.as_deref(),
         settings: &a.settings,
-        depth: hop_depth(store, &a.from)?,
-        from: &a.from,
     };
     let mut o = agent.start(&req, a.wait.map(deadline)).await?;
     o.from = Some(a.from);
-    Ok(Output::Outcome(Box::new(o)))
+    Ok(o)
 }
 
-async fn send(store: &Store, a: SendArgs) -> Result<Output> {
+pub async fn send(store: &Store, a: SendArgs) -> Result<Outcome> {
     let (name, id) = split_handle(&a.handle)?;
     let agent = Adapter::named(store, name)?;
     // Settings change only on sessions agent-talk started, and for a turn of their own
@@ -262,13 +238,15 @@ async fn send(store: &Store, a: SendArgs) -> Result<Output> {
     }
     let delivered = delivered(&a.from, &a.text);
     let req = SendRequest {
-        text: &a.text,
-        delivered: &delivered,
+        message: Outgoing {
+            text: &a.text,
+            delivered: &delivered,
+            from: &a.from,
+            depth: hop_depth(store, &a.from)?,
+        },
         steer: a.steer,
         change: &change,
         settings: settings.as_ref(),
-        depth: hop_depth(store, &a.from)?,
-        from: &a.from,
     };
     let res = agent.send(id, &req, a.wait.map(deadline)).await;
     if let (Err(e), Some(c)) = (&res, &current)
@@ -281,26 +259,25 @@ async fn send(store: &Store, a: SendArgs) -> Result<Output> {
     }
     let mut o = res?;
     o.from = Some(a.from);
-    Ok(Output::Outcome(Box::new(o)))
+    Ok(o)
 }
 
-async fn read(store: &Store, a: ReadArgs) -> Result<Output> {
+pub async fn read(store: &Store, a: ReadArgs) -> Result<Read> {
     let (name, id) = split_handle(&a.handle)?;
     let page = Adapter::named(store, name)?.read(id, &a.query).await?;
-    Ok(Output::Read(Read {
+    Ok(Read {
         handle: a.handle,
         next_cursor: page.messages.next_cursor,
         messages: (!a.raw).then_some(page.messages.items),
         raw: a.raw.then_some(page.raw),
-    }))
+    })
 }
 
-async fn wait(store: &Store, a: WaitArgs) -> Result<Output> {
+pub async fn wait(store: &Store, a: WaitArgs) -> Result<Outcome> {
     let (name, id) = split_handle(&a.handle)?;
-    let o = Adapter::named(store, name)?
+    Adapter::named(store, name)?
         .wait(id, &a.target, deadline(a.timeout))
-        .await?;
-    Ok(Output::Outcome(Box::new(o)))
+        .await
 }
 
 /// The page of `all` after the cursor, among the models matching the query, sorted by id.
@@ -431,10 +408,12 @@ mod tests {
                     receipt_id: id,
                     handle: "codex:t1",
                     client_msg_id: id,
-                    text: "x",
-                    from: &Caller::UNKNOWN,
-                    depth,
-                    delivered_text: None,
+                    message: &Outgoing {
+                        text: "x",
+                        delivered: "x",
+                        from: &Caller::UNKNOWN,
+                        depth,
+                    },
                 })
                 .unwrap()
         };

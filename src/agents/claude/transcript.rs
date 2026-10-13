@@ -2,9 +2,9 @@
 //! live branch, turn boundaries and normalized messages. Pure; the records are narrow and
 //! unknown fields, line types and block types are tolerated.
 
-use super::io_err;
-use crate::agents::{first_line, strip_provenance};
-use crate::model::{self, Caller, Message, Result};
+use crate::agents::history::first_line;
+use crate::agents::strip_provenance;
+use crate::model::{self, Caller, Error, Message, Result};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -229,7 +229,7 @@ fn parse_entries(text: &str) -> Vec<Entry> {
 }
 
 pub fn load(path: &Path) -> Result<Vec<Entry>> {
-    let text = std::fs::read_to_string(path).map_err(|e| io_err(&path.display().to_string(), e))?;
+    let text = std::fs::read_to_string(path).map_err(|e| Error::transport(path.display(), e))?;
     Ok(parse_entries(&text))
 }
 

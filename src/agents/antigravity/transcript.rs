@@ -2,9 +2,9 @@
 //! decoding, turn boundaries and normalized messages. Pure apart from reading the file;
 //! the records are narrow and unknown fields and step types are tolerated.
 
-use super::io_err;
-use crate::agents::{first_line, strip_provenance};
-use crate::model::{Caller, Message, Result};
+use crate::agents::history::first_line;
+use crate::agents::strip_provenance;
+use crate::model::{Caller, Error, Message, Result};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::{HashSet, VecDeque};
@@ -94,7 +94,7 @@ pub fn load(path: &Path) -> Result<Vec<Entry>> {
     match std::fs::read_to_string(path) {
         Ok(text) => Ok(parse_entries(&text)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-        Err(e) => Err(io_err(&path.display().to_string(), e)),
+        Err(e) => Err(Error::transport(path.display(), e)),
     }
 }
 

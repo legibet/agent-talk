@@ -66,6 +66,12 @@ impl ErrorCode {
         }
     }
 
+    /// The outcome of a submission is unknown: the deadline passed, Ctrl-C or SIGTERM
+    /// ended observation, or the transport was lost (DESIGN.md §4).
+    pub fn is_unknown_outcome(self) -> bool {
+        matches!(self, Self::Timeout | Self::Interrupted | Self::Transport)
+    }
+
     /// 2 refused, 3 unknown outcome, 4 transport failure.
     pub fn exit_code(self) -> u8 {
         match self {
@@ -139,11 +145,16 @@ impl Error {
             ..Self::new(code, "")
         }
     }
+
+    /// A local I/O or transport failure: `<what>: <e>`.
+    pub fn transport(what: impl fmt::Display, e: impl fmt::Display) -> Self {
+        Self::new(ErrorCode::Transport, format!("{what}: {e}"))
+    }
 }
 
 impl From<rusqlite::Error> for Error {
     fn from(e: rusqlite::Error) -> Self {
-        Error::new(ErrorCode::Transport, format!("store: {e}"))
+        Error::transport("store", e)
     }
 }
 

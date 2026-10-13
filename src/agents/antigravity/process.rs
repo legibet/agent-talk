@@ -1,9 +1,8 @@
 //! The `agy` CLI as a child process: command line, spawn, the run's start-up, and what a
 //! run that never took the message reports.
 
-use super::io_err;
 use super::stream::Run;
-use crate::agents::agent_cmd;
+use crate::agents::child::agent_cmd;
 use crate::model::{AgentError, Error, ErrorCode, Result};
 use std::fs::File;
 use std::path::Path;
@@ -49,10 +48,10 @@ pub fn args(
 /// group so that Ctrl-C on agent-talk stops observing, not the turn.
 pub fn spawn(cwd: &str, args: &[String], log: &Path) -> Result<Child> {
     let runs = log.parent().expect("run log has a directory");
-    std::fs::create_dir_all(runs).map_err(|e| io_err("create run dir", e))?;
-    let out = File::create(log).map_err(|e| io_err(&log.display().to_string(), e))?;
+    std::fs::create_dir_all(runs).map_err(|e| Error::transport("create run dir", e))?;
+    let out = File::create(log).map_err(|e| Error::transport(log.display(), e))?;
     let err = File::create(log.with_extension("stderr"))
-        .map_err(|e| io_err(&log.display().to_string(), e))?;
+        .map_err(|e| Error::transport(log.display(), e))?;
     agent_cmd("agy")
         .args(args)
         .current_dir(cwd)
@@ -61,7 +60,7 @@ pub fn spawn(cwd: &str, args: &[String], log: &Path) -> Result<Child> {
         .stderr(err)
         .process_group(0)
         .spawn()
-        .map_err(|e| io_err("spawn agy", e))
+        .map_err(|e| Error::transport("spawn agy", e))
 }
 
 /// Why a run ended without taking the message: the `result` error or stderr.
@@ -86,7 +85,9 @@ pub fn agent_error(log: &Path, run: &Run, status: Option<i32>) -> AgentError {
 /// emits it at startup, before it reads stdin.
 pub async fn wait_init(child: &mut Child, log: &Path) -> Result<String> {
     loop {
-        let exited = child.try_wait().map_err(|e| io_err("agy process", e))?;
+        let exited = child
+            .try_wait()
+            .map_err(|e| Error::transport("agy process", e))?;
         let run = Run::from_log(log);
         if let Some(id) = run.conversation_id {
             return Ok(id);

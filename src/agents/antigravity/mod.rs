@@ -26,10 +26,11 @@ use self::stream::{Event, Run, decode, denials, result_turn};
 use self::transcript::{
     ends_with_reply, load, messages, preview, span_reply, turn_span, user_input,
 };
-use super::{
-    Agent, AgentStatus, Check, ListFilter, Operation, ReadPage, ReadQuery, SendRequest,
-    StartRequest, WaitTarget, agent_cmd, bounded, cli_version, cut, lock, pid_alive, record,
-    settle, tail, wait_receipt,
+use crate::agents::child::{agent_cmd, cli_version, lock, pid_alive, tail};
+use crate::agents::history::{ReadPage, ReadQuery, cut};
+use crate::agents::lifecycle::{bounded, record, settle, wait_receipt};
+use crate::agents::{
+    Agent, AgentStatus, Check, ListFilter, Operation, SendRequest, StartRequest, WaitTarget,
 };
 use crate::model::{
     self, Approval, Error, ErrorCode, Model, Observations, Outcome, Page, ReceiptState, Result,
@@ -71,10 +72,6 @@ fn check_id(id: &str) -> Result<()> {
             format!("invalid Antigravity conversation id {id}; expected a UUID"),
         )
     })
-}
-
-fn io_err(what: &str, e: impl std::fmt::Display) -> Error {
-    Error::new(ErrorCode::Transport, format!("{what}: {e}"))
 }
 
 /// What this command observes of the `agy -p` run it started.
@@ -274,13 +271,13 @@ impl<'a> Antigravity<'a> {
         let f = match File::open(&path) {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(e) => return Err(io_err(&path.display().to_string(), e)),
+            Err(e) => return Err(Error::transport(path.display(), e)),
         };
         // Released when `f` is dropped.
         match f.try_lock() {
             Ok(()) => Ok(false),
             Err(TryLockError::WouldBlock) => Ok(true),
-            Err(TryLockError::Error(e)) => Err(io_err(&path.display().to_string(), e)),
+            Err(TryLockError::Error(e)) => Err(Error::transport(path.display(), e)),
         }
     }
 
@@ -384,12 +381,12 @@ impl<'a> Antigravity<'a> {
             stdin
                 .write_all(format!("{line}\n").as_bytes())
                 .await
-                .map_err(|e| io_err("write the message to agy", e))?;
+                .map_err(|e| Error::transport("write the message to agy", e))?;
             // Closing stdin makes agy exit after this turn's result.
             stdin
                 .shutdown()
                 .await
-                .map_err(|e| io_err("close agy stdin", e))?;
+                .map_err(|e| Error::transport("close agy stdin", e))?;
             drop(stdin);
             let status = tail(&mut child, &log, |l| watch.on_event(self.store, l)).await?;
             let (turn, denied) =
@@ -491,12 +488,7 @@ impl Agent for Antigravity<'_> {
             .stdin(std::process::Stdio::null())
             .output()
             .await
-            .map_err(|e| {
-                Error::new(
-                    ErrorCode::Transport,
-                    format!("cannot run `agy models`: {e}"),
-                )
-            })?;
+            .map_err(|e| Error::transport("cannot run `agy models`", e))?;
         if !out.status.success() {
             return Err(Error::new(
                 ErrorCode::Transport,
@@ -676,17 +668,14 @@ impl Agent for Antigravity<'_> {
             handle: &h,
             // No client message id reaches agy; the receipt id stands in.
             client_msg_id: &receipt_id,
-            text: req.prompt,
-            delivered_text: (req.delivered != req.prompt).then_some(req.delivered),
-            from: req.from,
-            depth: req.depth,
+            message: &req.message,
         })?;
         let watch = RunWatch {
             id,
             receipt_id,
             run: Run::default(),
         };
-        self.execute(child, log, watch, req.delivered, deadline)
+        self.execute(child, log, watch, req.message.delivered, deadline)
             .await
     }
 
@@ -741,10 +730,7 @@ impl Agent for Antigravity<'_> {
             receipt_id: &receipt_id,
             handle: &h,
             client_msg_id: &receipt_id,
-            text: req.text,
-            delivered_text: (req.delivered != req.text).then_some(req.delivered),
-            from: req.from,
-            depth: req.depth,
+            message: &req.message,
         })?;
         let log = self.log_path(&receipt_id);
         let child = match spawn(&cwd, &args, &log) {
@@ -760,7 +746,7 @@ impl Agent for Antigravity<'_> {
             receipt_id,
             run: Run::default(),
         };
-        self.execute(child, log, watch, req.delivered, deadline)
+        self.execute(child, log, watch, req.message.delivered, deadline)
             .await
     }
 

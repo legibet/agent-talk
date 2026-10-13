@@ -2,7 +2,7 @@
 //! request timeouts, HTTP status to error code, and the `/api/event` frames.
 
 use super::{take_data, text};
-use crate::agents::pid_alive;
+use crate::agents::child::pid_alive;
 use crate::model::{AgentError, Error, ErrorCode, Result};
 use futures_util::StreamExt;
 use serde::Deserialize;
@@ -102,19 +102,15 @@ impl Service {
         let body = resp
             .text()
             .await
-            .map_err(|e| Error::new(ErrorCode::Transport, format!("opencode service: {e}")))?;
+            .map_err(|e| Error::transport("opencode service", e))?;
         if !status.is_success() {
             return Err(http_error(status, &body));
         }
         if body.trim().is_empty() {
             return Ok(Value::Null);
         }
-        serde_json::from_str(&body).map_err(|e| {
-            Error::new(
-                ErrorCode::Transport,
-                format!("opencode service: invalid JSON in response: {e}"),
-            )
-        })
+        serde_json::from_str(&body)
+            .map_err(|e| Error::transport("opencode service: invalid JSON in response", e))
     }
 
     /// One page of a session's history, newest first: the first page by `order=desc`,
@@ -174,7 +170,7 @@ impl Service {
             .timeout(Duration::from_secs(60 * 60 * 24))
             .send()
             .await
-            .map_err(|e| Error::new(ErrorCode::Transport, format!("opencode events: {e}")))?;
+            .map_err(|e| Error::transport("opencode events", e))?;
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
@@ -214,10 +210,7 @@ impl Events {
             match self.body.next().await {
                 Some(Ok(chunk)) => self.buf.extend_from_slice(&chunk),
                 Some(Err(e)) => {
-                    return Err(Error::new(
-                        ErrorCode::Transport,
-                        format!("opencode events: {e}"),
-                    ));
+                    return Err(Error::transport("opencode events", e));
                 }
                 None => return Ok(None),
             }

@@ -7,7 +7,7 @@
 //! server-to-client requests such as `session/request_permission` (their ids overlap
 //! with ours). The reader never answers server requests; the adapter decides.
 
-use crate::agents::agent_cmd;
+use crate::agents::child::agent_cmd;
 use crate::model::{AgentError, Error, ErrorCode, Result};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -117,7 +117,7 @@ pub async fn spawn(cwd: &str, s: &Spawn<'_>) -> Result<Conn> {
         .process_group(0)
         .kill_on_drop(true)
         .spawn()
-        .map_err(|e| Error::new(ErrorCode::Transport, format!("spawn grok: {e}")))?;
+        .map_err(|e| Error::transport("spawn grok", e))?;
     let stdout = child.stdout.take().expect("stdout is piped");
     let mut err_pipe = child.stderr.take().expect("stderr is piped");
     let stderr = Arc::new(Mutex::new(String::new()));
@@ -270,7 +270,7 @@ impl Conn {
         line.push('\n');
         w.write_all(line.as_bytes())
             .await
-            .map_err(|e| Error::new(ErrorCode::Transport, format!("write to grok agent: {e}")))
+            .map_err(|e| Error::transport("write to grok agent", e))
     }
 
     fn closed(&self, reason: &str) -> Error {

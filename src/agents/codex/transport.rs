@@ -99,11 +99,11 @@ pub async fn connect(socket: &Path) -> Result<Conn> {
         .map_err(|e| match e.kind() {
             std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound => no_daemon(),
             std::io::ErrorKind::PermissionDenied => sandboxed(e),
-            _ => Error::new(ErrorCode::Transport, format!("connect: {e}")),
+            _ => Error::transport("connect", e),
         })?;
     let (ws, _) = client_async("ws://localhost/", stream)
         .await
-        .map_err(|e| Error::new(ErrorCode::Transport, format!("websocket upgrade: {e}")))?;
+        .map_err(|e| Error::transport("websocket upgrade", e))?;
     let (sink, stream) = ws.split();
     let sink = Arc::new(tokio::sync::Mutex::new(sink));
     let pending = Arc::new(Mutex::new(Pending::default()));
@@ -223,7 +223,7 @@ impl Conn {
             .await
             .send(WsMessage::text(msg.to_string()))
             .await
-            .map_err(|e| Error::new(ErrorCode::Transport, format!("write: {e}")))
+            .map_err(|e| Error::transport("write", e))
     }
 }
 

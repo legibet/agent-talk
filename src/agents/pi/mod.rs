@@ -18,10 +18,11 @@ mod session;
 
 use self::run::Run;
 use self::session::{check_id, head, live_branch, load, transcript_turn, turn_end};
-use super::{
-    Agent, AgentStatus, Check, ListFilter, Operation, ReadPage, ReadQuery, SendRequest,
-    StartRequest, WaitTarget, agent_cmd, bounded, cli_version, cut, lock, pid_alive, settle, tail,
-    wait_receipt,
+use crate::agents::child::{agent_cmd, cli_version, lock, pid_alive, tail};
+use crate::agents::history::{ReadPage, ReadQuery, cut};
+use crate::agents::lifecycle::{bounded, settle, wait_receipt};
+use crate::agents::{
+    Agent, AgentStatus, Check, ListFilter, Operation, SendRequest, StartRequest, WaitTarget,
 };
 use crate::model::{
     AgentError, Error, ErrorCode, Model, Observations, Outcome, Page, ReceiptState, Result, Session,
@@ -51,10 +52,6 @@ pub struct Pi<'a> {
 
 fn handle(id: &str) -> String {
     format!("pi:{id}")
-}
-
-fn io_err(what: &str, e: impl std::fmt::Display) -> Error {
-    Error::new(ErrorCode::Transport, format!("{what}: {e}"))
 }
 
 /// What this command observes of the `pi` run it started.
@@ -227,11 +224,11 @@ impl<'a> Pi<'a> {
             stdin
                 .write_all(prompt.as_bytes())
                 .await
-                .map_err(|e| io_err("write prompt to pi", e))?;
+                .map_err(|e| Error::transport("write prompt to pi", e))?;
             stdin
                 .shutdown()
                 .await
-                .map_err(|e| io_err("close pi stdin", e))?;
+                .map_err(|e| Error::transport("close pi stdin", e))?;
             drop(stdin);
             let status = tail(&mut child, &log, |l| {
                 watch.on_line(self.store, &self.sessions, l)
@@ -271,7 +268,7 @@ impl Agent for Pi<'_> {
             .stdin(std::process::Stdio::null())
             .output()
             .await
-            .map_err(|e| io_err("run pi --list-models", e))?;
+            .map_err(|e| Error::transport("run pi --list-models", e))?;
         if !out.status.success() {
             return Err(Error::new(
                 ErrorCode::Transport,
@@ -423,10 +420,7 @@ impl Agent for Pi<'_> {
             receipt_id: &receipt_id,
             handle: &h,
             client_msg_id: &client_msg_id,
-            text: req.prompt,
-            delivered_text: (req.delivered != req.prompt).then_some(req.delivered),
-            from: req.from,
-            depth: req.depth,
+            message: &req.message,
         })?;
         let args = run::args(
             ["--session-id", &id],
@@ -441,7 +435,7 @@ impl Agent for Pi<'_> {
             run: Run::default(),
             turn_id: None,
         };
-        self.execute(req.cwd, args, watch, req.delivered, deadline)
+        self.execute(req.cwd, args, watch, req.message.delivered, deadline)
             .await
     }
 
@@ -486,10 +480,7 @@ impl Agent for Pi<'_> {
             receipt_id: &receipt_id,
             handle: &h,
             client_msg_id: &client_msg_id,
-            text: req.text,
-            delivered_text: (req.delivered != req.text).then_some(req.delivered),
-            from: req.from,
-            depth: req.depth,
+            message: &req.message,
         })?;
         // pi restores the model from the session file, so only a change passes it; the
         // thinking level is not restored and comes from the session's settings.
@@ -507,7 +498,7 @@ impl Agent for Pi<'_> {
             run: Run::default(),
             turn_id: None,
         };
-        self.execute(&cwd, args, watch, req.delivered, deadline)
+        self.execute(&cwd, args, watch, req.message.delivered, deadline)
             .await
     }
 

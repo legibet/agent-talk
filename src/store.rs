@@ -1,7 +1,7 @@
 //! `~/.agent-talk/store.db`: intents, receipts, owned sessions, processes, approvals.
 //! One connection per command, owned by the command's main task.
 
-use crate::agents::Settings;
+use crate::agents::{Outgoing, Settings};
 use crate::model::{
     AgentError, Approval, Caller, CallerKind, Error, ErrorCode, Receipt, ReceiptState, Result,
 };
@@ -68,11 +68,7 @@ pub struct NewIntent<'a> {
     pub receipt_id: &'a str,
     pub handle: &'a str,
     pub client_msg_id: &'a str,
-    pub text: &'a str,
-    pub from: &'a Caller,
-    pub depth: u32,
-    /// Set when the agent got something other than `text` (the provenance header).
-    pub delivered_text: Option<&'a str>,
+    pub message: &'a Outgoing<'a>,
 }
 
 impl Store {
@@ -94,20 +90,6 @@ impl Store {
 
     fn init(db: Connection) -> Result<Store> {
         db.execute_batch(SCHEMA)?;
-        // Stores created before these columns existed.
-        for (column, ddl) in [
-            ("depth", "INTEGER NOT NULL DEFAULT 0"),
-            ("delivered_text", "TEXT"),
-        ] {
-            let present: i64 = db.query_row(
-                "SELECT COUNT(*) FROM pragma_table_info('intents') WHERE name = ?1",
-                params![column],
-                |row| row.get(0),
-            )?;
-            if present == 0 {
-                db.execute_batch(&format!("ALTER TABLE intents ADD COLUMN {column} {ddl}"))?;
-            }
-        }
         Ok(Store { db })
     }
 
@@ -116,8 +98,11 @@ impl Store {
         Store::init(Connection::open_in_memory().unwrap()).unwrap()
     }
 
-    /// Persist an intent and its pending receipt. Called before anything is sent.
+    /// Persist an intent and its pending receipt. Called before anything is sent. The
+    /// delivered text is kept only when the agent got something other than the caller's
+    /// text (the provenance header).
     pub fn insert_intent(&self, i: &NewIntent) -> Result<()> {
+        let m = i.message;
         let tx = self.db.unchecked_transaction()?;
         tx.execute(
             r#"INSERT INTO intents (receipt_id, handle, client_msg_id, text, "from", depth,
@@ -127,10 +112,10 @@ impl Store {
                 i.receipt_id,
                 i.handle,
                 i.client_msg_id,
-                i.text,
-                serde_json::to_string(i.from).unwrap(),
-                i.depth,
-                i.delivered_text
+                m.text,
+                serde_json::to_string(m.from).unwrap(),
+                m.depth,
+                (m.delivered != m.text).then_some(m.delivered)
             ],
         )?;
         tx.execute(
@@ -287,7 +272,6 @@ impl Store {
             )
             .optional()?
             .flatten();
-        // Rows from before callers were recorded as JSON hold a bare label, not a caller.
         Ok(from.and_then(|f| serde_json::from_str(&f).ok()))
     }
 
@@ -427,10 +411,12 @@ mod tests {
             receipt_id: id,
             handle,
             client_msg_id: &format!("c-{id}"),
-            text: "x",
-            from,
-            depth,
-            delivered_text: None,
+            message: &Outgoing {
+                text: "x",
+                delivered: "x",
+                from,
+                depth,
+            },
         })
         .unwrap();
         depth
@@ -467,15 +453,12 @@ mod tests {
     }
 
     #[test]
-    fn sender_round_trips_and_ignores_legacy_labels() {
+    fn sender_round_trips() {
         let s = Store::memory();
         intent(&s, "r0", "codex:b", &Caller::agent("claude:a"));
         assert_eq!(
             s.sender_of("c-r0").unwrap(),
             Some(Caller::agent("claude:a"))
         );
-        s.db.execute(r#"UPDATE intents SET "from" = 'cli'"#, [])
-            .unwrap();
-        assert_eq!(s.sender_of("c-r0").unwrap(), None);
     }
 }

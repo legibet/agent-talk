@@ -19,10 +19,14 @@ mod updates;
 
 use self::acp::{Conn, Event, Reply, ServerRequest, Spawn};
 use self::updates::{History, first_prompt};
-use super::{
-    Agent, AgentStatus, ApprovalPolicy, Check, ListFilter, Operation, ReadPage, ReadQuery,
-    SendRequest, StartRequest, WaitTarget, approval_policy, bounded, cli_version, cut, first_line,
-    lock, pid_alive, record, reject, settle, strip_provenance, wait_receipt,
+use crate::agents::child::{cli_version, lock, pid_alive};
+use crate::agents::history::{ReadPage, ReadQuery, cut, first_line};
+use crate::agents::lifecycle::{
+    ApprovalPolicy, approval_policy, bounded, record, reject, settle, wait_receipt,
+};
+use crate::agents::{
+    Agent, AgentStatus, Check, ListFilter, Operation, SendRequest, StartRequest, WaitTarget,
+    strip_provenance,
 };
 use crate::model::{
     self, Approval, Error, ErrorCode, Model, Observations, Outcome, Page, ReceiptState, Result,
@@ -65,10 +69,6 @@ fn check_id(id: &str) -> Result<()> {
             format!("invalid Grok session id {id}; expected a UUID"),
         )
     })
-}
-
-fn io_err(what: &str, e: impl std::fmt::Display) -> Error {
-    Error::new(ErrorCode::Transport, format!("{what}: {e}"))
 }
 
 #[derive(Debug, Deserialize)]
@@ -557,7 +557,7 @@ impl<'a> Grok<'a> {
                 )
             }),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-            Err(e) => Err(io_err(&path.display().to_string(), e)),
+            Err(e) => Err(Error::transport(path.display(), e)),
         }
     }
 
@@ -647,13 +647,12 @@ impl<'a> Grok<'a> {
             policy,
             leader.is_some(),
         );
-        let text = intent.delivered_text.unwrap_or(intent.text);
         let rx = conn
             .start(
                 "session/prompt",
                 json!({
                     "sessionId": id,
-                    "prompt": [{"type": "text", "text": text}],
+                    "prompt": [{"type": "text", "text": intent.message.delivered}],
                     "_meta": {"promptId": intent.client_msg_id},
                 }),
             )
@@ -795,16 +794,13 @@ impl<'a> Grok<'a> {
                 receipt_id: &receipt_id,
                 handle: &h,
                 client_msg_id: &client_msg_id,
-                text: req.text,
-                delivered_text: (req.delivered != req.text).then_some(req.delivered),
-                from: req.from,
-                depth: req.depth,
+                message: &req.message,
             })?;
-            let mut w = TurnWatch::steer(id, &receipt_id, running, req.delivered, policy);
+            let mut w = TurnWatch::steer(id, &receipt_id, running, req.message.delivered, policy);
             let ack = conn
                 .request(
                     "_x.ai/interject",
-                    json!({"sessionId": id, "text": req.delivered}),
+                    json!({"sessionId": id, "text": req.message.delivered}),
                 )
                 .await;
             match ack {
@@ -1091,10 +1087,7 @@ impl Agent for Grok<'_> {
                 receipt_id: &receipt_id,
                 handle: &h,
                 client_msg_id: &prompt_id,
-                text: req.prompt,
-                delivered_text: (req.delivered != req.prompt).then_some(req.delivered),
-                from: req.from,
-                depth: req.depth,
+                message: &req.message,
             };
             self.run(&mut conn, id, &intent, policy, deadline, &leader)
                 .await
@@ -1115,7 +1108,7 @@ impl Agent for Grok<'_> {
         let dir = self.require(id)?;
         let path = dir.join("summary.json");
         let summary: Summary = std::fs::read_to_string(&path)
-            .map_err(|e| io_err(&path.display().to_string(), e))
+            .map_err(|e| Error::transport(path.display(), e))
             .and_then(|t| {
                 serde_json::from_str(&t).map_err(|e| {
                     Error::new(ErrorCode::Precondition, format!("{}: {e}", path.display()))
@@ -1206,10 +1199,7 @@ impl Agent for Grok<'_> {
                 receipt_id: &receipt_id,
                 handle: &h,
                 client_msg_id: &prompt_id,
-                text: req.text,
-                delivered_text: (req.delivered != req.text).then_some(req.delivered),
-                from: req.from,
-                depth: req.depth,
+                message: &req.message,
             };
             self.run(&mut conn, id, &intent, policy, deadline, &leader)
                 .await
@@ -1256,7 +1246,9 @@ impl Agent for Grok<'_> {
                 let rec = wait_receipt(self.store, &h, r)?;
                 // The promptId, recorded as the client message id before submission.
                 (
-                    rec.turn_id.clone().unwrap_or(rec.client_msg_id.clone()),
+                    rec.turn_id
+                        .clone()
+                        .unwrap_or_else(|| rec.client_msg_id.clone()),
                     Some(rec),
                 )
             }

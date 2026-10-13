@@ -1,14 +1,15 @@
 //! `agent-talk mcp`: the CLI's models, ls, new, send, read and wait as MCP tools on stdio.
 //!
-//! Each tool builds the same request the CLI builds and runs it through `ops::run`,
-//! so results are exactly what `--json` prints, and refusals are the CLI's error object
-//! returned as a tool error (`isError: true`), not a protocol error.
+//! Each tool builds the same arguments the CLI builds and calls the same operation in
+//! `ops`, so results are exactly what `--json` prints, and refusals are the CLI's error
+//! object returned as a tool error (`isError: true`), not a protocol error.
 
-use crate::agents::{ReadQuery, Settings, WaitTarget};
+use crate::agents::history::ReadQuery;
+use crate::agents::{Settings, WaitTarget};
 use crate::model::{self, Caller, Error, ErrorCode, Outcome};
 use crate::ops::{
     self, DEFAULT_TIMEOUT, LS_LIMIT, LsArgs, MODELS_LIMIT, Models, ModelsArgs, NewArgs, READ_LIMIT,
-    Read, ReadArgs, Request, SendArgs, Sessions, WaitArgs, caller_from_handle, env_var,
+    Read, ReadArgs, SendArgs, Sessions, WaitArgs, caller_from_handle, env_var,
 };
 use crate::store::Store;
 use rmcp::handler::server::tool::schema_for_type;
@@ -19,7 +20,7 @@ use rmcp::model::{
 };
 use rmcp::{ServerHandler, ServiceExt, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -208,25 +209,25 @@ impl Server {
         }
     }
 
-    /// Run one request and return what `--json` would print.
-    async fn exec(&self, req: Request) -> CallToolResult {
+    /// Run one operation and return what `--json` would print.
+    async fn exec<T: Serialize + Send + 'static>(
+        &self,
+        op: impl AsyncFnOnce(&Store) -> model::Result<T> + Send + 'static,
+    ) -> CallToolResult {
         // Agent futures hold the store's rusqlite connection (Send, not Sync), so they
-        // are not Send; run each request on a blocking thread of the same runtime.
+        // are not Send; run each operation on a blocking thread of the same runtime.
         let rt = tokio::runtime::Handle::current();
         let res = tokio::task::spawn_blocking(move || {
             rt.block_on(async {
                 let store = Store::open()?;
-                ops::run(&store, req).await
+                op(&store).await
             })
         })
         .await;
         match res {
             Ok(Ok(out)) => CallToolResult::structured(serde_json::to_value(&out).unwrap()),
             Ok(Err(e)) => tool_error(e),
-            Err(e) => tool_error(Error::new(
-                ErrorCode::Transport,
-                format!("command failed: {e}"),
-            )),
+            Err(e) => tool_error(Error::transport("command failed", e)),
         }
     }
 }
@@ -240,13 +241,14 @@ impl Server {
         description = "List model IDs and their supported effort values for the model and effort parameters of new. Results are sorted by model ID. OpenCode includes every configured provider, so a query can narrow the results by provider or model family. Pass next_cursor as cursor to get the next page."
     )]
     async fn models(&self, Parameters(p): Parameters<ModelsParams>) -> CallToolResult {
-        self.exec(Request::Models(ModelsArgs {
+        let args = ModelsArgs {
             agent: p.agent,
             query: p.query,
             limit: p.limit.unwrap_or(MODELS_LIMIT),
             cursor: p.cursor,
-        }))
-        .await
+        };
+        self.exec(async move |store| ops::models(store, args).await)
+            .await
     }
 
     #[tool(
@@ -256,14 +258,15 @@ impl Server {
         description = "List sessions on this machine, newest first for each agent. Each entry includes a handle, working directory, state and a preview of the first message. Each agent has a separate cursor in next_cursors. To get its next page, pass next_cursors[agent] as cursor and select that agent."
     )]
     async fn ls(&self, Parameters(p): Parameters<LsParams>) -> CallToolResult {
-        self.exec(Request::Ls(LsArgs {
+        let args = LsArgs {
             agent: p.agent,
             cwd: p.cwd.map(PathBuf::from),
             all: false,
             limit: p.limit.unwrap_or(LS_LIMIT),
             cursor: p.cursor,
-        }))
-        .await
+        };
+        self.exec(async move |store| ops::ls(store, args).await)
+            .await
     }
 
     #[tool(
@@ -278,7 +281,7 @@ impl Server {
         meta: RequestMetaObject,
         Parameters(p): Parameters<NewParams>,
     ) -> CallToolResult {
-        self.exec(Request::New(NewArgs {
+        let args = NewArgs {
             agent: p.agent,
             cwd: PathBuf::from(p.cwd),
             prompt: p.prompt,
@@ -290,8 +293,9 @@ impl Server {
             },
             wait: wait_for(p.wait, p.timeout_s),
             from: self.sender(&meta),
-        }))
-        .await
+        };
+        self.exec(async move |store| ops::new(store, args).await)
+            .await
     }
 
     #[tool(
@@ -305,7 +309,7 @@ impl Server {
         meta: RequestMetaObject,
         Parameters(p): Parameters<SendParams>,
     ) -> CallToolResult {
-        self.exec(Request::Send(SendArgs {
+        let args = SendArgs {
             handle: p.handle,
             text: p.text,
             steer: p.steer.unwrap_or(false),
@@ -316,8 +320,9 @@ impl Server {
             },
             wait: wait_for(p.wait, p.timeout_s),
             from: self.sender(&meta),
-        }))
-        .await
+        };
+        self.exec(async move |store| ops::send(store, args).await)
+            .await
     }
 
     #[tool(
@@ -327,7 +332,7 @@ impl Server {
         description = "Read a session's newest messages, oldest first. By default these are the messages sent to it and its final replies. Pass next_cursor as cursor to get older messages."
     )]
     async fn read(&self, Parameters(p): Parameters<ReadParams>) -> CallToolResult {
-        self.exec(Request::Read(ReadArgs {
+        let args = ReadArgs {
             handle: p.handle,
             query: ReadQuery {
                 limit: p.limit.unwrap_or(READ_LIMIT),
@@ -335,8 +340,9 @@ impl Server {
                 all: p.all.unwrap_or(false),
             },
             raw: false,
-        }))
-        .await
+        };
+        self.exec(async move |store| ops::read(store, args).await)
+            .await
     }
 
     #[tool(
@@ -351,12 +357,13 @@ impl Server {
             (None, Some(r)) => WaitTarget::Receipt(r),
             _ => return invalid("pass exactly one of turn or receipt"),
         };
-        self.exec(Request::Wait(WaitArgs {
+        let args = WaitArgs {
             handle: p.handle,
             target,
             timeout: p.timeout_s.map_or(DEFAULT_TIMEOUT, Duration::from_secs),
-        }))
-        .await
+        };
+        self.exec(async move |store| ops::wait(store, args).await)
+            .await
     }
 }
 
@@ -385,13 +392,14 @@ pub async fn serve(caller_arg: Option<String>) -> model::Result<()> {
     .find_map(|(var, agent)| env_var(var).map(|s| Caller::agent(&format!("{agent}:{s}"))));
     tracing::info!("agent-talk mcp: pinned {pinned:?}, env {env:?}");
     let server = Server::new(pinned, env);
-    let transport_err =
-        |e: &dyn std::fmt::Display| Error::new(ErrorCode::Transport, format!("mcp: {e}"));
     let running = server
         .serve(rmcp::transport::stdio())
         .await
-        .map_err(|e| transport_err(&e))?;
-    running.waiting().await.map_err(|e| transport_err(&e))?;
+        .map_err(|e| Error::transport("mcp", e))?;
+    running
+        .waiting()
+        .await
+        .map_err(|e| Error::transport("mcp", e))?;
     Ok(())
 }
 

@@ -88,7 +88,10 @@ src/
   ops.rs               the operations: handles, provenance header, hop limit, dispatch, typed output
   model.rs             agent-neutral types and error codes
   store.rs             SQLite (rusqlite, bundled)
-  agents/mod.rs        agent interface, adapter dispatch, shared receipt/approval lifecycle
+  agents/mod.rs        agent interface, adapter dispatch, request types, provenance header
+  agents/lifecycle.rs  shared receipt/approval lifecycle, observation bounds (deadline, signals)
+  agents/history.rs    read paging: query, page cut, cursors
+  agents/child.rs      agent CLI children: environment, version, session lock, run log tail
   agents/codex/        adapter, protocol (narrow response types), transport (WebSocket over AF_UNIX)
   agents/claude/       adapter, transcript rules, stream-json events, process spawning
   agents/opencode/     adapter, transport (HTTP + SSE)
@@ -101,7 +104,7 @@ skills/agent-talk/     the skill that teaches agents the CLI (installed with `np
 
 The receipt and approval lifecycle (default policy, reject on agent refusal, record approvals,
 mark answered requests resolved, validate the receipt a `wait` names, settle the outcome) is
-agent-talk's semantics and is implemented once in `agents/mod.rs`. One exception: a process
+agent-talk's semantics and is implemented once in `agents/lifecycle.rs`. One exception: a process
 adapter whose child failed to spawn or exited before taking the message settles the receipt
 `rejected` itself, since nothing ran. Adapters supply discovery, submission, event source,
 history lookup and message normalization. Observe loops stay per adapter because the authority

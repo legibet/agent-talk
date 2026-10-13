@@ -20,10 +20,13 @@ mod transcript;
 use self::process::{AgentEntry, agents};
 use self::stream::{Run, StreamEvent, System, denial, result_turn};
 use self::transcript::{TurnEnd, head, live_branch, load, slug, transcript_turn, turn_end};
-use super::{
-    Agent, AgentStatus, ApprovalPolicy, Check, ListFilter, Operation, ReadPage, ReadQuery,
-    SendRequest, StartRequest, WaitTarget, approval_policy, bounded, cli_version, cut, first_line,
-    lock, pid_alive, record, settle, tail, wait_receipt,
+use crate::agents::child::{cli_version, lock, pid_alive, tail};
+use crate::agents::history::{ReadPage, ReadQuery, cut, first_line};
+use crate::agents::lifecycle::{
+    ApprovalPolicy, approval_policy, bounded, record, settle, wait_receipt,
+};
+use crate::agents::{
+    Agent, AgentStatus, Check, ListFilter, Operation, SendRequest, StartRequest, WaitTarget,
 };
 use crate::model::{
     self, AgentError, Approval, Error, ErrorCode, Model, Observations, Outcome, Page, ReceiptState,
@@ -67,10 +70,6 @@ fn check_id(id: &str) -> Result<()> {
             format!("invalid Claude session id {id}; expected a UUID"),
         )
     })
-}
-
-fn io_err(what: &str, e: impl std::fmt::Display) -> Error {
-    Error::new(ErrorCode::Transport, format!("{what}: {e}"))
 }
 
 /// Who, besides this command, is running the session right now.
@@ -288,12 +287,12 @@ impl<'a> Claude<'a> {
             stdin
                 .write_all(format!("{line}\n").as_bytes())
                 .await
-                .map_err(|e| io_err("write prompt to claude", e))?;
+                .map_err(|e| Error::transport("write prompt to claude", e))?;
             // Closing stdin makes claude exit after this turn's result.
             stdin
                 .shutdown()
                 .await
-                .map_err(|e| io_err("close claude stdin", e))?;
+                .map_err(|e| Error::transport("close claude stdin", e))?;
             drop(stdin);
             let status = tail(&mut child, &log, |l| watch.on_event(self.store, l)).await?;
             if !watch.run.init && watch.run.result.is_none() {
@@ -586,10 +585,7 @@ impl Agent for Claude<'_> {
             receipt_id: &receipt_id,
             handle: &h,
             client_msg_id: &client_msg_id,
-            text: req.prompt,
-            delivered_text: (req.delivered != req.prompt).then_some(req.delivered),
-            from: req.from,
-            depth: req.depth,
+            message: &req.message,
         })?;
         let mut args = process::args(
             ["--session-id", &id],
@@ -608,7 +604,7 @@ impl Agent for Claude<'_> {
             run: Run::default(),
             approvals: Vec::new(),
         };
-        self.execute(req.cwd, args, watch, req.delivered, deadline)
+        self.execute(req.cwd, args, watch, req.message.delivered, deadline)
             .await
     }
 
@@ -658,10 +654,7 @@ impl Agent for Claude<'_> {
             receipt_id: &receipt_id,
             handle: &h,
             client_msg_id: &client_msg_id,
-            text: req.text,
-            delivered_text: (req.delivered != req.text).then_some(req.delivered),
-            from: req.from,
-            depth: req.depth,
+            message: &req.message,
         })?;
         // Claude restores the model from the transcript, so only a change passes it; effort
         // and permission mode are per process and come from the session's settings.
@@ -680,7 +673,7 @@ impl Agent for Claude<'_> {
             run: Run::default(),
             approvals: Vec::new(),
         };
-        self.execute(&cwd, args, watch, req.delivered, deadline)
+        self.execute(&cwd, args, watch, req.message.delivered, deadline)
             .await
     }
 
@@ -715,7 +708,9 @@ impl Agent for Claude<'_> {
                 let rec = wait_receipt(self.store, &h, r)?;
                 // The input uuid is the turn id, recorded when the intent was written.
                 (
-                    rec.turn_id.clone().unwrap_or(rec.client_msg_id.clone()),
+                    rec.turn_id
+                        .clone()
+                        .unwrap_or_else(|| rec.client_msg_id.clone()),
                     Some(rec),
                 )
             }

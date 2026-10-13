@@ -12,10 +12,13 @@
 mod transport;
 
 use self::transport::{Events, Service};
-use super::{
-    Agent, AgentStatus, ApprovalPolicy, Boundary, Check, ListFilter, Operation, ReadPage,
-    ReadQuery, SendRequest, Settings, StartRequest, WaitTarget, approval_policy, bounded, cut,
-    record, reject, resolve, settle, wait_receipt,
+use crate::agents::history::{Boundary, ReadPage, ReadQuery, cut};
+use crate::agents::lifecycle::{
+    ApprovalPolicy, approval_policy, bounded, record, reject, resolve, settle, wait_receipt,
+};
+use crate::agents::{
+    Agent, AgentStatus, Check, ListFilter, Operation, Outgoing, SendRequest, StartRequest,
+    WaitTarget,
 };
 use crate::model::{
     self, Approval, Error, ErrorCode, Message, Model, Observations, Outcome, Page, ReceiptState,
@@ -530,12 +533,14 @@ impl<'a> OpenCode<'a> {
         }
     }
 
-    /// Record the intent, submit it, and optionally observe the resulting turn.
+    /// Record the intent, submit it (into the running execution with `steer`), and
+    /// optionally observe the resulting turn.
     async fn submit(
         &self,
         svc: &Service,
         session_id: &str,
-        req: &SendRequest<'_>,
+        message: &Outgoing<'_>,
+        steer: bool,
         deadline: Option<Instant>,
     ) -> Result<Outcome> {
         let handle = handle(session_id);
@@ -548,7 +553,7 @@ impl<'a> OpenCode<'a> {
             false,
         );
         let work = async {
-            if req.steer && !svc.active(session_id).await? {
+            if steer && !svc.active(session_id).await? {
                 return Err(Error::new(
                     ErrorCode::Precondition,
                     "no running execution to steer (the service would silently start a new one); send without --steer",
@@ -563,20 +568,17 @@ impl<'a> OpenCode<'a> {
                 receipt_id: &receipt_id,
                 handle: &handle,
                 client_msg_id: &msg_id,
-                text: req.text,
-                delivered_text: (req.delivered != req.text).then_some(req.delivered),
-                from: req.from,
-                depth: req.depth,
+                message,
             })?;
             let body = json!({
                 "id": msg_id,
-                "text": req.delivered,
+                "text": message.delivered,
                 // Always explicit: the service defaults to steer.
-                "delivery": if req.steer { "steer" } else { "queue" },
+                "delivery": if steer { "steer" } else { "queue" },
                 "metadata": {"agent-talk": {
                     "receipt": receipt_id,
-                    "from": req.from,
-                    "depth": req.depth,
+                    "from": message.from,
+                    "depth": message.depth,
                 }},
             });
             svc.post(&format!("/api/session/{session_id}/prompt"), &body)
@@ -863,16 +865,8 @@ impl Agent for OpenCode<'_> {
         })?;
         self.store
             .insert_owned(&handle(&session_id), req.cwd, req.settings)?;
-        let send = SendRequest {
-            text: req.prompt,
-            delivered: req.delivered,
-            steer: false,
-            change: &Settings::default(),
-            settings: Some(req.settings),
-            from: req.from,
-            depth: req.depth,
-        };
-        self.submit(&svc, &session_id, &send, deadline).await
+        self.submit(&svc, &session_id, &req.message, false, deadline)
+            .await
     }
 
     async fn send(
@@ -927,7 +921,8 @@ impl Agent for OpenCode<'_> {
             )
             .await?;
         }
-        self.submit(&svc, session_id, req, deadline).await
+        self.submit(&svc, session_id, &req.message, req.steer, deadline)
+            .await
     }
 
     async fn read(&self, session_id: &str, q: &ReadQuery) -> Result<ReadPage> {

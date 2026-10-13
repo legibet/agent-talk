@@ -1,9 +1,9 @@
 //! The `claude` CLI as a child process: command line, spawn into a run log, and
-//! `claude agents --json --all`. Reading the run log is `agents::tail`.
+//! `claude agents --json --all`. Reading the run log is `agents::child::tail`.
 
-use super::io_err;
-use crate::agents::{ApprovalPolicy, agent_cmd};
-use crate::model::Result;
+use crate::agents::child::agent_cmd;
+use crate::agents::lifecycle::ApprovalPolicy;
+use crate::model::{Error, Result};
 use serde::Deserialize;
 use std::fs::File;
 use std::path::Path;
@@ -55,11 +55,11 @@ pub fn args(
 /// process group so that Ctrl-C on agent-talk stops observing, not the turn.
 pub fn spawn(cwd: &str, args: &[String], log: &Path) -> Result<Child> {
     if let Some(dir) = log.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| io_err("create run dir", e))?;
+        std::fs::create_dir_all(dir).map_err(|e| Error::transport("create run dir", e))?;
     }
-    let out = File::create(log).map_err(|e| io_err(&log.display().to_string(), e))?;
+    let out = File::create(log).map_err(|e| Error::transport(log.display(), e))?;
     let err = File::create(log.with_extension("stderr"))
-        .map_err(|e| io_err(&log.display().to_string(), e))?;
+        .map_err(|e| Error::transport(log.display(), e))?;
     let mut cmd = agent_cmd("claude");
     // CLAUDE_CODE_EFFORT_LEVEL silently overrides --effort (claude 2.1.291, DESIGN.md §6.2).
     if args.iter().any(|a| a == "--effort") {
@@ -74,7 +74,7 @@ pub fn spawn(cwd: &str, args: &[String], log: &Path) -> Result<Child> {
         .stderr(err)
         .process_group(0)
         .spawn()
-        .map_err(|e| io_err("spawn claude", e))
+        .map_err(|e| Error::transport("spawn claude", e))
 }
 
 /// One entry of `claude agents --json --all`. Fields seen: cwd, id, kind, name, pid,
