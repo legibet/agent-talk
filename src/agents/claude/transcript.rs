@@ -5,7 +5,7 @@
 use crate::agents::history::first_line;
 use crate::agents::strip_provenance;
 use crate::model::{self, Caller, Error, Message, Phase, Result, Role, TurnStatus};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -77,12 +77,18 @@ enum Block {
     ToolResult {
         #[serde(default)]
         content: Value,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "flag")]
         is_error: bool,
     },
     /// thinking, image, …
     #[serde(other)]
     Other,
+}
+
+/// A boolean flag: absent or `null` reads as false. For
+/// `#[serde(default, deserialize_with = "flag")]`.
+fn flag<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<bool, D::Error> {
+    Ok(Option::<bool>::deserialize(d)?.unwrap_or(false))
 }
 
 impl Body {
@@ -104,9 +110,9 @@ struct Line {
     logical_parent_uuid: Option<String>,
     /// Shared by a turn's prompt line and its tool_result lines.
     prompt_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "flag")]
     is_sidechain: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "flag")]
     is_meta: bool,
     message: Option<Body>,
     cwd: Option<String>,
@@ -117,98 +123,82 @@ struct Line {
     leaf_uuid: Option<String>,
     timestamp: Option<String>,
     /// Who produced a user line: `{"kind":"human"}`, `{"kind":"task-notification",…}`.
-    origin: Option<Origin>,
+    /// Only `kind` is read; a shape that does not fit is no origin.
+    #[serde(default)]
+    origin: Value,
     /// `typed`, `sdk`, `system`, …
     prompt_source: Option<String>,
     /// Set on the `[Request interrupted by user]` line.
     interrupted_message_id: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct Origin {
-    kind: Option<String>,
-}
-
-/// What a `user` line is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum User {
-    /// Typed or sent by a client; starts a turn.
-    Prompt,
-    /// Input injected by the Claude Code runtime, not typed or sent by a client (a task
-    /// notification, a system reminder); starts a turn, and is shown `from: runtime` since
-    /// the model saw it.
-    RuntimePrompt,
-    /// Only tool results; part of the turn of its `promptId`.
-    ToolResult,
-    /// The line a TUI appends when the user presses Esc mid-turn; the turn ends there and
-    /// no `system/turn_duration` is written.
-    Interrupt,
-    /// Not a message: injected meta content and local slash-command bookkeeping.
-    Meta,
-}
-
-impl User {
-    /// Input the model saw that no client sent: runtime-injected prompts and interrupt lines.
-    fn is_runtime(self) -> bool {
-        matches!(self, User::RuntimePrompt | User::Interrupt)
-    }
-}
-
 impl Line {
-    /// What this line is, when it is a `user` line with a message.
-    fn user(&self) -> Option<User> {
+    /// The message text of a `user` line.
+    fn user_text(&self) -> Option<&str> {
         if self.kind != "user" {
             return None;
         }
-        let text = &self.message.as_ref()?.text;
-        let lead = text.trim_start();
-        // Local slash-command lines (`<command-name>…`, `<local-command-stdout>…`) carry no
-        // flag (no `origin`, no `promptSource`; only the companion `<local-command-caveat>`
-        // line has `isMeta`), so the leading tag is the marker.
-        if self.is_meta || lead.starts_with("<command-name>") || lead.starts_with("<local-command-")
-        {
-            return Some(User::Meta);
-        }
-        if self.message.as_ref().is_some_and(Body::tool_result_only) {
-            return Some(User::ToolResult);
-        }
-        // Structural marker: `interruptedMessageId` (no isMeta, origin or promptSource on
-        // it). Without it, the text decides (`[Request interrupted by user]`, `… for tool use]`).
-        if self.interrupted_message_id.is_some() || text.starts_with("[Request interrupted by user")
-        {
-            return Some(User::Interrupt);
-        }
-        // `origin.kind` other than `human` or `promptSource: system`; lines without either
-        // flag fall back to the leading tag.
-        let origin = self.origin.as_ref().and_then(|o| o.kind.as_deref());
-        let runtime = match (origin, self.prompt_source.as_deref()) {
-            (Some(k), _) if k != "human" => true,
-            (_, Some("system")) => true,
-            (None, None) => {
-                lead.starts_with("<task-notification>") || lead.starts_with("<system-reminder>")
-            }
-            _ => false,
-        };
-        Some(if runtime {
-            User::RuntimePrompt
-        } else {
-            User::Prompt
+        self.message.as_ref().map(|m| m.text.as_str())
+    }
+
+    /// A `user` line holding only tool results.
+    fn is_tool_result(&self) -> bool {
+        self.kind == "user" && self.message.as_ref().is_some_and(Body::tool_result_only)
+    }
+
+    /// The line a TUI appends when the user presses Esc mid-turn; the turn ends there and
+    /// no `system/turn_duration` is written. Structural marker: `interruptedMessageId`
+    /// (no isMeta, origin or promptSource on it). Without it, the text decides
+    /// (`[Request interrupted by user]`, `… for tool use]`).
+    fn is_interrupt(&self) -> bool {
+        self.kind == "user"
+            && (self.interrupted_message_id.is_some()
+                || self
+                    .user_text()
+                    .is_some_and(|t| t.starts_with("[Request interrupted by user")))
+    }
+
+    /// Local slash-command bookkeeping (`<command-name>…`, `<local-command-stdout>…`).
+    /// These lines carry no flag (no `origin`, no `promptSource`; only the companion
+    /// `<local-command-caveat>` line has `isMeta`), so the leading tag is the marker.
+    fn is_local_command(&self) -> bool {
+        self.user_text().is_some_and(|t| {
+            let t = t.trim_start();
+            t.starts_with("<command-name>") || t.starts_with("<local-command-")
         })
     }
 
-    #[cfg(test)]
-    fn is_interrupt(&self) -> bool {
-        self.user() == Some(User::Interrupt)
-    }
-
-    #[cfg(test)]
+    /// User input injected by the Claude Code runtime, not typed or sent by a client:
+    /// interrupt lines, `origin.kind` other than `human` (e.g. `task-notification`) or
+    /// `promptSource: system`. Lines without either flag fall back to the leading tag.
     fn is_runtime(&self) -> bool {
-        self.user().is_some_and(User::is_runtime)
+        if self.kind != "user" {
+            return false;
+        }
+        if self.is_interrupt() {
+            return true;
+        }
+        match (self.origin["kind"].as_str(), self.prompt_source.as_deref()) {
+            (Some(k), _) if k != "human" => true,
+            (_, Some("system")) => true,
+            (None, None) => self.user_text().is_some_and(|t| {
+                let t = t.trim_start();
+                t.starts_with("<task-notification>") || t.starts_with("<system-reminder>")
+            }),
+            _ => false,
+        }
     }
 
-    /// A main-chain user line that starts a turn.
+    /// A user line that starts a turn: content that is not only tool results, and not
+    /// injected meta content, a sub-agent line, local-command bookkeeping or an interrupt
+    /// marker.
     fn is_prompt(&self) -> bool {
-        !self.is_sidechain && matches!(self.user(), Some(User::Prompt | User::RuntimePrompt))
+        self.kind == "user"
+            && !self.is_sidechain
+            && !self.is_meta
+            && !self.is_interrupt()
+            && !self.is_local_command()
+            && self.message.as_ref().is_some_and(|m| !m.tool_result_only())
     }
 
     fn is_turn_duration(&self) -> bool {
@@ -325,7 +315,7 @@ pub fn live_branch(entries: &[Entry]) -> HashSet<usize> {
         .filter(|(i, e)| {
             !live.contains(i)
                 && e.line.as_ref().is_some_and(|l| {
-                    l.user() == Some(User::ToolResult)
+                    l.is_tool_result()
                         && l.prompt_id
                             .as_deref()
                             .is_some_and(|p| live_prompts.contains(p))
@@ -363,14 +353,13 @@ pub fn turn_end(entries: &[Entry], branch: &HashSet<usize>, start: usize) -> Opt
         .find_map(|i| {
             let l = entries[i].line.as_ref()?;
             if l.is_turn_duration() {
-                return Some(TurnEnd::Duration(i));
-            }
-            match l.user()? {
-                User::Interrupt => Some(TurnEnd::Interrupt(i)),
-                User::Prompt | User::RuntimePrompt if !l.is_sidechain => {
-                    Some(TurnEnd::NextPrompt(i))
-                }
-                _ => None,
+                Some(TurnEnd::Duration(i))
+            } else if l.is_interrupt() {
+                Some(TurnEnd::Interrupt(i))
+            } else if l.is_prompt() {
+                Some(TurnEnd::NextPrompt(i))
+            } else {
+                None
             }
         })
 }
@@ -491,16 +480,15 @@ pub fn messages(entries: &[Entry], branch: &HashSet<usize>) -> Vec<(usize, Messa
 /// bookkeeping are not messages (they stay in `--raw`); runtime-injected input is kept
 /// with `from: runtime`, since the model saw it.
 fn to_message(line: &Line, turn_id: &str, item_id: &str) -> Option<Message> {
+    if line.is_meta || line.is_local_command() {
+        return None;
+    }
     let body = line.message.as_ref()?;
-    let user = line.user();
     let (role, phase, text) = match line.kind.as_str() {
-        "user" => match user? {
-            User::Meta => return None,
-            User::ToolResult => (Role::User, Phase::Other, tool_result_summary(body)),
-            User::Interrupt => (Role::User, Phase::Other, "[interrupted]".to_string()),
-            User::RuntimePrompt => (Role::User, Phase::Other, body.text.clone()),
-            User::Prompt => (Role::User, Phase::Prompt, body.text.clone()),
-        },
+        "user" if body.tool_result_only() => (Role::User, Phase::Other, tool_result_summary(body)),
+        "user" if line.is_interrupt() => (Role::User, Phase::Other, "[interrupted]".to_string()),
+        "user" if line.is_runtime() => (Role::User, Phase::Other, body.text.clone()),
+        "user" => (Role::User, Phase::Prompt, body.text.clone()),
         "assistant" => {
             if !body.text.is_empty() {
                 let phase = if body.stop_reason.as_deref() == Some("end_turn") {
@@ -534,9 +522,7 @@ fn to_message(line: &Line, turn_id: &str, item_id: &str) -> Option<Message> {
         role,
         phase,
         text,
-        from: user
-            .is_some_and(User::is_runtime)
-            .then_some(Caller::RUNTIME),
+        from: line.is_runtime().then_some(Caller::RUNTIME),
         timestamp: line.timestamp.clone(),
     })
 }
@@ -885,6 +871,42 @@ mod tests {
         assert_eq!(end, Some(TurnEnd::Interrupt(3)));
         let t = transcript_turn(handle(), &entries, &live, 0, end.unwrap(), None);
         assert_eq!(t.status, TurnStatus::Interrupted);
+    }
+
+    /// The flags of a line are independent: an interrupt marker ends the turn even when it is
+    /// also meta, only tool results, or has no message; meta hides any line; a tool result
+    /// from the runtime is shown as such; a `null` flag reads as false.
+    #[test]
+    fn line_flags_combine() {
+        let meta_interrupt = r#"{"parentUuid":"27fad0b7-9d51-4afc-871d-d7150f29a6eb","isSidechain":false,"type":"user","message":{"role":"user","content":"[Request interrupted by user]"},"isMeta":true,"interruptedMessageId":"msg_1","uuid":"i1"}"#;
+        let tool_result_interrupt = r#"{"parentUuid":"27fad0b7-9d51-4afc-871d-d7150f29a6eb","isSidechain":false,"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"stopped","is_error":null}]},"interruptedMessageId":"msg_1","uuid":"i2"}"#;
+        let bare_interrupt = r#"{"parentUuid":"27fad0b7-9d51-4afc-871d-d7150f29a6eb","isSidechain":null,"isMeta":null,"type":"user","interruptedMessageId":"msg_1","uuid":"i3"}"#;
+        for s in [meta_interrupt, tool_result_interrupt, bare_interrupt] {
+            let entries = interrupted_turn(s);
+            let live = live_branch(&entries);
+            assert_eq!(live.len(), 4, "{s}");
+            assert_eq!(
+                turn_end(&entries, &live, 0),
+                Some(TurnEnd::Interrupt(3)),
+                "{s}"
+            );
+        }
+        assert!(to_message(&line(meta_interrupt), "t", "i").is_none());
+        let m = to_message(&line(tool_result_interrupt), "t", "i").unwrap();
+        assert_eq!(
+            (m.text.as_str(), m.from),
+            ("[tool_result] stopped", Some(Caller::RUNTIME))
+        );
+
+        let meta_assistant = ASSISTANT_LINE.replace(r#""isSidechain":false"#, r#""isMeta":true"#);
+        assert!(to_message(&line(&meta_assistant), "t", "i").is_none());
+
+        let runtime_tool_result = r#"{"type":"user","uuid":"x","message":{"role":"user","content":[{"type":"tool_result","content":"done"}]},"origin":{"kind":"task-notification"}}"#;
+        let m = to_message(&line(runtime_tool_result), "t", "i").unwrap();
+        assert_eq!(
+            (m.phase, m.text.as_str(), m.from),
+            (Phase::Other, "[tool_result] done", Some(Caller::RUNTIME))
+        );
     }
 
     /// A tool_result written after a later prompt still belongs to its own prompt's turn.

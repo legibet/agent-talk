@@ -389,7 +389,7 @@ impl<'a> Claude<'a> {
             SessionState::Running
         } else if live_pid.is_some() {
             match status {
-                Some("busy" | "running") => SessionState::Running,
+                Some("busy") => SessionState::Running,
                 Some("idle") => SessionState::Idle,
                 _ => SessionState::Unknown,
             }

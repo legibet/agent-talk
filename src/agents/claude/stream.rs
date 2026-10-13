@@ -7,12 +7,10 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::path::Path;
 
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[derive(Debug)]
 pub enum StreamEvent {
     System(System),
     Result(ResultEvent),
-    #[serde(other)]
     Other,
 }
 
@@ -33,30 +31,48 @@ pub enum System {
     Other,
 }
 
-/// The `result` event: the turn ended.
-#[derive(Debug, Deserialize)]
-pub struct ResultEvent {
+/// The `result` event: the turn ended. It ends the turn whatever its fields hold, so it
+/// stays as claude wrote it, read through accessors.
+#[derive(Debug)]
+pub struct ResultEvent(Value);
+
+impl ResultEvent {
     /// `success`, or the error kind (`error_max_turns`, …).
-    subtype: Option<String>,
-    #[serde(default)]
-    is_error: bool,
+    fn subtype(&self) -> Option<&str> {
+        self.0["subtype"].as_str()
+    }
+
+    fn is_error(&self) -> bool {
+        self.0["is_error"].as_bool() == Some(true)
+    }
+
     /// The final reply, or the error message.
-    result: Option<String>,
-    duration_ms: Option<i64>,
-    // Passed through into the turn's error as claude wrote them.
-    #[serde(default)]
-    api_error_status: Value,
-    #[serde(default)]
-    terminal_reason: Value,
-    /// Tools claude denied during the turn. Each entry is passed through as an
-    /// approval's raw record.
-    #[serde(default)]
-    permission_denials: Vec<Value>,
+    fn result(&self) -> Option<&str> {
+        self.0["result"].as_str()
+    }
+
+    fn duration_ms(&self) -> Option<i64> {
+        self.0["duration_ms"].as_i64()
+    }
+
+    /// Tools claude denied during the turn. Each entry is passed through as an approval's
+    /// raw record.
+    fn permission_denials(&self) -> &[Value] {
+        self.0["permission_denials"]
+            .as_array()
+            .map_or(&[], Vec::as_slice)
+    }
 }
 
-/// One run-log line; an error for a line that is not JSON or not a known shape.
+/// One run-log line; an error for a line that is not JSON, or a `system` event whose
+/// known subtype does not fit. Unknown event types are `Other`.
 pub fn decode(line: &str) -> serde_json::Result<StreamEvent> {
-    serde_json::from_str(line)
+    let raw: Value = serde_json::from_str(line)?;
+    Ok(match raw["type"].as_str() {
+        Some("system") => StreamEvent::System(System::deserialize(&raw)?),
+        Some("result") => StreamEvent::Result(ResultEvent(raw)),
+        _ => StreamEvent::Other,
+    })
 }
 
 /// What a run log says about one `claude -p` process.
@@ -93,7 +109,8 @@ impl Run {
 impl ResultEvent {
     /// The turn this event ends, of a `claude -p` process agent-talk started.
     pub fn turn(&self, handle: String, turn_id: String) -> model::Turn {
-        let failed = self.subtype.as_deref() != Some("success") || self.is_error;
+        let failed = self.subtype() != Some("success") || self.is_error();
+        let ev = &self.0;
         model::Turn {
             handle,
             turn_id,
@@ -102,23 +119,24 @@ impl ResultEvent {
             } else {
                 TurnStatus::Completed
             },
+            // Passed through as claude wrote them.
             error: failed.then(|| {
                 json!({
-                    "subtype": self.subtype,
-                    "message": self.result,
-                    "api_error_status": self.api_error_status,
-                    "terminal_reason": self.terminal_reason,
+                    "subtype": ev["subtype"],
+                    "message": ev["result"],
+                    "api_error_status": ev["api_error_status"],
+                    "terminal_reason": ev["terminal_reason"],
                 })
             }),
-            final_text: self.result.clone(),
-            duration_ms: self.duration_ms,
+            final_text: self.result().map(String::from),
+            duration_ms: self.duration_ms(),
             basis: Some("result event of the claude -p process agent-talk started".into()),
         }
     }
 
     /// `permission_denials`, as approvals of the turn.
     pub fn denials(&self, handle: &str, turn_id: &str) -> Vec<Approval> {
-        self.permission_denials
+        self.permission_denials()
             .iter()
             .map(|d| Approval {
                 handle: handle.into(),
@@ -168,6 +186,20 @@ mod tests {
         assert_eq!(
             failed.turn("x".into(), "y".into()).status,
             TurnStatus::Failed
+        );
+        // A result whose fields do not fit still ends the turn, without an init before it.
+        let odd = RESULT
+            .replace(r#""permission_denials":[]"#, r#""permission_denials":null"#)
+            .replace(r#""is_error":false"#, r#""is_error":"no""#);
+        let mut run = Run::default();
+        run.apply(decode(&odd).unwrap());
+        assert!(run.started());
+        let r = run.result.as_ref().unwrap();
+        assert!(r.denials("x", "y").is_empty());
+        let t = r.turn("x".into(), "y".into());
+        assert_eq!(
+            (t.status, t.final_text.as_deref()),
+            (TurnStatus::Completed, Some("pong"))
         );
         assert!(matches!(
             decode(PERMISSION_DENIED).unwrap(),
