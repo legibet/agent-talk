@@ -25,6 +25,7 @@ use crate::model::{
     Observations, Outcome, Page, Phase, Progress, Result, Role, Session, SessionState, TurnStatus,
 };
 use crate::store::{NewIntent, Store};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -467,7 +468,14 @@ impl<'a> Codex<'a> {
     fn messages(&self, turns: &[Value]) -> Result<Vec<(usize, Message)>> {
         let mut messages = Vec::new();
         for (i, turn) in turns.iter().enumerate() {
-            let turn: protocol::Turn = decode("turn", turn)?;
+            // A turn without an id cannot be named; the rest of the page still reads.
+            let turn = match protocol::Turn::deserialize(turn) {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!("codex: skipped a turn: {e}");
+                    continue;
+                }
+            };
             let started = timestamp(turn.started_at);
             let completed = timestamp(turn.completed_at).or_else(|| started.clone());
             for item in turn.items {

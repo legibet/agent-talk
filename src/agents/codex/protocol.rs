@@ -3,7 +3,8 @@
 //! keep the raw `Value`), plus the few request pieces shared by several call sites.
 
 use crate::model::{AgentError, Error, ErrorCode};
-use serde::{Deserialize, Serialize};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 
 // ---- requests ----
@@ -64,10 +65,34 @@ pub const ALL_SOURCE_KINDS: &[&str] = &[
 /// `thread/turns/list`, `thread/queue/list`, `model/list`); also the resume
 /// `initialTurnsPage`.
 #[derive(Deserialize, Debug)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", bound(deserialize = "T: DeserializeOwned"))]
 pub struct CursorPage<T> {
+    #[serde(deserialize_with = "entries")]
     pub data: Vec<T>,
     pub next_cursor: Option<String>,
+}
+
+/// The entries of a list that decode: one odd entry (a turn without an id, a model without
+/// its name) does not fail the whole list, and `null` is an empty list. For
+/// `#[serde(deserialize_with = "entries")]`.
+fn entries<'de, D: Deserializer<'de>, T: DeserializeOwned>(d: D) -> Result<Vec<T>, D::Error> {
+    let items = Option::<Vec<Value>>::deserialize(d)?.unwrap_or_default();
+    Ok(items
+        .into_iter()
+        .filter_map(|v| {
+            T::deserialize(v)
+                .inspect_err(|e| tracing::warn!("codex: skipped a list entry: {e}"))
+                .ok()
+        })
+        .collect())
+}
+
+/// A field whose value does not fit reads as its default. For
+/// `#[serde(default, deserialize_with = "or_default")]`.
+fn or_default<'de, D: Deserializer<'de>, T: DeserializeOwned + Default>(
+    d: D,
+) -> Result<T, D::Error> {
+    Ok(T::deserialize(Value::deserialize(d)?).unwrap_or_default())
 }
 
 #[derive(Deserialize, Debug)]
@@ -136,28 +161,35 @@ pub struct QueuedEntry {
     pub client_user_message_id: Option<String>,
 }
 
+/// A turn. Only the id is required: any other field that is missing or does not fit reads
+/// as absent (status `Unknown`).
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct Turn {
     pub id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "or_default")]
     pub items: Vec<Item>,
+    #[serde(default, deserialize_with = "or_default")]
     pub status: TurnStatus,
     pub error: Option<Value>,
+    #[serde(default, deserialize_with = "or_default")]
     pub duration_ms: Option<i64>,
     /// Unix seconds.
+    #[serde(default, deserialize_with = "or_default")]
     pub started_at: Option<i64>,
     /// Unix seconds.
+    #[serde(default, deserialize_with = "or_default")]
     pub completed_at: Option<i64>,
 }
 
-#[derive(Deserialize, Debug, Clone, Copy, PartialEq)]
+#[derive(Deserialize, Debug, Default, Clone, Copy, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub enum TurnStatus {
     Completed,
     Failed,
     Interrupted,
     InProgress,
+    #[default]
     #[serde(other)]
     Unknown,
 }
@@ -167,7 +199,7 @@ pub enum TurnStatus {
 #[serde(rename_all = "camelCase")]
 pub struct ModelInfo {
     pub model: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "entries")]
     pub supported_reasoning_efforts: Vec<EffortOption>,
 }
 
@@ -532,5 +564,47 @@ mod tests {
             Some(json!({"decision": "decline"}))
         );
         assert_eq!(deny_response("account/chatgptAuthTokens/refresh"), None);
+    }
+
+    /// One odd entry does not fail a page: a turn whose status or times do not fit keeps
+    /// its id, a turn without an id is skipped, and so are a model without its name and an
+    /// effort entry without its effort.
+    #[test]
+    fn odd_list_entries() {
+        let turns: CursorPage<Turn> = serde_json::from_str(
+            r#"{"data":[{"id":"t2","items":null,"status":null,"startedAt":"soon","completedAt":1791031124.5,"durationMs":"x"},{"status":"completed"},{"id":"t1","items":[],"status":"paused"}],"nextCursor":null}"#,
+        )
+        .unwrap();
+        let ids: Vec<(&str, TurnStatus)> = turns
+            .data
+            .iter()
+            .map(|t| (t.id.as_str(), t.status))
+            .collect();
+        assert_eq!(
+            ids,
+            [("t2", TurnStatus::Unknown), ("t1", TurnStatus::Unknown)]
+        );
+        let t = &turns.data[0];
+        assert_eq!(
+            (t.started_at, t.completed_at, t.duration_ms),
+            (None, None, None)
+        );
+
+        let models: CursorPage<ModelInfo> = serde_json::from_str(
+            r#"{"data":[{"displayName":"no id"},{"model":"gpt-5.5","supportedReasoningEfforts":[{"reasoningEffort":"low"},{}]},{"model":"gpt-5.5-mini","supportedReasoningEfforts":null}],"nextCursor":null}"#,
+        )
+        .unwrap();
+        let models: Vec<(&str, Vec<&str>)> = models
+            .data
+            .iter()
+            .map(|m| {
+                let efforts = m.supported_reasoning_efforts.iter();
+                (
+                    m.model.as_str(),
+                    efforts.map(|e| e.reasoning_effort.as_str()).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(models, [("gpt-5.5", vec!["low"]), ("gpt-5.5-mini", vec![])]);
     }
 }
