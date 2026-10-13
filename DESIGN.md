@@ -515,11 +515,14 @@ before submitting and filters on `data.sessionID`.
   resumes such a turn behind a `synthetic` row with `metadata.notice: restart`.
 - `GET /api/session/active` is the only running indicator; a session waiting on a permission still
   counts as running.
-- `wait` ends the turn at the first `idle` after the user message (status = its outcome, reply =
-  the last assistant text before it), or at an aborted assistant row followed directly by a user
-  row, or at an aborted row still last when `session/active` no longer lists the session on a
-  second read (`interrupted`). Anything else after an aborted row (its `idle`, a restart notice,
-  more assistant rows) belongs to the same turn. History is re-read at each execution end.
+- `wait` ends the turn at the first `idle` after the user message (status = its outcome), or at
+  an aborted assistant row followed directly by a user row, or at an aborted row still last when
+  `session/active` no longer lists the session on a second read (`interrupted`). Anything else
+  after an aborted row (its `idle`, a restart notice, more assistant rows) belongs to the same
+  turn. History is re-read at each execution end. The reply is the last text part of the last
+  assistant row in the turn that finished with `stop`, the message `read` marks `final`; a turn
+  without one (interrupted, failed) answers with its last assistant text. `turn.basis` names the
+  end that applied.
 - History pages by opaque cursor, in delivery order; the empty final page has null cursors, so a
   caller keeps its old cursor as a "since" marker. A `type=user` read behind a page's cursor gives
   the turn of a page that starts mid-turn. `read` hides `idle` and bookkeeping rows.

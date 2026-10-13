@@ -9,7 +9,7 @@ use serde::de::{DeserializeOwned, IgnoredAny};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::time::Duration;
 
@@ -30,6 +30,8 @@ pub struct Service {
     http: reqwest::Client,
     pub url: String,
     password: Option<String>,
+    /// The registration file the url and password came from.
+    registration: PathBuf,
     pub pid: u32,
     pub version: String,
 }
@@ -237,7 +239,7 @@ fn page_query(limit: u32, cursor: Option<&str>) -> Vec<(&'static str, String)> {
     q
 }
 
-fn http_error(status: reqwest::StatusCode, body: &str) -> Error {
+fn http_error(status: reqwest::StatusCode, body: &str, registration: &Path) -> Error {
     let parsed: Option<Value> = serde_json::from_str(body).ok();
     let field = |k: &str| {
         parsed
@@ -270,7 +272,10 @@ fn http_error(status: reqwest::StatusCode, body: &str) -> Error {
         },
     );
     if status.as_u16() == 401 {
-        e.message = "the OpenCode service rejected the registered password (stale ~/.local/state/opencode/service.json?); restart the service from an OpenCode client".into();
+        e.message = format!(
+            "the OpenCode service rejected the registered password (stale {}?); restart the service from an OpenCode client",
+            registration.display()
+        );
     }
     e
 }
@@ -308,7 +313,7 @@ impl Service {
             .text()
             .await
             .map_err(|e| Error::transport("opencode service", e))?;
-        Err(http_error(status, &body))
+        Err(http_error(status, &body, &self.registration))
     }
 
     /// Send a request and decode its JSON body (an empty body reads as `null`).
@@ -580,6 +585,7 @@ pub async fn connect(registration: &Path) -> Result<Service> {
         http: reqwest::Client::new(),
         url: reg.url.trim_end_matches('/').to_string(),
         password: reg.password,
+        registration: registration.to_path_buf(),
         pid: reg.pid,
         version: reg.version.unwrap_or_default(),
     };

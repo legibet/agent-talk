@@ -121,6 +121,14 @@ impl Row {
             .iter()
             .rposition(|p| matches!(p, Part::Text { .. }))
     }
+
+    /// The text of `reply_part`.
+    fn reply(&self) -> Option<&str> {
+        match &self.content[self.reply_part()?] {
+            Part::Text { text } => Some(text.as_deref().unwrap_or_default()),
+            _ => None,
+        }
+    }
 }
 
 /// Everything in history from a user message to the end of its turn.
@@ -188,7 +196,7 @@ impl Span {
 
     /// The turn, once it ended.
     pub fn turn(&self, session_id: &str) -> Option<model::Turn> {
-        let (status, ended_at) = match self.end.as_ref()? {
+        let (status, ended_at, basis) = match self.end.as_ref()? {
             End::Idle(idle) => (
                 match idle.outcome {
                     Some(IdleOutcome::Succeeded) => TurnStatus::Completed,
@@ -197,10 +205,12 @@ impl Span {
                     Some(IdleOutcome::Other) | None => TurnStatus::Unknown,
                 },
                 idle.time.created,
+                "history: the first idle row after the message; one execution may answer several messages",
             ),
             End::Aborted => (
                 TurnStatus::Interrupted,
                 self.after.last().and_then(|r| r.time.completed),
+                "history: an interrupted step with no idle row after it",
             ),
         };
         let assistants: Vec<&Row> = self
@@ -208,16 +218,14 @@ impl Span {
             .iter()
             .filter(|r| r.kind == Kind::Assistant)
             .collect();
-        let text_of = |r: &Row| {
-            let parts: Vec<&str> = r.texts().collect();
-            (!parts.is_empty()).then(|| parts.join("\n"))
-        };
+        // The message `read` marks final; a turn without one (interrupted, failed) answers
+        // with its last text.
         let final_text = assistants
             .iter()
             .rev()
-            .filter(|r| r.finish == Some(Finish::Stop))
-            .find_map(|r| text_of(r))
-            .or_else(|| assistants.iter().rev().find_map(|r| text_of(r)));
+            .find_map(|r| r.reply())
+            .or_else(|| assistants.iter().rev().find_map(|r| r.texts().last()))
+            .map(String::from);
         let error = assistants.iter().rev().find_map(|r| r.error.clone());
         Some(model::Turn {
             handle: handle(session_id),
@@ -229,9 +237,7 @@ impl Span {
                 (Some(s), Some(e)) => Some(e - s),
                 _ => None,
             },
-            basis: Some(
-                "history: the first idle message after the user message, or its interrupted step when a new user message followed without one or nothing runs any more; one execution may answer several user messages".into(),
-            ),
+            basis: Some(basis.into()),
         })
     }
 }
@@ -440,6 +446,39 @@ mod tests {
         assert!(span.undecided_abort());
         span.end_at_abort();
         assert_eq!(span.turn("ses_x").unwrap().status, TurnStatus::Interrupted);
+    }
+
+    /// `wait` reports as the final reply what `read` marks `final`: the last text part of
+    /// the last step that stopped, not every text of that step.
+    #[test]
+    fn wait_and_read_agree_on_the_reply() {
+        let page = [
+            json!({"id":"msg_u","time":{"created":1},"text":"two","type":"user"}),
+            json!({"id":"msg_a1","time":{"created":2,"completed":3},"type":"assistant","finish":"stop",
+                "content":[{"type":"text","text":"working"},{"type":"tool","name":"shell","state":{"status":"completed"}},{"type":"text","text":"two"}]}),
+            json!({"id":"msg_a2","time":{"created":4,"completed":5},"type":"assistant","finish":"stop",
+                "content":[{"type":"reasoning","text":"done"}]}),
+            json!({"id":"msg_i","time":{"created":6},"type":"idle","outcome":"succeeded"}),
+        ];
+        let finals: Vec<String> = messages(&page, None)
+            .into_iter()
+            .filter(|(_, m)| m.phase == Phase::Final)
+            .map(|(_, m)| m.text)
+            .collect();
+        let span = Span::new(Row::decode(&page[0]), rows(&page[1..]));
+        let t = span.turn("ses_x").unwrap();
+        assert_eq!(finals, ["two"]);
+        assert_eq!(t.final_text.as_deref(), Some("two"));
+
+        // Interrupted before any step stopped: no final message, the last text instead.
+        let cut = json!({"id":"msg_b","time":{"created":2,"completed":3},"type":"assistant","finish":"error",
+            "error":{"type":"aborted"},"content":[{"type":"text","text":"first"},{"type":"text","text":"second"}]});
+        let idle = json!({"id":"msg_j","time":{"created":4},"type":"idle","outcome":"interrupted"});
+        let span = Span::new(Row::decode(&page[0]), rows(&[cut, idle]));
+        assert_eq!(
+            span.turn("ses_x").unwrap().final_text.as_deref(),
+            Some("second")
+        );
     }
 
     #[test]

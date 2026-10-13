@@ -382,10 +382,9 @@ impl<'a> OpenCode<'a> {
                 Some(events) => self.observe(svc, events, &mut w).await.map(Some),
             }
         };
-        let res = match deadline {
-            Some(d) => bounded(Some(d), work).await,
-            None => work.await,
-        };
+        // Bounded even without a deadline, so that Ctrl-C or SIGTERM during the submission
+        // settles the receipt `unknown` (DESIGN.md §4).
+        let res = bounded(deadline, work).await;
         let progress = w.progress();
         settle(
             self.store,
