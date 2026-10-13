@@ -508,22 +508,12 @@ pub fn files(sessions: &Path) -> impl Iterator<Item = (String, PathBuf)> {
         })
 }
 
-/// The session file `*_<id>.jsonl` under any cwd directory of `sessions`. Ids are unique
-/// per cwd only; a second match is an error, not a guess.
+/// The session file of `id` under any cwd directory of `sessions`. Ids are unique per cwd
+/// only; a second match is an error, not a guess.
 pub fn find(sessions: &Path, id: &str) -> Result<Option<PathBuf>> {
-    let suffix = format!("_{id}.jsonl");
-    let mut hits: Vec<PathBuf> = std::fs::read_dir(sessions)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|d| d.path().is_dir())
-        .flat_map(|d| std::fs::read_dir(d.path()).into_iter().flatten().flatten())
-        .map(|f| f.path())
-        .filter(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.ends_with(&suffix))
-        })
+    let mut hits: Vec<PathBuf> = files(sessions)
+        .filter(|(i, _)| i == id)
+        .map(|(_, path)| path)
         .collect();
     hits.sort();
     match hits.len() {
@@ -656,6 +646,31 @@ mod tests {
             .collect();
         assert_eq!(view, [("c1", "summary"), ("c2", "a\nb")]);
         assert_eq!(msgs[0].1.from, Some(Caller::RUNTIME));
+    }
+
+    /// The id is what follows the first `_` of the file name, and `find` compares it whole:
+    /// `b` is not found in `…_a_b.jsonl`.
+    #[test]
+    fn session_files() {
+        let dir = std::env::temp_dir().join(format!("pi-sessions-{}", std::process::id()));
+        let file = |d: &str, name: &str| {
+            std::fs::create_dir_all(dir.join(d)).unwrap();
+            std::fs::write(dir.join(d).join(name), "").unwrap();
+            dir.join(d).join(name)
+        };
+        let b = file("--x--", "2026-10-07T12-32-33-000Z_b.jsonl");
+        let ab = file("--y--", "2026-10-07T12-32-34-000Z_a_b.jsonl");
+        file("--y--", "notes.jsonl");
+        file("--y--", "2026-10-07T12-32-35-000Z_-bad.jsonl");
+        let mut ids: Vec<String> = files(&dir).map(|(id, _)| id).collect();
+        ids.sort();
+        assert_eq!(ids, ["a_b", "b"]);
+        assert_eq!(find(&dir, "b").unwrap(), Some(b));
+        assert_eq!(find(&dir, "a_b").unwrap(), Some(ab));
+        assert_eq!(find(&dir, "a").unwrap(), None);
+        file("--z--", "2026-10-07T12-32-36-000Z_b.jsonl");
+        assert!(find(&dir, "b").is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

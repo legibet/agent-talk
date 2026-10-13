@@ -589,8 +589,8 @@ impl Agent for Pi<'_> {
                         let turn_id = turn_id.clone().unwrap_or_default();
                         return Ok(run::exited(h.clone(), turn_id, None));
                     }
-                    Err(e) if receipt_id.is_none() || file.is_none() => return Err(e),
-                    _ => {}
+                    Err(e) => return Err(e),
+                    Ok(None) => {}
                 }
                 waiting_for = "session file: waiting for an assistant message without tool calls or a later user message after the prompt (best effort; pi records no process liveness)".into();
                 tokio::time::sleep(Duration::from_secs(1)).await;

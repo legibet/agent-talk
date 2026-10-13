@@ -797,7 +797,9 @@ from a later command.
 
 - Session files `<agent dir>/sessions/--<cwd>--/<timestamp>_<id>.jsonl`, where the agent dir is
   `$PI_CODING_AGENT_DIR`, else `~/.pi/agent`, and the cwd loses its leading separator and has
-  `/`, `\` and `:` replaced by `-`. `--session <path>` opens the file in place and runs the
+  `/`, `\` and `:` replaced by `-`. The timestamp has no `_` (its `:` and `.` become `-`), and
+  pi accepts `_` in an id, so the id is everything after the first `_` and is compared whole.
+  `--session <path>` opens the file in place and runs the
   session in the directory its header records, whatever the process cwd. `--session <id>` is
   not used: an id found only in another project's directory makes pi ask on stdin whether to
   fork, and json mode would read the prompt as the answer. Ids are unique per directory only;
@@ -825,7 +827,9 @@ from a later command.
   ended it. Other turns end, best effort, at the first assistant entry after the prompt on the
   live branch without tool calls, skipping an entry a later `context_edit` with a `null`
   replacement hides (pi's auto-retry keeps the failed message in the file; an edit with content
-  keeps the entry), or at a later user message. Steer and follow-up messages are plain user
+  keeps the entry), or at a later user message. `wait` refuses (`E_PRECONDITION`) a turn that is
+  not a user entry on the live branch, and a receipt with neither a turn id nor a run log, whose
+  outcome cannot be recovered. Steer and follow-up messages are plain user
   entries, so they read as prompts of their own. No `duration_ms`: pi stamps an assistant
   message when its request starts, not when the reply ends.
 - An unknown `--model` exits 1 before any file exists and the receipt is `rejected` with pi's
