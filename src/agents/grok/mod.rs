@@ -11,34 +11,37 @@
 //!
 //! agent-talk's `promptId` (the intent's client message id) becomes the persisted
 //! `turn_completed.prompt_id`, so it is the turn id. History, turn ends after the
-//! command and listings come from the store `<GROK_HOME>/sessions/<urlencoded
-//! cwd>/<id>/` (`updates.jsonl`, `summary.json`) and `<GROK_HOME>/active_sessions.json`.
+//! command and listings come from the session store (`sessions.rs`, `updates.rs`).
 
 mod acp;
+mod sessions;
 mod updates;
+mod watch;
 
-use self::acp::{Conn, Event, Reply, ServerRequest, Spawn};
+use self::acp::{Conn, Spawn};
+use self::sessions::{Active, Summary};
 use self::updates::{History, first_prompt};
+use self::watch::{End, Watch};
 use crate::agents::child::{cli_version, lock, pid_alive};
 use crate::agents::history::{ReadPage, ReadQuery, cut, first_line};
 use crate::agents::lifecycle::{
-    ApprovalPolicy, approval_policy, bounded, record, reject, settle, wait_receipt,
+    ApprovalPolicy, approval_policy, bounded, note_waiting, reject, settle, wait_receipt,
 };
 use crate::agents::{
     Agent, AgentStatus, Check, ListFilter, Operation, SendRequest, StartRequest, WaitTarget,
     strip_provenance,
 };
 use crate::model::{
-    self, Approval, ApprovalOutcome, Error, ErrorCode, Loaded, Model, Observations, Outcome, Page,
-    Progress, ReceiptState, Result, Session, SessionState, TurnStatus,
+    self, Error, ErrorCode, Loaded, Model, Observations, Outcome, Page, Progress, ReceiptState,
+    Result, Session, SessionState, TurnStatus,
 };
 use crate::store::{NewIntent, Store};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::HashSet;
+use std::fmt::Write as _;
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tokio::sync::oneshot;
 use tokio::time::Instant;
 
 /// Why agent-talk refuses a second writer (DESIGN.md §6.4).
@@ -51,10 +54,8 @@ pub struct Grok<'a> {
     store: &'a Store,
     /// `$GROK_HOME`, default `~/.grok`.
     home: PathBuf,
-    /// `$GROK_LEADER_SOCKET`, default `<home>/leader.sock`.
-    socket: PathBuf,
-    /// The socket came from `GROK_LEADER_SOCKET`; only then is `--leader-socket` passed.
-    socket_override: bool,
+    /// `$GROK_LEADER_SOCKET`, passed on as `--leader-socket`.
+    leader_socket: Option<PathBuf>,
 }
 
 fn handle(id: &str) -> String {
@@ -71,44 +72,83 @@ fn check_id(id: &str) -> Result<()> {
     })
 }
 
-#[derive(Debug, Deserialize)]
-struct Summary {
-    info: SummaryInfo,
-    /// Set by `_x.ai/session/rename` (with `title_is_manual: true`) or generated.
-    #[serde(default)]
-    generated_title: Option<String>,
-    /// `headless` for `-p`; null for the TUI and ACP.
-    #[serde(default)]
-    session_kind: Option<String>,
-    #[serde(default)]
-    updated_at: Option<String>,
+/// `params` with `_meta.yoloMode: true` when the session gets full access: on `session/new`
+/// and on a direct-mode `session/load`, for this process's session only (DESIGN.md §6.4).
+fn with_yolo(mut params: Value, full_access: bool) -> Value {
+    if full_access {
+        params["_meta"] = json!({"yoloMode": true});
+    }
+    params
 }
 
-impl Summary {
-    /// `updated_at`, empty when absent: the `ls` order and cursor.
-    fn at(&self) -> &str {
-        self.updated_at.as_deref().unwrap_or("")
+/// `session/set_config_option`: `config` (`model`, `reasoning_effort`) of the session,
+/// which Grok stores in `summary.json` at once (DESIGN.md §6.4).
+async fn set_config(conn: &Conn, id: &str, config: &str, value: &str) -> Result<()> {
+    let params = json!({"sessionId": id, "configId": config, "value": value});
+    match conn.request("session/set_config_option", params).await {
+        Ok(_) => Ok(()),
+        Err(mut e) => {
+            e.message = format!("{config} {value} refused: {}", e.message);
+            Err(e)
+        }
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct SummaryInfo {
-    id: String,
+/// One entry of the `initialize` response's `_meta.modelState.availableModels`.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AvailableModel {
     #[serde(default)]
-    cwd: Option<String>,
+    model_id: String,
+    #[serde(rename = "_meta", default)]
+    meta: ModelMeta,
 }
 
-/// One row of `active_sessions.json`: a live TUI (DESIGN.md §6.4).
-#[derive(Debug, Deserialize)]
-struct Active {
-    session_id: String,
-    pid: u32,
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelMeta {
+    #[serde(default)]
+    reasoning_efforts: Vec<Effort>,
 }
 
-/// A session as `_x.ai/sessions/list` describes it, through the leader.
+#[derive(Deserialize)]
+struct Effort {
+    value: Option<String>,
+}
+
+/// A session as `_x.ai/sessions/list` describes it. `resident` and `activity` describe
+/// the process that answers, so they mean something only through a leader (DESIGN.md
+/// §6.4).
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct Listed {
+    session_id: String,
+    #[serde(default)]
     resident: bool,
-    activity: String,
+    #[serde(default)]
+    activity: Activity,
+}
+
+#[derive(Clone, Copy, Default, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+enum Activity {
+    Working,
+    Idle,
+    Dormant,
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+impl Activity {
+    fn as_str(self) -> &'static str {
+        match self {
+            Activity::Working => "working",
+            Activity::Idle => "idle",
+            Activity::Dormant => "dormant",
+            Activity::Unknown => "unknown",
+        }
+    }
 }
 
 /// The leader as seen at the start of this command: its socket answered a connect.
@@ -117,304 +157,14 @@ struct Leader {
     pid: Option<u32>,
 }
 
-/// What this command observes of one prompt: its own `session/prompt`, or, for a
-/// steer message, the turn it joined.
-struct TurnWatch {
-    id: String,
-    receipt_id: String,
-    /// agent-talk's promptId; for steer, the turn the interjection joined, once known.
-    prompt_id: Option<String>,
-    /// Steer: the delivered text, matched against `_x.ai/session/interjection`.
-    interjection: Option<String>,
-    policy: ApprovalPolicy,
-    /// Attached through a leader, where other clients' permission requests arrive too.
-    shared: bool,
-    accepted: bool,
-    running: bool,
-    /// The prompt the session runs now (`runningPromptId`).
-    running_prompt: Option<String>,
-    /// Agent text of the prompt since its last tool call.
-    text: String,
-    tools: HashSet<String>,
-    approvals: Vec<Approval>,
-    response: Option<oneshot::Receiver<Reply>>,
-    /// `{stopReason, …}`: the `session/prompt` result, or for steer the
-    /// `_x.ai/session/prompt_complete` of the joined turn.
-    result: Option<Result<Value>>,
-}
-
-impl TurnWatch {
-    /// This command's own `session/prompt`, submitted with `prompt_id`.
-    fn prompt(
-        id: &str,
-        receipt_id: &str,
-        prompt_id: &str,
-        policy: ApprovalPolicy,
-        shared: bool,
-    ) -> Self {
-        TurnWatch {
-            prompt_id: Some(prompt_id.to_string()),
-            ..TurnWatch::new(id, receipt_id, policy, shared)
-        }
-    }
-
-    /// A steer message `text` through the leader, sent while the session runs the
-    /// prompt `running` (`runningPromptId` at load); the joined turn is learned later.
-    fn steer(
-        id: &str,
-        receipt_id: &str,
-        running: Option<String>,
-        text: &str,
-        policy: ApprovalPolicy,
-    ) -> Self {
-        TurnWatch {
-            interjection: Some(text.to_string()),
-            running_prompt: running,
-            ..TurnWatch::new(id, receipt_id, policy, true)
-        }
-    }
-
-    /// What both kinds start from: nothing seen yet.
-    fn new(id: &str, receipt_id: &str, policy: ApprovalPolicy, shared: bool) -> Self {
-        TurnWatch {
-            id: id.to_string(),
-            receipt_id: receipt_id.to_string(),
-            prompt_id: None,
-            interjection: None,
-            policy,
-            shared,
-            accepted: false,
-            running: false,
-            running_prompt: None,
-            text: String::new(),
-            tools: HashSet::new(),
-            approvals: Vec::new(),
-            response: None,
-            result: None,
-        }
-    }
-
-    fn accept(&mut self, store: &Store) -> Result<()> {
-        if !self.accepted {
-            let p = self.prompt_id.as_deref();
-            store.accept(&self.receipt_id, p, p, None)?;
-            self.accepted = true;
-        }
-        Ok(())
-    }
-
-    /// Events until the turn's result arrives (or, with `until_running`, until the
-    /// prompt runs).
-    async fn observe(&mut self, store: &Store, conn: &mut Conn, until_running: bool) -> Result<()> {
-        loop {
-            if self.result.is_some() || (until_running && self.running) {
-                return Ok(());
-            }
-            let ev = match self.response.as_mut() {
-                Some(rx) => tokio::select! {
-                    biased;
-                    r = rx => Err(r),
-                    ev = conn.next_event() => Ok(ev),
-                },
-                None => Ok(conn.next_event().await),
-            };
-            match ev {
-                Err(r) => {
-                    self.response = None;
-                    let r = conn.reply(r);
-                    if r.is_ok() {
-                        self.accept(store)?;
-                    }
-                    self.result = Some(r);
-                }
-                Ok(Some(Event::Request(r))) => self.on_request(store, conn, r).await?,
-                Ok(Some(Event::Notification { method, params })) => {
-                    self.on_notification(store, &method, &params)?
-                }
-                // Never reached with a response pending: the reader drops the waiters
-                // before the event channels close, so the biased select above has
-                // already taken the response (or its loss).
-                Ok(None) => {
-                    return Err(Error::new(
-                        ErrorCode::Transport,
-                        "grok agent exited while agent-talk was observing; outcome unknown",
-                    ));
-                }
-            }
-        }
-    }
-
-    fn on_notification(&mut self, store: &Store, method: &str, params: &Value) -> Result<()> {
-        if params["sessionId"] != self.id.as_str() {
-            return Ok(());
-        }
-        let mine = |p: &Value, id: &Option<String>| id.is_some() && p.as_str() == id.as_deref();
-        match method {
-            // The queue lists the prompt (its id is the promptId) and then names it
-            // running; the first is the earliest proof of acceptance (direct mode:
-            // about 20 ms after the request).
-            "_x.ai/queue/changed" => {
-                let listed = params["entries"]
-                    .as_array()
-                    .is_some_and(|es| es.iter().any(|e| mine(&e["id"], &self.prompt_id)));
-                let running = mine(&params["runningPromptId"], &self.prompt_id);
-                self.running_prompt = params["runningPromptId"].as_str().map(String::from);
-                if listed || running {
-                    self.accept(store)?;
-                }
-                if running {
-                    self.running = true;
-                }
-            }
-            "_x.ai/session/interjection" => {
-                if self.interjection.is_some()
-                    && params["text"].as_str() == self.interjection.as_deref()
-                {
-                    self.interjection = None;
-                    // Joined the running turn; with none running, Grok starts a
-                    // fallback turn, named by its first update.
-                    if let Some(p) = self.running_prompt.clone() {
-                        self.prompt_id = Some(p);
-                        self.running = true;
-                        store.accept(&self.receipt_id, None, self.prompt_id.as_deref(), None)?;
-                    }
-                }
-            }
-            "session/update" => {
-                let p = &params["_meta"]["promptId"];
-                if self.prompt_id.is_none()
-                    && self.accepted
-                    && p.as_str()
-                        .is_some_and(|p| p.starts_with("interject-fallback-"))
-                {
-                    self.prompt_id = p.as_str().map(String::from);
-                    store.accept(&self.receipt_id, None, self.prompt_id.as_deref(), None)?;
-                }
-                if !mine(p, &self.prompt_id) {
-                    return Ok(());
-                }
-                self.running = true;
-                self.accept(store)?;
-                let u = &params["update"];
-                match u["sessionUpdate"].as_str() {
-                    Some("agent_message_chunk") => self
-                        .text
-                        .push_str(u["content"]["text"].as_str().unwrap_or("")),
-                    Some("tool_call") => {
-                        self.text.clear();
-                        if let Some(id) = u["toolCallId"].as_str() {
-                            self.tools.insert(id.to_string());
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            "_x.ai/session/prompt_complete"
-                if self.response.is_none() && mine(&params["promptId"], &self.prompt_id) =>
-            {
-                self.result = Some(Ok(params.clone()));
-            }
-            "_x.ai/session_notification" => {
-                let u = &params["update"];
-                if u["sessionUpdate"] == "interaction_resolved" {
-                    // Someone answered (or agent-talk's own answer took effect).
-                    for a in self.approvals.iter_mut().filter(|a| {
-                        a.outcome == ApprovalOutcome::Pending
-                            && a.item_id.as_deref() == u["tool_call_id"].as_str()
-                    }) {
-                        a.outcome = ApprovalOutcome::Resolved;
-                        record(store, a);
-                    }
-                }
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-
-    /// A request from the agent. Permission requests are recorded; under `deny` the
-    /// ones for this prompt's tool calls (matched by `toolCallId`; through a leader,
-    /// other clients' turns raise them too) get the `reject_once` option. Anything
-    /// else is answered "method not found": agent-talk offers no client capabilities.
-    async fn on_request(&mut self, store: &Store, conn: &Conn, r: ServerRequest) -> Result<()> {
-        let ServerRequest { id, method, params } = r;
-        if method != "session/request_permission" {
-            return conn
-                .respond_error(&id, -32601, "not supported by agent-talk")
-                .await;
-        }
-        let call = &params["toolCall"];
-        let call_id = call["toolCallId"].as_str().map(String::from);
-        // A request already recorded is not answered again. Unverified whether Grok
-        // ever sends the same request twice to one client.
-        if self
-            .approvals
-            .iter()
-            .any(|a| a.request_id == id && a.item_id == call_id)
-        {
-            return Ok(());
-        }
-        let ours = !self.shared || call_id.as_ref().is_some_and(|c| self.tools.contains(c));
-        let reject = params["options"]
-            .as_array()
-            .and_then(|os| os.iter().find(|o| o["kind"] == "reject_once"))
-            .and_then(|o| o["optionId"].as_str());
-        let outcome = match (self.policy, ours, reject) {
-            (ApprovalPolicy::Deny, true, Some(option)) => {
-                conn.respond(
-                    &id,
-                    json!({"outcome": {"outcome": "selected", "optionId": option}}),
-                )
-                .await?;
-                ApprovalOutcome::Declined
-            }
-            _ => ApprovalOutcome::Pending,
-        };
-        let summary = call["title"]
-            .as_str()
-            .or(call["_meta"]["x.ai/tool"]["name"].as_str())
-            .map(|t| first_line(t, 160))
-            .unwrap_or_else(|| "permission request".into());
-        let a = Approval {
-            handle: handle(&self.id),
-            turn_id: if ours { self.prompt_id.clone() } else { None },
-            item_id: call_id,
-            request_id: id,
-            kind: method,
-            summary,
-            outcome,
-            raw: params,
-        };
-        record(store, &a);
-        self.approvals.push(a);
-        Ok(())
-    }
-
-    /// The turn as its result reports it; `final_text` is the agent text after the
-    /// last tool call, from the live updates. `note` is appended to the basis.
-    fn turn(&self, handle: String, result: &Value, basis: &str, note: Option<&str>) -> model::Turn {
-        let (status, error) = updates::status(
-            result["stopReason"].as_str().unwrap_or(""),
-            &result["_meta"],
-        );
-        model::Turn {
-            handle,
-            // A result exists only for a known prompt: a prompt carries its id from the
-            // start, and a steer result is the prompt_complete matched by that id.
-            turn_id: self
-                .prompt_id
-                .clone()
-                .expect("a turn result names its prompt"),
-            status,
-            error,
-            final_text: (!self.text.is_empty()).then(|| self.text.clone()),
-            duration_ms: None,
-            basis: Some(match note {
-                Some(n) => format!("{basis}; {n}"),
-                None => basis.into(),
-            }),
-        }
-    }
+/// How this command reaches a session (DESIGN.md §6.4).
+enum Route {
+    /// Through the live leader, which holds the session; clients of one leader do not
+    /// exclude each other.
+    Leader(Leader),
+    /// A `--no-leader` child that holds the session while the command runs, under
+    /// agent-talk's lock.
+    Direct { _lock: File },
 }
 
 impl<'a> Grok<'a> {
@@ -423,44 +173,24 @@ impl<'a> Grok<'a> {
         let home = std::env::var_os("GROK_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| home_dir.join(".grok"));
-        let (socket, socket_override) = match std::env::var_os("GROK_LEADER_SOCKET") {
-            Some(s) => (PathBuf::from(s), true),
-            None => (home.join("leader.sock"), false),
-        };
         Grok {
             store,
             home,
-            socket,
-            socket_override,
+            leader_socket: std::env::var_os("GROK_LEADER_SOCKET").map(PathBuf::from),
         }
     }
 
-    fn sessions(&self) -> PathBuf {
-        self.home.join("sessions")
-    }
-
-    /// The session directory, found by id across the cwd groups.
-    fn find(&self, id: &str) -> Option<PathBuf> {
-        std::fs::read_dir(self.sessions())
-            .ok()?
-            .flatten()
-            .map(|d| d.path().join(id))
-            .find(|p| p.is_dir())
-    }
-
-    fn require(&self, id: &str) -> Result<PathBuf> {
-        self.find(id).ok_or_else(|| {
-            Error::new(
-                ErrorCode::Precondition,
-                format!("no Grok session {id} under {}", self.sessions().display()),
-            )
-        })
+    /// `$GROK_LEADER_SOCKET`, default `<home>/leader.sock`.
+    fn socket(&self) -> PathBuf {
+        self.leader_socket
+            .clone()
+            .unwrap_or_else(|| self.home.join("leader.sock"))
     }
 
     /// The pid in the leader's lock file, which sits next to its socket (`leader.sock`,
     /// `leader.lock`; a custom socket `x.sock` has `x.lock`).
     fn leader_pid(&self) -> Option<u32> {
-        std::fs::read_to_string(self.socket.with_extension("lock"))
+        std::fs::read_to_string(self.socket().with_extension("lock"))
             .ok()?
             .trim()
             .parse()
@@ -473,7 +203,8 @@ impl<'a> Grok<'a> {
     /// means "no leader".
     fn leader(&self) -> Result<Option<Leader>> {
         let pid = self.leader_pid();
-        match std::os::unix::net::UnixStream::connect(&self.socket) {
+        let socket = self.socket();
+        match std::os::unix::net::UnixStream::connect(&socket) {
             Ok(_) => Ok(Some(Leader { pid })),
             Err(e)
                 if matches!(
@@ -489,7 +220,7 @@ impl<'a> Grok<'a> {
                 ErrorCode::Transport,
                 format!(
                     "cannot probe the Grok leader socket {}: {e}. A sandbox that blocks local network access fails this way; agent-talk needs to reach the socket to tell whether a leader runs",
-                    self.socket.display()
+                    socket.display()
                 ),
             )),
         }
@@ -497,8 +228,8 @@ impl<'a> Grok<'a> {
 
     /// A note when `leader.lock` names another pid than at the probe: the leader that
     /// answered exited in between and the `--leader` child spawned a new one.
-    fn leader_change(&self, leader: &Option<Leader>) -> Option<String> {
-        let before = leader.as_ref()?.pid;
+    fn leader_change(&self, leader: &Leader) -> Option<String> {
+        let before = leader.pid;
         let after = self.leader_pid();
         (before != after).then(|| {
             let note = format!(
@@ -511,55 +242,53 @@ impl<'a> Grok<'a> {
 
     /// A `grok agent` child in `cwd`, initialized: `--leader` (only after `leader()`
     /// found a live socket) or `--no-leader`.
-    async fn connect(&self, cwd: &str, leader: bool, model: Option<&str>) -> Result<Conn> {
+    async fn connect(&self, cwd: &Path, leader: bool, model: Option<&str>) -> Result<Conn> {
         let opts = Spawn {
             leader,
-            leader_socket: self.socket_override.then_some(self.socket.as_path()),
+            leader_socket: self.leader_socket.as_deref(),
             model,
         };
         acp::spawn(cwd, &opts).await
     }
 
-    /// `_x.ai/sessions/list` through the leader: the entry for `id` if it is listed,
-    /// or with `None` every listed session.
-    async fn listed(&self, conn: &Conn, id: Option<&str>) -> Result<Vec<(String, Listed)>> {
+    /// `_x.ai/sessions/list`: every session the answering process knows.
+    async fn listed(&self, conn: &Conn) -> Result<Vec<Listed>> {
         let v = conn.request("_x.ai/sessions/list", json!({})).await?;
-        // The sessions sit under a nested `result` (verified in direct and leader mode).
+        // The sessions sit under a nested `result` (seen in direct and leader mode, grok
+        // 1.0.46).
         Ok(v["result"]["sessions"]
             .as_array()
             .into_iter()
             .flatten()
-            .filter_map(|s| {
-                let sid = s["sessionId"].as_str()?;
-                (id.is_none() || id == Some(sid)).then(|| {
-                    (
-                        sid.to_string(),
-                        Listed {
-                            resident: s["resident"].as_bool() == Some(true),
-                            activity: s["activity"].as_str().unwrap_or("unknown").to_string(),
-                        },
-                    )
-                })
-            })
+            .filter_map(|s| Listed::deserialize(s).ok())
             .collect())
     }
 
-    /// Rows of `active_sessions.json` (absent: none).
-    fn active(&self) -> Result<Vec<Active>> {
-        let path = self.home.join("active_sessions.json");
-        match std::fs::read_to_string(&path) {
-            Ok(t) => serde_json::from_str(&t).map_err(|e| {
-                Error::new(
-                    ErrorCode::CapMissing,
-                    format!(
-                        "cannot check whether a Grok TUI holds the session: {}: {e}",
-                        path.display()
-                    ),
-                )
-            }),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-            Err(e) => Err(Error::transport(path.display(), e)),
+    /// The leader's own view of the sessions, when one runs; what cannot be read is
+    /// left out with a warning.
+    async fn leader_sessions(&self) -> Vec<Listed> {
+        match self.leader() {
+            Ok(Some(_)) => {}
+            Ok(None) => return Vec::new(),
+            Err(e) => {
+                tracing::warn!("{e}");
+                return Vec::new();
+            }
         }
+        // The client process needs some cwd; `_x.ai/sessions/list` covers all.
+        let conn = match self.connect(&std::env::temp_dir(), true, None).await {
+            Ok(conn) => conn,
+            Err(e) => {
+                tracing::warn!("leader client: {e}");
+                return Vec::new();
+            }
+        };
+        let listed = self.listed(&conn).await.unwrap_or_else(|e| {
+            tracing::warn!("leader sessions/list: {e}");
+            Vec::new()
+        });
+        conn.close().await;
+        listed
     }
 
     /// A recorded child of the session that is still alive and whose turn has
@@ -594,8 +323,7 @@ impl<'a> Grok<'a> {
     /// leader path would have been taken), or a grok agent another agent-talk command
     /// started.
     fn refuse_live(&self, id: &str, dir: &Path) -> Result<()> {
-        if let Some(a) = self
-            .active()?
+        if let Some(a) = sessions::active(&self.home)?
             .into_iter()
             .find(|a| a.session_id == id && pid_alive(a.pid))
         {
@@ -620,6 +348,50 @@ impl<'a> Grok<'a> {
         Ok(())
     }
 
+    /// How a queued send reaches the session, and the connection: through the leader
+    /// only when the leader lists the session resident (a listed but dormant session may
+    /// be held in process by a TUI); otherwise directly, under agent-talk's lock and only
+    /// while no other process holds the session.
+    async fn route(&self, id: &str, dir: &Path, cwd: &Path) -> Result<(Route, Conn)> {
+        if let Some(leader) = self.leader()? {
+            let conn = self.connect(cwd, true, None).await?;
+            let resident = self.listed(&conn).await.map(|l| {
+                l.iter()
+                    .find(|s| s.session_id == id)
+                    .is_some_and(|s| s.resident)
+            });
+            match resident {
+                Ok(true) => return Ok((Route::Leader(leader), conn)),
+                Ok(false) => conn.close().await,
+                Err(e) => {
+                    conn.close().await;
+                    return Err(e);
+                }
+            }
+        }
+        let lock = lock(&handle(id), SECOND_WRITER)?;
+        self.refuse_live(id, dir)?;
+        let conn = self.connect(cwd, false, None).await?;
+        Ok((Route::Direct { _lock: lock }, conn))
+    }
+
+    /// The session's working directory, from `summary.json`; it must still exist.
+    fn session_cwd(&self, dir: &Path) -> Result<String> {
+        match sessions::summary(dir)?.info.cwd {
+            Some(c) if Path::new(&c).is_dir() => Ok(c),
+            Some(c) => Err(Error::new(
+                ErrorCode::Precondition,
+                format!(
+                    "the session's directory {c} no longer exists; session/load would run it elsewhere"
+                ),
+            )),
+            None => Err(Error::new(
+                ErrorCode::Precondition,
+                "summary.json records no working directory for this session",
+            )),
+        }
+    }
+
     /// Record the intent, submit its text as a prompt on the loaded session and observe
     /// it (until the deadline, or to the end of the turn without one), then settle the
     /// receipt. The caller closes `conn`.
@@ -630,26 +402,19 @@ impl<'a> Grok<'a> {
         intent: &NewIntent<'_>,
         policy: ApprovalPolicy,
         deadline: Option<Instant>,
-        leader: &Option<Leader>,
+        route: &Route,
     ) -> Result<Outcome> {
         self.store.insert_intent(intent)?;
         // Direct mode: the child is the session's writer until it exits; later commands
         // tell it from a foreign writer by its pid.
-        if leader.is_none()
+        if let Route::Direct { .. } = route
             && let Some(pid) = conn.pid()
         {
             self.store
                 .insert_process(intent.receipt_id, intent.handle, pid)?;
         }
-        let mut w = TurnWatch::prompt(
-            id,
-            intent.receipt_id,
-            intent.client_msg_id,
-            policy,
-            leader.is_some(),
-        );
-        let rx = conn
-            .start(
+        let response = conn
+            .submit(
                 "session/prompt",
                 json!({
                     "sessionId": id,
@@ -657,67 +422,69 @@ impl<'a> Grok<'a> {
                     "_meta": {"promptId": intent.client_msg_id},
                 }),
             )
-            .await;
-        match rx {
-            Ok(rx) => w.response = Some(rx),
-            Err(e) => return Err(reject(self.store, &w.receipt_id, e)),
-        }
-        // Without --wait the turn still runs to its end: no process outlives the
-        // command in direct mode. Only Ctrl-C stops observing early.
-        let mut res = bounded(deadline, w.observe(self.store, conn, false)).await;
-        if let Err(e) = &mut res
-            && matches!(e.code, ErrorCode::Timeout | ErrorCode::Interrupted)
-        {
-            if leader.is_some() {
-                e.message
-                    .push_str("; the turn continues in the Grok leader");
-            } else {
-                // The child dies with this command and would take the turn down
-                // mid-step; end it Grok's way instead, so updates.jsonl records
-                // turn_completed (stop_reason cancelled). A cancel sent before the
-                // prompt runs is ignored, hence the wait for it to start.
-                let _ = tokio::time::timeout(WIND_DOWN, w.observe(self.store, conn, true)).await;
-                if w.result.is_none() {
-                    let _ = conn
-                        .notify("session/cancel", json!({"sessionId": id}))
-                        .await;
-                    let _ =
-                        tokio::time::timeout(WIND_DOWN, w.observe(self.store, conn, false)).await;
+            .await
+            .map_err(|e| reject(self.store, intent.receipt_id, e))?;
+        let shared = matches!(route, Route::Leader(_));
+        let mut w = Watch::prompt(
+            self.store,
+            id,
+            intent.receipt_id,
+            intent.client_msg_id,
+            response,
+            policy,
+            shared,
+        );
+        // Without --wait there is no deadline: the command still observes to the end of
+        // the turn (DESIGN.md §5) and reports no turn. Only a signal ends it early.
+        let mut res = bounded(deadline, w.finish(conn)).await;
+        let stopped = |e: &Error| matches!(e.code, ErrorCode::Timeout | ErrorCode::Interrupted);
+        let note = match route {
+            Route::Leader(leader) => {
+                if let Err(e) = &mut res
+                    && stopped(e)
+                {
+                    e.message
+                        .push_str("; the turn continues in the Grok leader");
                 }
-                e.message.push_str("; in direct mode no process outlives the command, so agent-talk ended the turn with session/cancel unless it finished first; wait --receipt reads how it ended from updates.jsonl");
+                self.leader_change(leader)
             }
-        }
-        let h = handle(id);
-        let note = self.leader_change(leader);
-        let res = res.and_then(|()| {
-            // observe(false) returns Ok only once the result is in.
-            match w.result.take().expect("observe ended without a result") {
-                Ok(v) => Ok(w.turn(h.clone(), &v, "session/prompt response", note.as_deref())),
-                // A refusal of the prompt itself; an error after acceptance is a failed turn.
-                Err(e) if !w.accepted => Err(reject(self.store, &w.receipt_id, e)),
-                Err(e) => Ok(model::Turn {
-                    handle: h.clone(),
-                    turn_id: intent.client_msg_id.to_string(),
-                    status: TurnStatus::Failed,
-                    error: Some(json!({"message": e.message, "agent_error": e.agent_error})),
-                    final_text: (!w.text.is_empty()).then(|| w.text.clone()),
-                    duration_ms: None,
-                    basis: Some("session/prompt error response".into()),
-                }),
+            Route::Direct { .. } => {
+                if let Err(e) = &mut res
+                    && stopped(e)
+                {
+                    wind_down(&mut w, conn, id).await;
+                    e.message.push_str("; in direct mode no process outlives the command, so agent-talk ended the turn with session/cancel unless it finished first; wait --receipt reads how it ended from updates.jsonl");
+                }
+                None
             }
-        });
-        let progress = if w.running {
-            Progress::Running
-        } else if w.accepted {
-            Progress::Pending
-        } else {
-            Progress::Unknown
         };
+        let h = handle(id);
+        let res = res.and_then(|end| match end.result {
+            Ok(v) => Ok(w.turn(
+                h.clone(),
+                end.turn_id,
+                &v,
+                "session/prompt response",
+                note.as_deref(),
+            )),
+            // A refusal of the prompt itself; an error after acceptance is a failed turn.
+            Err(e) if !w.accepted() => Err(reject(self.store, intent.receipt_id, e)),
+            Err(e) => Ok(model::Turn {
+                handle: h.clone(),
+                turn_id: end.turn_id,
+                status: TurnStatus::Failed,
+                error: Some(json!({"message": e.message, "agent_error": e.agent_error})),
+                final_text: w.final_text(),
+                duration_ms: None,
+                basis: Some("session/prompt error response".into()),
+            }),
+        });
+        let progress = w.progress();
         settle(
             self.store,
             h,
             res.map(|t| deadline.is_some().then_some(t)),
-            Some(&w.receipt_id),
+            Some(intent.receipt_id),
             w.approvals,
             progress,
         )
@@ -732,12 +499,10 @@ impl<'a> Grok<'a> {
         cwd: &str,
         full_access: bool,
     ) -> Result<Value> {
-        let mut params = json!({"sessionId": id, "cwd": cwd, "mcpServers": []});
-        if full_access {
-            // As on session/new: `_meta.yoloMode` on session/load sets yolo for this
-            // process's session (DESIGN.md §6.4).
-            params["_meta"] = json!({"yoloMode": true});
-        }
+        let params = with_yolo(
+            json!({"sessionId": id, "cwd": cwd, "mcpServers": []}),
+            full_access,
+        );
         let r = conn.request("session/load", params).await?;
         conn.discard_notifications();
         Ok(r)
@@ -758,21 +523,21 @@ impl<'a> Grok<'a> {
                 ErrorCode::NoSteer,
                 format!(
                     "Grok steers only through a live leader ({} does not answer), and in direct mode no process of an earlier command survives to steer; send without --steer",
-                    self.socket.display()
+                    self.socket().display()
                 ),
             ));
         };
-        let mut conn = self.connect(cwd, true, None).await?;
+        let mut conn = self.connect(Path::new(cwd), true, None).await?;
         let res = async {
-            let listed = self.listed(&conn, Some(id)).await?;
-            match listed.first() {
-                Some((_, l)) if l.resident && l.activity == "working" => {}
-                Some((_, l)) if l.resident => {
+            let listed = self.listed(&conn).await?;
+            match listed.iter().find(|s| s.session_id == id) {
+                Some(l) if l.resident && l.activity == Activity::Working => {}
+                Some(l) if l.resident => {
                     return Err(Error::new(
                         ErrorCode::Precondition,
                         format!(
                             "{h} is {} in the leader; steer needs a running turn (Grok would start a fallback turn instead); send without --steer",
-                            l.activity
+                            l.activity.as_str()
                         ),
                     ));
                 }
@@ -797,50 +562,54 @@ impl<'a> Grok<'a> {
                 client_msg_id: &client_msg_id,
                 message: &req.message,
             })?;
-            let mut w = TurnWatch::steer(id, &receipt_id, running, req.message.delivered, policy);
-            let ack = conn
-                .request(
-                    "_x.ai/interject",
-                    json!({"sessionId": id, "text": req.message.delivered}),
-                )
-                .await;
-            match ack {
-                // The ack (`status: queued`) is the acceptance; the turn it joined comes
-                // with `_x.ai/session/interjection`.
-                Ok(_) => w.accept(self.store)?,
-                Err(e) => return Err(reject(self.store, &w.receipt_id, e)),
-            }
+            let params = json!({"sessionId": id, "text": req.message.delivered});
+            conn.request("_x.ai/interject", params)
+                .await
+                .map_err(|e| reject(self.store, &receipt_id, e))?;
+            // The ack (`status: queued`) is the acceptance; the turn it joined comes with
+            // `_x.ai/session/interjection`.
+            self.store.accept(&receipt_id, None, None, None)?;
+            let mut w = Watch::steer(
+                self.store,
+                id,
+                &receipt_id,
+                req.message.delivered,
+                running,
+                policy,
+            );
             let res = match deadline {
-                Some(d) => bounded(Some(d), w.observe(self.store, &mut conn, false)).await,
+                Some(d) => bounded(Some(d), w.finish(&mut conn)).await.map(Some),
                 None => {
-                    // Without --wait: only until the joined turn is known (`running` is
-                    // set exactly when the watch learns its prompt id).
+                    // Without --wait: only until the joined turn is known.
                     let _ = tokio::time::timeout(
                         Duration::from_secs(5),
-                        w.observe(self.store, &mut conn, true),
+                        w.until_running(&mut conn),
                     )
                     .await;
-                    Ok(())
+                    Ok(None)
                 }
             };
-            let note = self.leader_change(&Some(leader));
-            // Steer sets no `session/prompt` response, so a result is the joined turn's
+            let note = self.leader_change(&leader);
+            // A steer message's turn ends with the joined turn's
             // `_x.ai/session/prompt_complete`, never an error.
-            let res = res.map(|()| {
-                w.result.take().and_then(Result::ok).map(|v| {
-                    w.turn(
-                        h.clone(),
-                        &v,
-                        "_x.ai/session/prompt_complete of the joined turn",
-                        note.as_deref(),
-                    )
-                })
+            let res = res.map(|end| match end {
+                Some(End {
+                    turn_id,
+                    result: Ok(v),
+                }) => Some(w.turn(
+                    h.clone(),
+                    turn_id,
+                    &v,
+                    "_x.ai/session/prompt_complete of the joined turn",
+                    note.as_deref(),
+                )),
+                _ => None,
             });
             settle(
                 self.store,
                 h.clone(),
                 res,
-                Some(&w.receipt_id),
+                Some(&receipt_id),
                 w.approvals,
                 Progress::Running,
             )
@@ -849,27 +618,92 @@ impl<'a> Grok<'a> {
         conn.close().await;
         res
     }
+
+    /// An `ls` row for the session in `dir`.
+    fn session(
+        &self,
+        dir: &Path,
+        s: Summary,
+        active: &[Active],
+        listed: &[Listed],
+    ) -> Result<Session> {
+        let id = s.info.id;
+        let h = handle(&id);
+        let owned = self.store.is_owned(&h)?;
+        let tui = active
+            .iter()
+            .any(|a| a.session_id == id && pid_alive(a.pid));
+        let resident = listed
+            .iter()
+            .find(|l| l.session_id == id)
+            .filter(|l| l.resident);
+        let own_pid = self.own_run(&id, dir)?;
+        let state = match (own_pid, resident.map(|l| l.activity)) {
+            (Some(_), _) | (None, Some(Activity::Working)) => SessionState::Running,
+            (None, Some(Activity::Idle)) => SessionState::Idle,
+            _ => SessionState::Unknown,
+        };
+        let loaded = own_pid.is_some() || tui || resident.is_some();
+        let updates_path = dir.join("updates.jsonl");
+        Ok(Session {
+            handle: h,
+            agent: "grok",
+            cwd: s.info.cwd,
+            name: s.generated_title,
+            preview: first_prompt(&updates_path).map(|p| first_line(strip_provenance(&p), 200)),
+            observations: Observations {
+                history: if updates_path.is_file() {
+                    model::History::Visible
+                } else {
+                    model::History::Absent
+                },
+                loaded: if loaded { Loaded::Yes } else { Loaded::No },
+                origin: if owned {
+                    "agent-talk".into()
+                } else if s.session_kind.as_deref() == Some("headless") {
+                    "headless".into()
+                } else {
+                    "grok".into()
+                },
+            },
+            state,
+            owned,
+            id,
+        })
+    }
+}
+
+/// The deadline or a signal ended observation of a direct-mode prompt. The child dies
+/// with this command and would take the turn down mid-step; end it Grok's way instead,
+/// so updates.jsonl records turn_completed (stop_reason cancelled). A cancel sent before
+/// the prompt runs is ignored, hence the wait for it to start.
+async fn wind_down(w: &mut Watch<'_>, conn: &mut Conn, id: &str) {
+    let ended = tokio::time::timeout(WIND_DOWN, w.until_running(conn)).await;
+    if !matches!(ended, Ok(Ok(true))) {
+        let _ = conn
+            .notify("session/cancel", json!({"sessionId": id}))
+            .await;
+        let _ = tokio::time::timeout(WIND_DOWN, w.finish(conn)).await;
+    }
 }
 
 impl Agent for Grok<'_> {
     async fn models(&self) -> Result<Vec<Model>> {
         // A direct child's `initialize` response lists the account's models with their
         // effort choices; no session is opened (DESIGN.md §6.4).
-        let conn = self
-            .connect(&self.home.to_string_lossy(), false, None)
-            .await?;
+        let conn = self.connect(&self.home, false, None).await?;
         let models = conn.init["_meta"]["modelState"]["availableModels"]
             .as_array()
             .into_iter()
             .flatten()
+            .filter_map(|m| AvailableModel::deserialize(m).ok())
             .map(|m| Model {
-                id: m["modelId"].as_str().unwrap_or_default().into(),
-                efforts: m["_meta"]["reasoningEfforts"]
-                    .as_array()
+                id: m.model_id,
+                efforts: m
+                    .meta
+                    .reasoning_efforts
                     .into_iter()
-                    .flatten()
-                    .filter_map(|e| e["value"].as_str())
-                    .map(String::from)
+                    .filter_map(|e| e.value)
                     .collect(),
             })
             .collect();
@@ -890,7 +724,7 @@ impl Agent for Grok<'_> {
             ),
             Err(e) => ("leader not reachable", Err(e.message)),
         };
-        let dir = self.sessions();
+        let dir = sessions::sessions_dir(&self.home);
         let store: Check = if dir.is_dir() {
             Ok(())
         } else {
@@ -918,138 +752,57 @@ impl Agent for Grok<'_> {
         limit: u32,
         cursor: Option<&str>,
     ) -> Result<Page<Session>> {
-        // (dir, summary), newest first, ties by id.
-        let mut rows: Vec<(PathBuf, Summary)> = Vec::new();
-        for group in std::fs::read_dir(self.sessions())
-            .into_iter()
-            .flatten()
-            .flatten()
-        {
-            for dir in std::fs::read_dir(group.path())
-                .into_iter()
-                .flatten()
-                .flatten()
-            {
-                let path = dir.path().join("summary.json");
-                let Ok(text) = std::fs::read_to_string(&path) else {
-                    continue;
-                };
-                let Ok(s) = serde_json::from_str::<Summary>(&text) else {
-                    tracing::warn!("undecodable {}", path.display());
-                    continue;
-                };
-                if filter.cwd.is_some() && s.info.cwd.as_deref() != filter.cwd {
-                    continue;
-                }
-                rows.push((dir.path(), s));
-            }
-        }
+        let mut rows = sessions::summaries(&self.home);
+        rows.retain(|(_, s)| filter.cwd.is_none() || s.info.cwd.as_deref() == filter.cwd);
+        // Newest first, ties by id; the cursor is `<updated_at>|<id>` of the last row of
+        // the previous page.
         rows.sort_by(|(_, a), (_, b)| b.at().cmp(a.at()).then(a.info.id.cmp(&b.info.id)));
-        let skip = match cursor {
-            Some(c) => {
-                let (at, id) = c.split_once('|').ok_or_else(|| {
-                    Error::new(ErrorCode::Precondition, format!("invalid cursor {c}"))
-                })?;
-                rows.iter()
-                    .position(|(_, s)| s.at() < at || (s.at() == at && s.info.id.as_str() > id))
-                    .unwrap_or(rows.len())
-            }
-            None => 0,
-        };
-        let end = (skip + limit as usize).min(rows.len());
-        let next_cursor = (end < rows.len() && end > 0).then(|| {
-            let s = &rows[end - 1].1;
-            format!("{}|{}", s.at(), s.info.id)
-        });
-        let page: Vec<_> = rows.into_iter().take(end).skip(skip).collect();
-        if page.is_empty() {
+        if let Some(c) = cursor {
+            let (at, id) = c.split_once('|').ok_or_else(|| {
+                Error::new(ErrorCode::Precondition, format!("invalid cursor {c}"))
+            })?;
+            rows.retain(|(_, s)| s.at() < at || (s.at() == at && s.info.id.as_str() > id));
+        }
+        let more = rows.len() > limit as usize;
+        rows.truncate(limit as usize);
+        let next_cursor = more
+            .then(|| {
+                rows.last()
+                    .map(|(_, s)| format!("{}|{}", s.at(), s.info.id))
+            })
+            .flatten();
+        if rows.is_empty() {
             return Ok(Page {
                 items: Vec::new(),
                 next_cursor,
             });
         }
-        let active = self.active().unwrap_or_else(|e| {
+        let active = sessions::active(&self.home).unwrap_or_else(|e| {
             tracing::warn!("{e}");
             Vec::new()
         });
-        // The leader's own view, when one runs.
-        let mut listed = Vec::new();
-        match self.leader() {
-            Ok(Some(_)) => {
-                // The client process needs some cwd; `_x.ai/sessions/list` covers all.
-                let cwd = std::env::temp_dir().to_string_lossy().into_owned();
-                match self.connect(&cwd, true, None).await {
-                    Ok(conn) => {
-                        match self.listed(&conn, None).await {
-                            Ok(l) => listed = l,
-                            Err(e) => tracing::warn!("leader sessions/list: {e}"),
-                        }
-                        conn.close().await;
-                    }
-                    Err(e) => tracing::warn!("leader client: {e}"),
-                }
-            }
-            Ok(None) => {}
-            Err(e) => tracing::warn!("{e}"),
-        }
-        let mut items = Vec::new();
-        for (dir, s) in page {
-            let id = s.info.id.as_str();
-            let h = handle(id);
-            let owned = self.store.is_owned(&h)?;
-            let tui = active
-                .iter()
-                .any(|a| a.session_id == id && pid_alive(a.pid));
-            let lead = listed.iter().find(|(sid, _)| sid == id).map(|(_, l)| l);
-            let updates_path = dir.join("updates.jsonl");
-            let own_pid = self.own_run(id, &dir)?;
-            let state = match (own_pid, lead) {
-                (Some(_), _) => SessionState::Running,
-                (None, Some(l)) if l.resident && l.activity == "working" => SessionState::Running,
-                (None, Some(l)) if l.resident && l.activity == "idle" => SessionState::Idle,
-                _ => SessionState::Unknown,
-            };
-            let loaded = own_pid.is_some() || tui || lead.is_some_and(|l| l.resident);
-            items.push(Session {
-                handle: h,
-                agent: "grok",
-                cwd: s.info.cwd.clone(),
-                name: s.generated_title.clone(),
-                preview: first_prompt(&updates_path).map(|p| first_line(strip_provenance(&p), 200)),
-                observations: Observations {
-                    history: if updates_path.is_file() {
-                        model::History::Visible
-                    } else {
-                        model::History::Absent
-                    },
-                    loaded: if loaded { Loaded::Yes } else { Loaded::No },
-                    origin: if owned {
-                        "agent-talk".into()
-                    } else if s.session_kind.as_deref() == Some("headless") {
-                        "headless".into()
-                    } else {
-                        "grok".into()
-                    },
-                },
-                state,
-                owned,
-                id: id.to_string(),
-            });
-        }
+        let listed = self.leader_sessions().await;
+        let items = rows
+            .into_iter()
+            .map(|(dir, s)| self.session(&dir, s, &active, &listed))
+            .collect::<Result<_>>()?;
         Ok(Page { items, next_cursor })
     }
 
     async fn start(&self, req: &StartRequest<'_>, deadline: Option<Instant>) -> Result<Outcome> {
-        let policy = ApprovalPolicy::Deny;
         let leader = self.leader()?;
         let mut conn = self
-            .connect(req.cwd, leader.is_some(), req.settings.model.as_deref())
+            .connect(
+                Path::new(req.cwd),
+                leader.is_some(),
+                req.settings.model.as_deref(),
+            )
             .await?;
         let res = async {
-            let mut params = json!({"cwd": req.cwd, "mcpServers": []});
-            if req.settings.full_access {
-                params["_meta"] = json!({"yoloMode": true});
-            }
+            let params = with_yolo(
+                json!({"cwd": req.cwd, "mcpServers": []}),
+                req.settings.full_access,
+            );
             let created = conn.request("session/new", params).await?;
             let id = created["sessionId"].as_str().ok_or_else(|| {
                 Error::new(
@@ -1061,20 +814,22 @@ impl Agent for Grok<'_> {
             // ignores (DESIGN.md §6.4). A refusal leaves the new session empty and
             // unrecorded; agent-talk deletes nothing, so the error names it.
             if let Some(e) = &req.settings.effort {
-                let params = json!({"sessionId": id, "configId": "reasoning_effort", "value": e});
-                if let Err(mut err) = conn.request("session/set_config_option", params).await {
-                    err.message = format!(
-                        "reasoning effort {e} refused: {}; the new session {id} has no messages and is not used (`grok sessions delete {id}` removes it)",
-                        err.message
-                    );
-                    return Err(err);
-                }
+                set_config(&conn, id, "reasoning_effort", e)
+                    .await
+                    .map_err(|mut err| {
+                        let _ = write!(
+                            err.message,
+                            "; the new session {id} has no messages and is not used (`grok sessions delete {id}` removes it)"
+                        );
+                        err
+                    })?;
             }
             let h = handle(id);
-            // Direct mode only: clients of one leader do not exclude each other.
-            let _lock = match leader {
-                None => Some(lock(&h, SECOND_WRITER)?),
-                Some(_) => None,
+            let route = match leader {
+                Some(leader) => Route::Leader(leader),
+                None => Route::Direct {
+                    _lock: lock(&h, SECOND_WRITER)?,
+                },
             };
             self.store.insert_owned(&h, req.cwd, req.settings)?;
             if let Some(n) = req.name {
@@ -1090,8 +845,15 @@ impl Agent for Grok<'_> {
                 client_msg_id: &prompt_id,
                 message: &req.message,
             };
-            self.run(&mut conn, id, &intent, policy, deadline, &leader)
-                .await
+            self.run(
+                &mut conn,
+                id,
+                &intent,
+                ApprovalPolicy::Deny,
+                deadline,
+                &route,
+            )
+            .await
         }
         .await;
         conn.close().await;
@@ -1106,68 +868,19 @@ impl Agent for Grok<'_> {
     ) -> Result<Outcome> {
         check_id(id)?;
         let h = handle(id);
-        let dir = self.require(id)?;
-        let path = dir.join("summary.json");
-        let summary: Summary = std::fs::read_to_string(&path)
-            .map_err(|e| Error::transport(path.display(), e))
-            .and_then(|t| {
-                serde_json::from_str(&t).map_err(|e| {
-                    Error::new(ErrorCode::Precondition, format!("{}: {e}", path.display()))
-                })
-            })?;
-        let cwd = match summary.info.cwd {
-            Some(c) if Path::new(&c).is_dir() => c,
-            Some(c) => {
-                return Err(Error::new(
-                    ErrorCode::Precondition,
-                    format!(
-                        "the session's directory {c} no longer exists; session/load would run it elsewhere"
-                    ),
-                ));
-            }
-            None => {
-                return Err(Error::new(
-                    ErrorCode::Precondition,
-                    "summary.json records no working directory for this session",
-                ));
-            }
-        };
+        let dir = sessions::require(&self.home, id)?;
+        let cwd = self.session_cwd(&dir)?;
         let policy = approval_policy(self.store, &h)?;
         if req.steer {
             return self.steer(id, &cwd, req, policy, deadline).await;
         }
-        // Through the leader only when the session is resident there: a listed but
-        // dormant session may be held in process by a TUI.
-        let resident = match self.leader()? {
-            Some(leader) => {
-                let conn = self.connect(&cwd, true, None).await?;
-                match self.listed(&conn, Some(id)).await {
-                    Ok(l) if l.first().is_some_and(|(_, l)| l.resident) => Some((leader, conn)),
-                    Ok(_) => {
-                        conn.close().await;
-                        None
-                    }
-                    Err(e) => {
-                        conn.close().await;
-                        return Err(e);
-                    }
-                }
-            }
-            None => None,
-        };
-        let (leader, mut conn, _lock) = match resident {
-            Some((leader, conn)) => (Some(leader), conn, None),
-            None => {
-                let lock = lock(&h, SECOND_WRITER)?;
-                self.refuse_live(id, &dir)?;
-                let conn = self.connect(&cwd, false, None).await?;
-                (None, conn, Some(lock))
-            }
-        };
+        let (route, mut conn) = self.route(id, &dir, Path::new(&cwd)).await?;
         let res = async {
-            // yoloMode only in direct mode: on a session resident in a leader it has no effect
-            // (verified: `yolo` stayed unchanged for every client after such a load).
-            if leader.is_some() && req.change.full_access {
+            let direct = matches!(route, Route::Direct { .. });
+            // yoloMode only in direct mode: on a session resident in a leader it has no
+            // effect (`yolo` stayed unchanged for every client after such a load; grok
+            // 1.0.46).
+            if !direct && req.change.full_access {
                 return Err(Error::new(
                     ErrorCode::Unsupported,
                     format!(
@@ -1175,24 +888,18 @@ impl Agent for Grok<'_> {
                     ),
                 ));
             }
-            let yolo = leader.is_none() && req.settings.is_some_and(|s| s.full_access);
+            let yolo = direct && req.settings.is_some_and(|s| s.full_access);
             self.session_load(&mut conn, id, &cwd, yolo).await?;
-            // Model and effort are set on the session, which Grok stores in summary.json
-            // at once for every later load and, in a leader, every attached client
-            // (DESIGN.md §6.4). A refusal fails the send before anything is recorded, as
-            // in `start`. A value set here stays stored even if the prompt below, or the
-            // second value, is then refused.
-            let configs = [
-                ("model", &req.change.model),
-                ("reasoning_effort", &req.change.effort),
-            ];
-            for (config, value) in configs {
-                let Some(v) = value else { continue };
-                let params = json!({"sessionId": id, "configId": config, "value": v});
-                if let Err(mut err) = conn.request("session/set_config_option", params).await {
-                    err.message = format!("{config} {v} refused: {}", err.message);
-                    return Err(err);
-                }
+            // Model and effort are set on the session, which Grok stores at once for
+            // every later load and, in a leader, every attached client (DESIGN.md §6.4).
+            // A refusal fails the send before anything is recorded, as in `start`. A
+            // value set here stays stored even if the prompt below, or the second value,
+            // is then refused.
+            if let Some(m) = &req.change.model {
+                set_config(&conn, id, "model", m).await?;
+            }
+            if let Some(e) = &req.change.effort {
+                set_config(&conn, id, "reasoning_effort", e).await?;
             }
             let receipt_id = uuid::Uuid::new_v4().to_string();
             let prompt_id = uuid::Uuid::new_v4().to_string();
@@ -1202,7 +909,7 @@ impl Agent for Grok<'_> {
                 client_msg_id: &prompt_id,
                 message: &req.message,
             };
-            self.run(&mut conn, id, &intent, policy, deadline, &leader)
+            self.run(&mut conn, id, &intent, policy, deadline, &route)
                 .await
         }
         .await;
@@ -1212,7 +919,7 @@ impl Agent for Grok<'_> {
 
     async fn read(&self, id: &str, q: &ReadQuery) -> Result<ReadPage> {
         check_id(id)?;
-        let dir = self.require(id)?;
+        let dir = sessions::require(&self.home, id)?;
         let history = History::new(updates::load(&dir.join("updates.jsonl"))?);
         let mut messages = history.messages();
         for m in &mut messages {
@@ -1254,7 +961,7 @@ impl Agent for Grok<'_> {
                 )
             }
         };
-        let dir = self.require(id)?;
+        let dir = sessions::require(&self.home, id)?;
         let path = dir.join("updates.jsonl");
         let mut unaccepted = receipt
             .as_ref()
@@ -1315,13 +1022,13 @@ impl Agent for Grok<'_> {
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
         };
-        let res = bounded(Some(deadline), work).await.map(Some).map_err(|mut e| {
-            if matches!(e.code, ErrorCode::Timeout | ErrorCode::Interrupted) {
-                e.message.push_str(&format!(
-                    "; waiting for turn_completed of {turn_id} in updates.jsonl (polled every second)"
-                ));
-            }
-            e
+        let res = bounded(Some(deadline), work).await.map(Some).map_err(|e| {
+            note_waiting(
+                e,
+                &format!(
+                    "waiting for turn_completed of {turn_id} in updates.jsonl (polled every second)"
+                ),
+            )
         });
         let receipt_id = receipt.map(|r| r.receipt_id);
         settle(
@@ -1345,8 +1052,7 @@ mod tests {
         Grok {
             store,
             home: socket.parent().unwrap().to_path_buf(),
-            socket,
-            socket_override: true,
+            leader_socket: Some(socket),
         }
     }
 

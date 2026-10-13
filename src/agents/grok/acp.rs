@@ -12,10 +12,13 @@ use crate::model::{AgentError, Error, ErrorCode, Result};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::path::Path;
+use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, ready};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin};
@@ -27,7 +30,7 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(120);
 const STDERR_TAIL: usize = 4096;
 
 /// A response as the reader delivers it: the result, or the agent's error object.
-pub type Reply = std::result::Result<Value, AgentError>;
+type Reply = std::result::Result<Value, AgentError>;
 
 #[derive(Debug)]
 pub enum Event {
@@ -45,15 +48,11 @@ pub struct ServerRequest {
 
 #[derive(Debug, Deserialize)]
 struct Incoming {
-    #[serde(default)]
     id: Option<Value>,
-    #[serde(default)]
     method: Option<String>,
     #[serde(default)]
     params: Value,
-    #[serde(default)]
     result: Option<Value>,
-    #[serde(default)]
     error: Option<AgentError>,
 }
 
@@ -61,6 +60,57 @@ struct Incoming {
 struct Pending {
     closed: Option<String>,
     waiters: HashMap<u64, oneshot::Sender<Reply>>,
+}
+
+/// What the connection, the reader and the stderr task share.
+#[derive(Default)]
+struct Shared {
+    pending: Mutex<Pending>,
+    /// The tail of the child's stderr, for error messages.
+    stderr: Mutex<String>,
+}
+
+impl Shared {
+    /// The error for a connection the reader saw end.
+    fn closed(&self) -> Error {
+        let reason = self.pending.lock().unwrap().closed.clone();
+        let stderr = self.stderr.lock().unwrap().trim().to_string();
+        let mut msg = format!(
+            "grok agent connection lost: {}",
+            reason.as_deref().unwrap_or("connection closed")
+        );
+        if !stderr.is_empty() {
+            let _ = write!(msg, "; stderr: {stderr}");
+        }
+        Error::new(ErrorCode::Transport, msg)
+    }
+}
+
+/// The response to a request `Conn::submit` wrote. Agent errors keep code/message/data; a
+/// connection that ends first is a transport error.
+pub struct Response {
+    rx: oneshot::Receiver<Reply>,
+    shared: Arc<Shared>,
+}
+
+impl Future for Response {
+    type Output = Result<Value>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<Value>> {
+        Poll::Ready(match ready!(Pin::new(&mut self.rx).poll(cx)) {
+            Ok(Ok(v)) => Ok(v),
+            Ok(Err(e)) => Err(Error::from_agent(
+                if e.code == -32601 {
+                    ErrorCode::Unsupported
+                } else {
+                    ErrorCode::Precondition
+                },
+                e,
+            )),
+            // The reader dropped the waiter: the connection ended.
+            Err(_) => Err(self.shared.closed()),
+        })
+    }
 }
 
 /// How the child is started.
@@ -77,8 +127,7 @@ pub struct Conn {
     pub init: Value,
     child: Child,
     stdin: tokio::sync::Mutex<Option<ChildStdin>>,
-    pending: Arc<Mutex<Pending>>,
-    stderr: Arc<Mutex<String>>,
+    shared: Arc<Shared>,
     next_id: AtomicU64,
     events: mpsc::UnboundedReceiver<Event>,
     requests: mpsc::UnboundedReceiver<ServerRequest>,
@@ -92,12 +141,12 @@ impl Drop for Conn {
 }
 
 /// Spawn the child in `cwd` and run the ACP `initialize` handshake.
-pub async fn spawn(cwd: &str, s: &Spawn<'_>) -> Result<Conn> {
+pub async fn spawn(cwd: &Path, s: &Spawn<'_>) -> Result<Conn> {
     // GROK_HOME and GROK_LEADER_SOCKET are honoured by the child as by agent-talk.
     let mut cmd = agent_cmd("grok");
     // `grok agent` has no --no-auto-update (only `grok agent leader` does); the
     // binary's GROK_DISABLE_AUTOUPDATER is set instead (its effect on a stdio agent
-    // was not observed).
+    // was not observed; grok 1.0.46).
     cmd.env("GROK_DISABLE_AUTOUPDATER", "1").arg("agent");
     cmd.arg(if s.leader { "--leader" } else { "--no-leader" });
     if let Some(p) = s.leader_socket {
@@ -120,14 +169,14 @@ pub async fn spawn(cwd: &str, s: &Spawn<'_>) -> Result<Conn> {
         .map_err(|e| Error::transport("spawn grok", e))?;
     let stdout = child.stdout.take().expect("stdout is piped");
     let mut err_pipe = child.stderr.take().expect("stderr is piped");
-    let stderr = Arc::new(Mutex::new(String::new()));
-    let tail = stderr.clone();
+    let shared = Arc::new(Shared::default());
+    let tail = shared.clone();
     tokio::spawn(async move {
         let mut buf = [0u8; 1024];
         while let Ok(n) = err_pipe.read(&mut buf).await
             && n > 0
         {
-            let mut t = tail.lock().unwrap();
+            let mut t = tail.stderr.lock().unwrap();
             t.push_str(&String::from_utf8_lossy(&buf[..n]));
             if t.len() > STDERR_TAIL {
                 let cut = t.len() - STDERR_TAIL;
@@ -136,16 +185,14 @@ pub async fn spawn(cwd: &str, s: &Spawn<'_>) -> Result<Conn> {
             }
         }
     });
-    let pending = Arc::new(Mutex::new(Pending::default()));
     let (tx, events) = mpsc::unbounded_channel();
     let (req_tx, requests) = mpsc::unbounded_channel();
-    let reader = tokio::spawn(read_loop(stdout, pending.clone(), tx, req_tx));
+    let reader = tokio::spawn(read_loop(stdout, shared.clone(), tx, req_tx));
     let mut conn = Conn {
         init: Value::Null,
         stdin: tokio::sync::Mutex::new(child.stdin.take()),
         child,
-        pending,
-        stderr,
+        shared,
         next_id: AtomicU64::new(1),
         events,
         requests,
@@ -169,52 +216,37 @@ impl Conn {
         self.child.id()
     }
 
-    /// Write a request; the receiver yields its response. For requests that resolve
-    /// late (`session/prompt` answers at the end of the turn).
-    pub async fn start(&self, method: &str, params: Value) -> Result<oneshot::Receiver<Reply>> {
+    /// Write a request and return its response without waiting for it, for requests
+    /// that resolve late (`session/prompt` answers at the end of the turn).
+    pub async fn submit(&self, method: &str, params: Value) -> Result<Response> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         {
-            let mut p = self.pending.lock().unwrap();
-            if let Some(reason) = &p.closed {
-                return Err(self.closed(reason));
+            let mut p = self.shared.pending.lock().unwrap();
+            if p.closed.is_some() {
+                drop(p);
+                return Err(self.shared.closed());
             }
             p.waiters.insert(id, tx);
         }
         tracing::debug!(id, method, %params, "send");
         self.write(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))
             .await?;
-        Ok(rx)
+        Ok(Response {
+            rx,
+            shared: self.shared.clone(),
+        })
     }
 
-    /// Send a request and wait for its response. Agent errors keep code/message/data.
+    /// Send a request and wait for its response, at most `RPC_TIMEOUT`.
     pub async fn request(&self, method: &str, params: Value) -> Result<Value> {
-        let rx = self.start(method, params).await?;
-        match tokio::time::timeout(RPC_TIMEOUT, rx).await {
-            Ok(r) => self.reply(r),
+        let response = self.submit(method, params).await?;
+        match tokio::time::timeout(RPC_TIMEOUT, response).await {
+            Ok(r) => r,
             Err(_) => Err(Error::new(
                 ErrorCode::Timeout,
                 format!("no response to {method} within {}s", RPC_TIMEOUT.as_secs()),
             )),
-        }
-    }
-
-    /// A response as delivered to the receiver of `start`.
-    pub fn reply(&self, r: std::result::Result<Reply, oneshot::error::RecvError>) -> Result<Value> {
-        match r {
-            Ok(Ok(v)) => Ok(v),
-            Ok(Err(e)) => Err(Error::from_agent(
-                if e.code == -32601 {
-                    ErrorCode::Unsupported
-                } else {
-                    ErrorCode::Precondition
-                },
-                e,
-            )),
-            Err(_) => {
-                let reason = self.pending.lock().unwrap().closed.clone();
-                Err(self.closed(reason.as_deref().unwrap_or("connection closed")))
-            }
         }
     }
 
@@ -272,20 +304,11 @@ impl Conn {
             .await
             .map_err(|e| Error::transport("write to grok agent", e))
     }
-
-    fn closed(&self, reason: &str) -> Error {
-        let stderr = self.stderr.lock().unwrap().trim().to_string();
-        let mut msg = format!("grok agent connection lost: {reason}");
-        if !stderr.is_empty() {
-            msg.push_str(&format!("; stderr: {stderr}"));
-        }
-        Error::new(ErrorCode::Transport, msg)
-    }
 }
 
 async fn read_loop(
     stdout: tokio::process::ChildStdout,
-    pending: Arc<Mutex<Pending>>,
+    shared: Arc<Shared>,
     events: mpsc::UnboundedSender<Event>,
     requests: mpsc::UnboundedSender<ServerRequest>,
 ) {
@@ -324,7 +347,7 @@ async fn read_loop(
             }
             (Some(id), None) => {
                 let Some(id) = id.as_u64() else { continue };
-                let waiter = pending.lock().unwrap().waiters.remove(&id);
+                let waiter = shared.pending.lock().unwrap().waiters.remove(&id);
                 if let Some(w) = waiter {
                     let _ = w.send(match msg.error {
                         Some(e) => Err(e),
@@ -336,7 +359,7 @@ async fn read_loop(
         }
     };
     tracing::debug!(reason, "reader stopped");
-    let mut p = pending.lock().unwrap();
+    let mut p = shared.pending.lock().unwrap();
     p.closed = Some(reason);
     // Dropping the waiters wakes their requests with a closed-connection error.
     p.waiters.clear();

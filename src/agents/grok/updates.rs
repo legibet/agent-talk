@@ -1,5 +1,5 @@
-//! `updates.jsonl`, the conversation log of a Grok session: the ACP session updates as
-//! persisted, one JSON object per line, append-only (DESIGN.md §6.4). Streamed
+//! ACP session updates, and `updates.jsonl`, the conversation log of a Grok session: the
+//! updates as persisted, one JSON object per line, append-only (DESIGN.md §6.4). Streamed
 //! chunks are coalesced on disk: one `agent_message_chunk` line per stretch of text.
 //!
 //! Turns: a `user_message_chunk` with `_meta.promptIndex` opens one, a `turn_completed
@@ -13,24 +13,165 @@
 
 use crate::agents::history::first_line;
 use crate::model::{self, Error, Message, Phase, Result, Role, TurnStatus};
+use serde::Deserialize;
 use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
+
+/// One ACP session update (`params.update`), as Grok sends it live (`session/update`,
+/// `_x.ai/session_notification`) and persists it in `updates.jsonl`. Unknown kinds, and
+/// known ones whose fields do not decode, are `Other`.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "sessionUpdate", rename_all = "snake_case")]
+pub enum SessionUpdate {
+    UserMessageChunk {
+        #[serde(default)]
+        content: Content,
+        #[serde(rename = "_meta", default)]
+        meta: PromptMeta,
+    },
+    AgentMessageChunk {
+        #[serde(default)]
+        content: Content,
+    },
+    ToolCall(ToolCall),
+    #[serde(rename_all = "camelCase")]
+    ToolCallUpdate {
+        tool_call_id: Option<String>,
+        status: Option<String>,
+    },
+    TurnCompleted {
+        prompt_id: Option<String>,
+        stop_reason: Option<String>,
+        elapsed_ms: Option<i64>,
+    },
+    /// Live only: the permission request of this tool call was answered.
+    InteractionResolved {
+        tool_call_id: String,
+    },
+    #[serde(other)]
+    Other,
+}
+
+impl SessionUpdate {
+    /// The update in a notification's (or a line's) `params`.
+    pub fn of(params: &Value) -> SessionUpdate {
+        SessionUpdate::deserialize(&params["update"]).unwrap_or(SessionUpdate::Other)
+    }
+
+    /// A user prompt that opens a turn; steer messages (`interjection`) join the running
+    /// one.
+    fn opens_turn(&self) -> bool {
+        matches!(self, SessionUpdate::UserMessageChunk { meta, .. }
+            if meta.prompt_index.is_some() && !meta.interjection)
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct Content {
+    pub text: Option<String>,
+    #[serde(rename = "_meta", default)]
+    meta: ContentMeta,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ContentMeta {
+    /// A steer message's own text; `text` wraps it in instructions to the model.
+    display_text: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptMeta {
+    prompt_index: Option<u64>,
+    #[serde(default)]
+    interjection: bool,
+}
+
+/// A tool call as a `tool_call` update or a `session/request_permission` describes it.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolCall {
+    pub tool_call_id: Option<String>,
+    pub title: Option<String>,
+    #[serde(default)]
+    raw_input: Value,
+    status: Option<String>,
+    #[serde(rename = "_meta", default)]
+    meta: ToolMeta,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ToolMeta {
+    #[serde(rename = "x.ai/tool")]
+    tool: Option<ToolInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolInfo {
+    name: Option<String>,
+}
+
+impl ToolCall {
+    /// `_meta["x.ai/tool"].name`, such as `run_terminal_command`.
+    pub fn tool_name(&self) -> Option<&str> {
+        self.meta.tool.as_ref()?.name.as_deref()
+    }
+
+    /// The tool name, else the title.
+    fn name(&self) -> &str {
+        self.tool_name().or(self.title.as_deref()).unwrap_or("tool")
+    }
+
+    /// ` <first line of the input's main argument>`, or nothing.
+    fn detail(&self) -> String {
+        [
+            "command",
+            "file_path",
+            "path",
+            "url",
+            "query",
+            "description",
+        ]
+        .iter()
+        .find_map(|k| self.raw_input[k].as_str())
+        .map(|d| format!(" {}", first_line(d, 120)))
+        .unwrap_or_default()
+    }
+}
 
 pub struct Line {
     /// 1-based line number in the file, the item id.
     pub no: usize,
     pub raw: Value,
+    update: SessionUpdate,
+}
+
+impl Line {
+    /// The prompt id a line names: `turn_completed.prompt_id`, else `params._meta.promptId`.
+    fn prompt_id(&self) -> Option<&str> {
+        match &self.update {
+            SessionUpdate::TurnCompleted {
+                prompt_id: Some(p), ..
+            } => Some(p),
+            _ => self.raw["params"]["_meta"]["promptId"].as_str(),
+        }
+    }
 }
 
 pub fn parse(text: &str) -> Vec<Line> {
     text.lines()
         .enumerate()
         .filter_map(|(i, l)| {
-            serde_json::from_str(l)
-                .ok()
-                .map(|raw| Line { no: i + 1, raw })
+            let raw: Value = serde_json::from_str(l).ok()?;
+            Some(Line {
+                no: i + 1,
+                update: SessionUpdate::of(&raw["params"]),
+                raw,
+            })
         })
         .collect()
 }
@@ -43,29 +184,6 @@ pub fn load(path: &Path) -> Result<Vec<Line>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(e) => Err(Error::transport(path.display(), e)),
     }
-}
-
-fn update(raw: &Value) -> &Value {
-    &raw["params"]["update"]
-}
-
-fn kind(raw: &Value) -> &str {
-    update(raw)["sessionUpdate"].as_str().unwrap_or("")
-}
-
-/// The prompt id a line names: `turn_completed.prompt_id`, else `params._meta.promptId`.
-fn prompt_of(raw: &Value) -> Option<&str> {
-    update(raw)["prompt_id"]
-        .as_str()
-        .or_else(|| raw["params"]["_meta"]["promptId"].as_str())
-}
-
-/// A user prompt that opens a turn; steer messages (`interjection`) join the running one.
-fn opens_turn(raw: &Value) -> bool {
-    let meta = &update(raw)["_meta"];
-    kind(raw) == "user_message_chunk"
-        && meta["promptIndex"].is_u64()
-        && meta["interjection"].as_bool() != Some(true)
 }
 
 pub struct Span {
@@ -90,7 +208,7 @@ impl History {
         let mut owner = Vec::with_capacity(lines.len());
         let mut current: Option<usize> = None;
         for (i, l) in lines.iter().enumerate() {
-            if opens_turn(&l.raw) {
+            if l.update.opens_turn() {
                 spans.push(Span {
                     start: i,
                     id: None,
@@ -98,7 +216,8 @@ impl History {
                 });
                 current = Some(spans.len() - 1);
             }
-            let prompt = prompt_of(&l.raw);
+            let completed = matches!(l.update, SessionUpdate::TurnCompleted { .. });
+            let prompt = l.prompt_id();
             let this = match prompt {
                 Some(p) => match spans.iter().rposition(|s| s.id.as_deref() == Some(p)) {
                     Some(s) => Some(s),
@@ -109,7 +228,7 @@ impl History {
                         }
                         // A prompt cancelled within milliseconds of starting gets a
                         // turn_completed and no user line: a turn of its own.
-                        _ if kind(&l.raw) == "turn_completed" => {
+                        _ if completed => {
                             spans.push(Span {
                                 start: i,
                                 id: Some(p.to_string()),
@@ -122,7 +241,7 @@ impl History {
                 },
                 None => current,
             };
-            if kind(&l.raw) == "turn_completed"
+            if completed
                 && let Some(s) = this
                 && spans[s].id.as_deref() == prompt
             {
@@ -137,10 +256,12 @@ impl History {
         }
     }
 
-    pub fn turn_id(&self, span: usize) -> String {
+    pub fn turn_id(&self, span: usize) -> Cow<'_, str> {
         let s = &self.spans[span];
-        s.id.clone()
-            .unwrap_or_else(|| format!("line-{}", self.lines[s.start].no))
+        match &s.id {
+            Some(id) => Cow::Borrowed(id),
+            None => Cow::Owned(format!("line-{}", self.lines[s.start].no)),
+        }
     }
 
     pub fn find(&self, turn_id: &str) -> Option<usize> {
@@ -153,11 +274,12 @@ impl History {
     /// carrying its latest status. Thoughts, hooks and bookkeeping are not messages.
     pub fn messages(&self) -> Vec<Msg> {
         let mut out: Vec<Msg> = Vec::new();
-        let mut tools: HashMap<&str, (usize, String, String)> = HashMap::new();
+        let mut tools: HashMap<&str, (usize, &str, String)> = HashMap::new();
         for (i, l) in self.lines.iter().enumerate() {
             let span = self.owner[i];
-            let turn_id = span.map(|s| self.turn_id(s)).unwrap_or_default();
-            let u = update(&l.raw);
+            let turn_id = span
+                .map(|s| self.turn_id(s).into_owned())
+                .unwrap_or_default();
             let at = l.raw["timestamp"]
                 .as_i64()
                 .and_then(|s| jiff::Timestamp::from_second(s).ok())
@@ -171,22 +293,23 @@ impl History {
                 from: None,
                 timestamp: at.clone(),
             };
-            match kind(&l.raw) {
-                "user_message_chunk" => {
-                    let c = &u["content"];
-                    let text = c["_meta"]["displayText"]
-                        .as_str()
-                        .or(c["text"].as_str())
+            match &l.update {
+                SessionUpdate::UserMessageChunk { content, .. } => {
+                    let text = content
+                        .meta
+                        .display_text
+                        .as_deref()
+                        .or(content.text.as_deref())
                         .unwrap_or("");
                     out.push(Msg {
                         line: i,
                         span,
-                        prompt: opens_turn(&l.raw),
+                        prompt: l.update.opens_turn(),
                         message: message(Role::User, Phase::Prompt, text.to_string()),
                     });
                 }
-                "agent_message_chunk" => {
-                    let text = u["content"]["text"].as_str().unwrap_or("");
+                SessionUpdate::AgentMessageChunk { content } => {
+                    let text = content.text.as_deref().unwrap_or("");
                     let extends = out.last().is_some_and(|m| {
                         m.span == span
                             && m.message.role == Role::Assistant
@@ -202,29 +325,12 @@ impl History {
                         }),
                     }
                 }
-                "tool_call" => {
-                    let Some(id) = u["toolCallId"].as_str() else {
+                SessionUpdate::ToolCall(call) => {
+                    let Some(id) = call.tool_call_id.as_deref() else {
                         continue;
                     };
-                    let name = u["_meta"]["x.ai/tool"]["name"]
-                        .as_str()
-                        .or(u["title"].as_str())
-                        .unwrap_or("tool")
-                        .to_string();
-                    let input = &u["rawInput"];
-                    let detail = [
-                        "command",
-                        "file_path",
-                        "path",
-                        "url",
-                        "query",
-                        "description",
-                    ]
-                    .iter()
-                    .find_map(|k| input[k].as_str())
-                    .map(|d| format!(" {}", first_line(d, 120)))
-                    .unwrap_or_default();
-                    let status = u["status"].as_str().unwrap_or("pending");
+                    let (name, detail) = (call.name(), call.detail());
+                    let status = call.status.as_deref().unwrap_or("pending");
                     out.push(Msg {
                         line: i,
                         span,
@@ -232,16 +338,16 @@ impl History {
                         message: message(
                             Role::Assistant,
                             Phase::Other,
-                            tool_text(&name, status, &detail),
+                            tool_text(name, status, &detail),
                         ),
                     });
                     tools.insert(id, (out.len() - 1, name, detail));
                 }
-                "tool_call_update" => {
-                    if let Some((idx, name, detail)) =
-                        u["toolCallId"].as_str().and_then(|id| tools.get(id))
-                        && let Some(status) = u["status"].as_str()
-                    {
+                SessionUpdate::ToolCallUpdate {
+                    tool_call_id: Some(id),
+                    status: Some(status),
+                } => {
+                    if let Some((idx, name, detail)) = tools.get(id.as_str()) {
                         out[*idx].message.text = tool_text(name, status, detail);
                     }
                 }
@@ -262,20 +368,29 @@ impl History {
     /// The finished turn of a span: status from `stop_reason`, the final message as
     /// `final_text`.
     pub fn turn(&self, handle: String, span: usize, messages: &[Msg]) -> Option<model::Turn> {
-        let s = &self.spans[span];
-        let end = &self.lines[s.end?].raw;
-        let u = update(end);
-        let (status, error) = status(u["stop_reason"].as_str().unwrap_or(""), u);
+        let end = &self.lines[self.spans[span].end?];
+        let SessionUpdate::TurnCompleted {
+            stop_reason,
+            elapsed_ms,
+            ..
+        } = &end.update
+        else {
+            return None;
+        };
+        let (status, error) = status(
+            stop_reason.as_deref().unwrap_or(""),
+            &end.raw["params"]["update"],
+        );
         Some(model::Turn {
             handle,
-            turn_id: self.turn_id(span),
+            turn_id: self.turn_id(span).into_owned(),
             status,
             error,
             final_text: messages
                 .iter()
                 .find(|m| m.span == Some(span) && m.message.phase == Phase::Final)
                 .map(|m| m.message.text.clone()),
-            duration_ms: u["elapsed_ms"].as_i64(),
+            duration_ms: *elapsed_ms,
             basis: Some("updates.jsonl turn_completed".into()),
         })
     }
@@ -311,13 +426,17 @@ pub fn status(stop_reason: &str, detail: &Value) -> (TurnStatus, Option<Value>) 
 /// Text of the first user prompt, for `ls` previews.
 pub fn first_prompt(path: &Path) -> Option<String> {
     let f = std::fs::File::open(path).ok()?;
-    BufReader::new(f)
+    let update = BufReader::new(f)
         .lines()
         .map_while(std::result::Result::ok)
         .take(2000)
         .filter_map(|l| serde_json::from_str::<Value>(&l).ok())
-        .find(opens_turn)
-        .and_then(|raw| update(&raw)["content"]["text"].as_str().map(String::from))
+        .map(|raw| SessionUpdate::of(&raw["params"]))
+        .find(SessionUpdate::opens_turn)?;
+    match update {
+        SessionUpdate::UserMessageChunk { content, .. } => content.text,
+        _ => None,
+    }
 }
 
 #[cfg(test)]
