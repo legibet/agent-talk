@@ -6,7 +6,6 @@
 use super::acp::{Conn, Event, Response};
 use super::handle;
 use super::updates::{self, SessionUpdate, ToolCall};
-use crate::agents::decode::{entries, or_default};
 use crate::agents::history::first_line;
 use crate::agents::lifecycle::{ApprovalPolicy, record, resolve};
 use crate::model::{self, Approval, ApprovalOutcome, Error, ErrorCode, Progress, Result};
@@ -62,44 +61,7 @@ pub struct End {
     pub result: Result<Value>,
 }
 
-/// `_x.ai/queue/changed`: the queued prompts (entry id = prompt id) and the running one.
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct QueueChanged {
-    #[serde(default, deserialize_with = "entries")]
-    entries: Vec<QueueEntry>,
-    #[serde(default, deserialize_with = "or_default")]
-    running_prompt_id: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct QueueEntry {
-    #[serde(default, deserialize_with = "or_default")]
-    id: Option<String>,
-}
-
-/// `session/request_permission`.
-#[derive(Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PermissionRequest {
-    #[serde(default, deserialize_with = "or_default")]
-    tool_call: ToolCall,
-    #[serde(default, deserialize_with = "entries")]
-    options: Vec<PermissionOption>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PermissionOption {
-    #[serde(default, deserialize_with = "or_default")]
-    option_id: Option<String>,
-    #[serde(default, deserialize_with = "or_default")]
-    kind: String,
-}
-
 impl<'s> Watch<'s> {
-    /// This command's own `session/prompt`, submitted with `prompt_id`; `response` is its
-    /// response.
     pub fn prompt(
         store: &'s Store,
         session_id: &str,
@@ -118,8 +80,8 @@ impl<'s> Watch<'s> {
         Watch::new(store, session_id, receipt_id, kind, policy, shared, None)
     }
 
-    /// A steer message `text` the leader acknowledged, sent while the session ran the
-    /// prompt `running` (`runningPromptId` at load); the joined turn is learned later.
+    /// `running`: the prompt the session ran when the leader acknowledged the message
+    /// (`runningPromptId` at load).
     pub fn steer(
         store: &'s Store,
         session_id: &str,
@@ -309,12 +271,14 @@ impl<'s> Watch<'s> {
             // running; the first is the earliest proof of acceptance (direct mode:
             // about 20 ms after the request).
             "_x.ai/queue/changed" => {
-                let Ok(q) = QueueChanged::deserialize(params) else {
-                    return Ok(None);
-                };
+                let running = params["runningPromptId"].as_str();
                 if let Kind::Prompt { prompt_id, .. } = &self.kind {
-                    let listed = q.entries.iter().any(|e| e.id.as_ref() == Some(prompt_id));
-                    let runs = q.running_prompt_id.as_ref() == Some(prompt_id);
+                    let listed = params["entries"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .any(|e| e["id"] == prompt_id.as_str());
+                    let runs = running == Some(prompt_id.as_str());
                     if listed || runs {
                         self.accept()?;
                     }
@@ -322,7 +286,7 @@ impl<'s> Watch<'s> {
                         *running = true;
                     }
                 }
-                self.running_prompt = q.running_prompt_id;
+                self.running_prompt = running.map(String::from);
             }
             "_x.ai/session/interjection" => {
                 if let Kind::Steer {
@@ -400,8 +364,7 @@ impl<'s> Watch<'s> {
     /// tool calls (matched by `toolCallId`; through a leader, other clients' turns raise
     /// them too) get the `reject_once` option.
     fn on_permission(&self, request_id: Value, params: Value) -> Option<(Approval, Option<Value>)> {
-        let req = PermissionRequest::deserialize(&params).unwrap_or_default();
-        let call = req.tool_call;
+        let call = ToolCall::deserialize(&params["toolCall"]).unwrap_or_default();
         // A request already recorded is not answered again. Unverified whether Grok
         // ever sends the same request twice to one client.
         if self
@@ -416,11 +379,12 @@ impl<'s> Watch<'s> {
                 .tool_call_id
                 .as_ref()
                 .is_some_and(|c| self.tools.contains(c));
-        let reject = req
-            .options
-            .iter()
-            .find(|o| o.kind == "reject_once")
-            .and_then(|o| o.option_id.as_deref());
+        let reject = params["options"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|o| o["kind"] == "reject_once")
+            .and_then(|o| o["optionId"].as_str());
         let answer = match (self.policy, ours, reject) {
             (ApprovalPolicy::Deny, true, Some(option)) => {
                 Some(json!({"outcome": {"outcome": "selected", "optionId": option}}))
