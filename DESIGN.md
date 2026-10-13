@@ -103,10 +103,11 @@ Agent records and events are decoded into small structs where that reads better 
 JSON. The decoding is tolerant, so that one field an agent writes differently does not lose a
 record, a listing or the end of a turn: optional fields default, unknown variants are tolerated,
 and a field that does not fit reads as its default (an odd list entry is skipped) instead of
-dropping the record around it (`agents/decode.rs`). The raw record is kept for `read --raw` and error data, and content a
-struct does not recognize never counts as the end of a turn. Decoding is strict only where a
-failure must be an error, such as the ids that correlate a response or a record with
-agent-talk's own request. Payloads agent-talk only passes through stay `serde_json::Value`.
+dropping the record around it (`agents/decode.rs`). The raw record is kept for `read --raw` and
+error data, and content a struct does not recognize never counts as the end of a turn. Decoding
+is strict only where a failure must be an error, such as the ids that correlate a response or a
+record with agent-talk's own request. Payloads agent-talk only passes through stay
+`serde_json::Value`.
 
 ## 4. Model
 
