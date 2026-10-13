@@ -94,7 +94,7 @@ src/
   agents/child.rs      agent CLI children: environment, version, session lock, run logs
   agents/codex/        adapter, protocol (narrow response types), transport (WebSocket over AF_UNIX)
   agents/claude/       adapter, transcript rules, stream-json events, command line and `claude agents`
-  agents/opencode/     adapter, transport (HTTP + SSE)
+  agents/opencode/     adapter, history rows and turn rules, transport (HTTP + SSE, endpoints)
   agents/grok/         adapter, ACP client of a grok agent child, updates.jsonl rules
   agents/antigravity/  adapter (summaries db, presence lock), transcript, stream, process
   agents/pi/           adapter, session file rules, the `pi --mode json` run

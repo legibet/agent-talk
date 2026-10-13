@@ -1,26 +1,27 @@
 //! HTTP + SSE client of the OpenCode background service: registration, authentication,
-//! request timeouts, HTTP status to error code, and the `/api/event` frames.
+//! request timeouts, HTTP status to error code, every endpoint the adapter calls with its
+//! response decoded, and the `/api/event` stream.
 
-use super::{take_data, text};
 use crate::agents::child::pid_alive;
 use crate::model::{AgentError, Error, ErrorCode, Result};
 use futures_util::StreamExt;
-use serde::Deserialize;
-use serde_json::Value;
+use serde::de::{DeserializeOwned, IgnoredAny};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::pin::Pin;
 use std::time::Duration;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Rows per history page.
 const PAGE: u32 = 50;
 
 #[derive(Deserialize)]
 struct Registration {
     url: String,
     pid: u32,
-    #[serde(default)]
     version: Option<String>,
-    #[serde(default)]
     password: Option<String>,
 }
 
@@ -33,25 +34,225 @@ pub struct Service {
     pub version: String,
 }
 
-/// `GET /api/event`: one JSON object per `data:` line, no ids, no replay.
-pub struct Events {
-    body: Pin<Box<dyn futures_util::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>>,
-    buf: Vec<u8>,
+/// `Model.Ref`: a model as the service stores it on a session; the variant is the effort.
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+pub struct ModelRef {
+    #[serde(rename = "providerID")]
+    pub provider: String,
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub variant: Option<String>,
+}
+
+impl ModelRef {
+    /// `provider/model`, as `--model` takes it.
+    pub fn parse(spec: &str) -> Result<ModelRef> {
+        let (provider, id) = spec.split_once('/').ok_or_else(|| {
+            Error::new(
+                ErrorCode::Precondition,
+                format!("--model for OpenCode is <providerID>/<modelID>, got {spec}"),
+            )
+        })?;
+        Ok(ModelRef {
+            provider: provider.into(),
+            id: id.into(),
+            variant: None,
+        })
+    }
+}
+
+/// `Session.Info`, as far as agent-talk reads it.
+#[derive(Deserialize)]
+pub struct SessionInfo {
+    pub id: String,
+    pub title: Option<String>,
+    #[serde(rename = "parentID")]
+    pub parent_id: Option<String>,
+    pub agent: Option<String>,
+    pub model: Option<ModelRef>,
+    location: Option<Location>,
+}
+
+#[derive(Deserialize)]
+struct Location {
+    directory: Option<String>,
+}
+
+impl SessionInfo {
+    pub fn directory(&self) -> Option<&str> {
+        self.location.as_ref()?.directory.as_deref()
+    }
+}
+
+/// A model of a configured provider, with its variants (efforts).
+#[derive(Deserialize)]
+pub struct ApiModel {
+    #[serde(rename = "providerID")]
+    pub provider: String,
+    pub id: String,
+    #[serde(default)]
+    pub variants: Vec<Variant>,
+}
+
+#[derive(Deserialize)]
+pub struct Variant {
+    pub id: String,
+}
+
+/// `Permission.Request`, from a `permission.asked` event or `GET …/permission`; `raw` is
+/// the request as the service sent it.
+#[derive(Deserialize)]
+#[serde(try_from = "Value")]
+pub struct PermissionRequest {
+    pub id: String,
+    pub session_id: String,
+    pub action: Option<String>,
+    pub resources: Vec<String>,
+    /// The tool call that asks (`call_…`).
+    pub call_id: Option<String>,
+    pub raw: Value,
+}
+
+impl TryFrom<Value> for PermissionRequest {
+    type Error = serde_json::Error;
+
+    fn try_from(raw: Value) -> std::result::Result<Self, Self::Error> {
+        #[derive(Deserialize)]
+        struct Fields {
+            id: String,
+            #[serde(rename = "sessionID")]
+            session_id: String,
+            action: Option<String>,
+            #[serde(default)]
+            resources: Vec<String>,
+            source: Option<Source>,
+        }
+        #[derive(Deserialize)]
+        struct Source {
+            id: Option<String>,
+        }
+        let f = Fields::deserialize(&raw)?;
+        Ok(PermissionRequest {
+            id: f.id,
+            session_id: f.session_id,
+            action: f.action,
+            resources: f.resources,
+            call_id: f.source.and_then(|s| s.id),
+            raw,
+        })
+    }
+}
+
+/// The `/api/event` events agent-talk acts on; every other one is `Other`.
+#[derive(Deserialize)]
+#[serde(tag = "type")]
+pub enum Event {
+    #[serde(rename = "permission.asked")]
+    PermissionAsked { data: PermissionRequest },
+    #[serde(rename = "permission.replied")]
+    PermissionReplied { data: Replied },
+    #[serde(rename = "session.inbox.delivered")]
+    InboxDelivered { data: Delivered },
+    /// An execution ended (`succeeded`, `failed` or `interrupted`).
+    #[serde(
+        rename = "session.execution.succeeded",
+        alias = "session.execution.failed",
+        alias = "session.execution.interrupted"
+    )]
+    ExecutionEnded { data: SessionRef },
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Deserialize)]
+pub struct Replied {
+    #[serde(rename = "sessionID")]
+    pub session_id: String,
+    #[serde(rename = "requestID")]
+    pub request_id: String,
+}
+
+#[derive(Deserialize)]
+pub struct Delivered {
+    #[serde(rename = "sessionID")]
+    pub session_id: String,
+    #[serde(rename = "inboxID")]
+    pub inbox_id: String,
+}
+
+#[derive(Deserialize)]
+pub struct SessionRef {
+    #[serde(rename = "sessionID")]
+    pub session_id: String,
+}
+
+/// `{data}`, the envelope of a response with a body.
+#[derive(Deserialize)]
+struct Data<T> {
+    data: T,
+}
+
+/// A list response; `cursor.next` names the next page.
+#[derive(Deserialize)]
+#[serde(bound(deserialize = "T: Deserialize<'de>"))]
+struct List<T> {
+    #[serde(default)]
+    data: Vec<T>,
+    #[serde(default)]
+    cursor: Cursor,
+}
+
+#[derive(Deserialize, Default)]
+struct Cursor {
+    next: Option<String>,
+}
+
+/// An object of which only the id is read.
+#[derive(Deserialize)]
+struct Id {
+    id: String,
+}
+
+#[derive(Deserialize)]
+struct Agent {
+    permissions: Option<Vec<Value>>,
+}
+
+#[derive(Deserialize)]
+struct Info {
+    #[serde(default)]
+    pid: u64,
+    version: Option<String>,
+}
+
+/// The query of one page of a list, newest first: the first page by `order=desc`, later
+/// ones by the previous page's cursor (the service rejects `order` together with `cursor`,
+/// observed on opencode 2.0.22).
+fn page_query(limit: u32, cursor: Option<&str>) -> Vec<(&'static str, String)> {
+    let mut q = vec![("limit", limit.to_string())];
+    match cursor {
+        Some(c) => q.push(("cursor", c.into())),
+        None => q.push(("order", "desc".into())),
+    }
+    q
 }
 
 fn http_error(status: reqwest::StatusCode, body: &str) -> Error {
     let parsed: Option<Value> = serde_json::from_str(body).ok();
-    let message = parsed
-        .as_ref()
-        .and_then(|v| text(&v["message"]))
-        .unwrap_or_else(|| {
-            if body.is_empty() {
-                status.to_string()
-            } else {
-                body.chars().take(300).collect()
-            }
-        });
-    let tag = parsed.as_ref().and_then(|v| text(&v["_tag"]));
+    let field = |k: &str| {
+        parsed
+            .as_ref()
+            .and_then(|v| v[k].as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+    };
+    let message = field("message").unwrap_or_else(|| {
+        if body.is_empty() {
+            status.to_string()
+        } else {
+            body.chars().take(300).collect()
+        }
+    });
     let code = match status.as_u16() {
         401 => ErrorCode::NoDaemon,
         400 | 404 | 409 | 422 => ErrorCode::Precondition,
@@ -61,7 +262,7 @@ fn http_error(status: reqwest::StatusCode, body: &str) -> Error {
         code,
         AgentError {
             code: i64::from(status.as_u16()),
-            message: match &tag {
+            message: match field("_tag") {
                 Some(t) => format!("{t}: {message}"),
                 None => message,
             },
@@ -86,7 +287,8 @@ impl Service {
         }
     }
 
-    async fn send(&self, b: reqwest::RequestBuilder) -> Result<Value> {
+    /// Send a request; a status other than success is an error.
+    async fn respond(&self, b: reqwest::RequestBuilder) -> Result<reqwest::Response> {
         let resp = b.send().await.map_err(|e| {
             // reqwest's Display stops at "error sending request"; the io cause below it
             // (connection refused, operation not permitted) is what tells the failures apart.
@@ -99,83 +301,216 @@ impl Service {
             Error::new(ErrorCode::Transport, message)
         })?;
         let status = resp.status();
+        if status.is_success() {
+            return Ok(resp);
+        }
         let body = resp
             .text()
             .await
             .map_err(|e| Error::transport("opencode service", e))?;
-        if !status.is_success() {
-            return Err(http_error(status, &body));
-        }
-        if body.trim().is_empty() {
-            return Ok(Value::Null);
-        }
-        serde_json::from_str(&body)
-            .map_err(|e| Error::transport("opencode service: invalid JSON in response", e))
+        Err(http_error(status, &body))
     }
 
-    /// One page of a session's history, newest first: the first page by `order=desc`,
-    /// later ones by the previous page's cursor (the service rejects `order` together
-    /// with `cursor`, observed on opencode 2.0.22). Returns the rows and the next cursor; the
-    /// page after the last one is empty.
+    /// Send a request and decode its JSON body (an empty body reads as `null`).
+    async fn call<T: DeserializeOwned>(&self, b: reqwest::RequestBuilder) -> Result<T> {
+        let body = self
+            .respond(b)
+            .await?
+            .text()
+            .await
+            .map_err(|e| Error::transport("opencode service", e))?;
+        let body = if body.trim().is_empty() {
+            "null"
+        } else {
+            &body
+        };
+        serde_json::from_str(body)
+            .map_err(|e| Error::transport("opencode service: unexpected response", e))
+    }
+
+    async fn get<T: DeserializeOwned>(&self, path: &str, query: &[(&str, String)]) -> Result<T> {
+        self.call(self.request(reqwest::Method::GET, path).query(query))
+            .await
+    }
+
+    /// A request whose response body agent-talk does not read.
+    async fn send(&self, b: reqwest::RequestBuilder) -> Result<()> {
+        self.call::<IgnoredAny>(b).await?;
+        Ok(())
+    }
+
+    async fn post(&self, path: &str, body: &Value) -> Result<()> {
+        self.send(self.request(reqwest::Method::POST, path).json(body))
+            .await
+    }
+
+    /// One page of a session's history, newest first (`page_query`): the raw rows and the
+    /// cursor of the next older page. The page after the last one is empty.
     pub async fn history(
         &self,
         session_id: &str,
         cursor: Option<&str>,
     ) -> Result<(Vec<Value>, Option<String>)> {
-        let mut q = vec![("limit", PAGE.to_string())];
-        match cursor {
-            Some(c) => q.push(("cursor", c.into())),
-            None => q.push(("order", "desc".into())),
-        }
-        let mut page = self
-            .get(&format!("/api/session/{session_id}/message"), &q)
+        let page: List<Value> = self
+            .get(
+                &format!("/api/session/{session_id}/message"),
+                &page_query(PAGE, cursor),
+            )
             .await?;
-        let rows = take_data(&mut page);
-        Ok((rows, text(&page["cursor"]["next"])))
+        Ok((page.data, page.cursor.next))
     }
 
-    /// Whether the session has a running execution.
-    pub async fn active(&self, session_id: &str) -> Result<bool> {
-        Ok(self.get("/api/session/active", &[]).await?["data"]
-            .get(session_id)
-            .is_some())
+    /// The id of the newest user message behind a history page's `cursor` toward older rows
+    /// (a cursor is an anchor row plus a direction; `type` filters any cursor read; observed
+    /// on opencode 2.0.22).
+    pub async fn user_before(&self, session_id: &str, cursor: &str) -> Result<Option<String>> {
+        let page: List<Id> = self
+            .get(
+                &format!("/api/session/{session_id}/message"),
+                &[
+                    ("cursor", cursor.into()),
+                    ("type", "user".into()),
+                    ("limit", "1".into()),
+                ],
+            )
+            .await?;
+        Ok(page.data.into_iter().next().map(|u| u.id))
+    }
+
+    /// The ids of the messages waiting in a session's inbox.
+    pub async fn inbox(&self, session_id: &str) -> Result<Vec<String>> {
+        let inbox: List<Id> = self
+            .get(&format!("/api/session/{session_id}/inbox"), &[])
+            .await?;
+        Ok(inbox.data.into_iter().map(|i| i.id).collect())
+    }
+
+    /// The sessions with a running execution.
+    pub async fn active(&self) -> Result<HashSet<String>> {
+        let active: Data<Option<HashMap<String, IgnoredAny>>> =
+            self.get("/api/session/active", &[]).await?;
+        Ok(active.data.unwrap_or_default().into_keys().collect())
     }
 
     /// Requests already pending are not replayed on a new subscription (DESIGN.md §6.3).
-    pub async fn permissions(&self, session_id: &str) -> Result<Vec<Value>> {
-        let mut list = self
+    pub async fn permissions(&self, session_id: &str) -> Result<Vec<PermissionRequest>> {
+        let list: List<PermissionRequest> = self
             .get(&format!("/api/session/{session_id}/permission"), &[])
             .await?;
-        Ok(take_data(&mut list))
+        Ok(list.data)
     }
 
-    pub async fn get(&self, path: &str, query: &[(&str, String)]) -> Result<Value> {
-        self.send(self.request(reqwest::Method::GET, path).query(query))
+    /// Answer a permission request with `reject` and a message for the model.
+    pub async fn reject(&self, session_id: &str, request_id: &str, message: &str) -> Result<()> {
+        self.post(
+            &format!("/api/session/{session_id}/permission/{request_id}/reply"),
+            &json!({"decision": "reject", "message": message}),
+        )
+        .await
+    }
+
+    pub async fn prompt(&self, session_id: &str, body: &Value) -> Result<()> {
+        self.post(&format!("/api/session/{session_id}/prompt"), body)
             .await
     }
 
-    pub async fn post(&self, path: &str, body: &Value) -> Result<Value> {
-        self.send(self.request(reqwest::Method::POST, path).json(body))
-            .await
+    /// One page of sessions, newest first (`page_query`), and the cursor of the next one.
+    pub async fn sessions(
+        &self,
+        limit: u32,
+        cursor: Option<&str>,
+        directory: Option<&str>,
+        top_level: bool,
+    ) -> Result<(Vec<SessionInfo>, Option<String>)> {
+        let mut q = page_query(limit, cursor);
+        if let Some(d) = directory {
+            q.push(("directory", d.into()));
+        }
+        if top_level {
+            q.push(("parentID", "null".into()));
+        }
+        let page: List<SessionInfo> = self.get("/api/session", &q).await?;
+        Ok((page.data, page.cursor.next))
     }
 
-    pub async fn patch(&self, path: &str, body: &Value) -> Result<Value> {
-        self.send(self.request(reqwest::Method::PATCH, path).json(body))
-            .await
+    pub async fn session(&self, session_id: &str) -> Result<SessionInfo> {
+        let s: Data<SessionInfo> = self.get(&format!("/api/session/{session_id}"), &[]).await?;
+        Ok(s.data)
+    }
+
+    /// `session.create`; returns the new session's id.
+    pub async fn create_session(&self, body: &Value) -> Result<String> {
+        let created: Data<Id> = self
+            .call(
+                self.request(reqwest::Method::POST, "/api/session")
+                    .json(body),
+            )
+            .await?;
+        Ok(created.data.id)
+    }
+
+    pub async fn set_model(&self, session_id: &str, model: &ModelRef) -> Result<()> {
+        self.post(
+            &format!("/api/session/{session_id}/model"),
+            &json!({ "model": model }),
+        )
+        .await
+    }
+
+    pub async fn set_permissions(&self, session_id: &str, rules: &Value) -> Result<()> {
+        self.send(
+            self.request(
+                reqwest::Method::PATCH,
+                &format!("/api/session/{session_id}"),
+            )
+            .json(&json!({ "permissions": rules })),
+        )
+        .await
+    }
+
+    /// Every model of every configured provider.
+    pub async fn models(&self) -> Result<Vec<ApiModel>> {
+        let models: List<ApiModel> = self.get("/api/model", &[]).await?;
+        Ok(models.data)
+    }
+
+    /// The user's default model for `directory`.
+    pub async fn default_model(&self, directory: &str) -> Result<Option<ModelRef>> {
+        let default: Data<Option<ModelRef>> = self
+            .get(
+                "/api/model/default",
+                &[("location[directory]", directory.into())],
+            )
+            .await?;
+        Ok(default.data)
+    }
+
+    /// The rules of the agent a new session in `directory` runs: the default agent, which
+    /// the service lists first.
+    pub async fn default_agent_rules(&self, directory: &str) -> Result<Option<Vec<Value>>> {
+        let agents: List<Agent> = self
+            .get("/api/agent", &[("location[directory]", directory.into())])
+            .await?;
+        Ok(agents.data.into_iter().next().and_then(|a| a.permissions))
+    }
+
+    /// `integration.list`, which returns once the location's plugins are active, and with
+    /// them its configuration.
+    pub async fn load_location(&self, directory: &str) -> Result<()> {
+        self.send(
+            self.request(reqwest::Method::GET, "/api/integration")
+                .query(&[("location[directory]", directory)]),
+        )
+        .await
     }
 
     pub async fn events(&self) -> Result<Events> {
         let resp = self
-            .request(reqwest::Method::GET, "/api/event")
-            .timeout(Duration::from_secs(60 * 60 * 24))
-            .send()
-            .await
-            .map_err(|e| Error::transport("opencode events", e))?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(http_error(status, &body));
-        }
+            .respond(
+                self.request(reqwest::Method::GET, "/api/event")
+                    .timeout(Duration::from_secs(60 * 60 * 24)),
+            )
+            .await?;
         Ok(Events {
             body: Box::pin(resp.bytes_stream()),
             buf: Vec::new(),
@@ -183,9 +518,15 @@ impl Service {
     }
 }
 
+/// `GET /api/event`: one JSON object per `data:` line, no ids, no replay.
+pub struct Events {
+    body: Pin<Box<dyn futures_util::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>>,
+    buf: Vec<u8>,
+}
+
 impl Events {
-    /// Next event object, or `None` when the service closed the stream.
-    pub async fn next(&mut self) -> Result<Option<Value>> {
+    /// Next event, or `None` when the service closed the stream.
+    pub async fn next(&mut self) -> Result<Option<Event>> {
         loop {
             if let Some(pos) = self.buf.windows(2).position(|w| w == b"\n\n") {
                 let frame: Vec<u8> = self.buf.drain(..pos + 2).collect();
@@ -198,9 +539,9 @@ impl Events {
                 if data.is_empty() {
                     continue; // heartbeat comment
                 }
-                let joined = data.join("\n");
-                match serde_json::from_str::<Value>(&joined) {
-                    Ok(v) => return Ok(Some(v)),
+                match serde_json::from_str::<Value>(&data.join("\n")) {
+                    // An event of an unexpected shape is one agent-talk does not act on.
+                    Ok(v) => return Ok(Some(Event::deserialize(&v).unwrap_or(Event::Other))),
                     Err(e) => {
                         tracing::warn!("opencode events: undecodable frame: {e}");
                         continue;
@@ -242,7 +583,7 @@ pub async fn connect(registration: &Path) -> Result<Service> {
         pid: reg.pid,
         version: reg.version.unwrap_or_default(),
     };
-    let info = svc.get("/api/info", &[]).await.map_err(|mut e| {
+    let info: Info = svc.get("/api/info", &[]).await.map_err(|mut e| {
         if e.code == ErrorCode::Transport {
             if pid_alive(reg.pid) {
                 e.message = format!(
@@ -261,18 +602,17 @@ pub async fn connect(registration: &Path) -> Result<Service> {
         }
         e
     })?;
-    let live_pid = info["pid"].as_u64().unwrap_or_default();
-    if live_pid != u64::from(reg.pid) {
+    if info.pid != u64::from(reg.pid) {
         return Err(Error::new(
             ErrorCode::NoDaemon,
             format!(
-                "registration names pid {} but {} is served by pid {live_pid}; stale registration",
-                reg.pid, svc.url
+                "registration names pid {} but {} is served by pid {}; stale registration",
+                reg.pid, svc.url, info.pid
             ),
         ));
     }
     Ok(Service {
-        version: text(&info["version"]).unwrap_or(svc.version),
+        version: info.version.unwrap_or(svc.version),
         ..svc
     })
 }
@@ -285,19 +625,34 @@ mod tests {
     async fn sse_frames_are_split_on_blank_lines() {
         let chunks: Vec<reqwest::Result<bytes::Bytes>> = vec![
             Ok(bytes::Bytes::from_static(b"data: {\"id\":\"evt_1\",\"type\":\"server.connected\",\"data\":{}}\n\n: heart")),
-            Ok(bytes::Bytes::from_static(b"beat\n\ndata: {\"id\":\"evt_2\",\"type\":\"session.execution.succeeded\",\"data\":{\"sessionID\":\"ses_x\"}}\n\n")),
+            Ok(bytes::Bytes::from_static(b"beat\n\ndata: {\"id\":\"evt_2\",\"type\":\"session.execution.interrupted\",\"data\":{\"sessionID\":\"ses_x\",\"reason\":\"user\"}}\n\n")),
         ];
         let mut ev = Events {
             body: Box::pin(futures_util::stream::iter(chunks)),
             buf: Vec::new(),
         };
-        assert_eq!(
-            ev.next().await.unwrap().unwrap()["type"],
-            "server.connected"
-        );
-        let second = ev.next().await.unwrap().unwrap();
-        assert_eq!(second["type"], "session.execution.succeeded");
-        assert_eq!(second["data"]["sessionID"], "ses_x");
+        assert!(matches!(ev.next().await.unwrap(), Some(Event::Other)));
+        match ev.next().await.unwrap() {
+            Some(Event::ExecutionEnded { data }) => assert_eq!(data.session_id, "ses_x"),
+            _ => panic!("expected an execution end"),
+        }
         assert!(ev.next().await.unwrap().is_none());
+    }
+
+    /// Shapes observed on opencode 2.0.22.
+    #[test]
+    fn permission_requests_keep_their_raw_form() {
+        let raw = json!({"id":"evt_1","type":"permission.asked","location":{"directory":"/w"},
+            "data":{"id":"per_1","sessionID":"ses_x","action":"edit","resources":["a.txt"],"save":["*"],
+                "source":{"type":"tool","messageID":"msg_a","id":"call_1"}}});
+        let Event::PermissionAsked { data: req } = Event::deserialize(&raw).unwrap() else {
+            panic!("expected a permission request");
+        };
+        assert_eq!(
+            (req.id.as_str(), req.session_id.as_str()),
+            ("per_1", "ses_x")
+        );
+        assert_eq!(req.call_id.as_deref(), Some("call_1"));
+        assert_eq!(req.raw, raw["data"]);
     }
 }
