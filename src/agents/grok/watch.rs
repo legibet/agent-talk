@@ -65,13 +65,15 @@ pub struct End {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct QueueChanged {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "super::or_default")]
     entries: Vec<QueueEntry>,
+    #[serde(default, deserialize_with = "super::or_default")]
     running_prompt_id: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct QueueEntry {
+    #[serde(default, deserialize_with = "super::or_default")]
     id: Option<String>,
 }
 
@@ -79,17 +81,18 @@ struct QueueEntry {
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PermissionRequest {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "super::or_default")]
     tool_call: ToolCall,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "super::or_default")]
     options: Vec<PermissionOption>,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PermissionOption {
+    #[serde(default, deserialize_with = "super::or_default")]
     option_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "super::or_default")]
     kind: String,
 }
 
@@ -267,8 +270,12 @@ impl<'s> Watch<'s> {
             }
             Next::Event(Some(Event::Request(r))) if r.method == REQUEST_PERMISSION => {
                 let id = r.id.clone();
-                if let Some(answer) = self.on_permission(r.id, r.params) {
-                    conn.respond(&id, answer).await?;
+                if let Some((a, answer)) = self.on_permission(r.id, r.params) {
+                    // Recorded as declined only once the answer is written.
+                    if let Some(answer) = answer {
+                        conn.respond(&id, answer).await?;
+                    }
+                    self.add_approval(a);
                 }
                 Ok(None)
             }
@@ -391,10 +398,11 @@ impl<'s> Watch<'s> {
         Ok(None)
     }
 
-    /// A permission request, recorded; the answer to send, if any. Under `deny` the ones
-    /// for this prompt's tool calls (matched by `toolCallId`; through a leader, other
-    /// clients' turns raise them too) get the `reject_once` option.
-    fn on_permission(&mut self, request_id: Value, params: Value) -> Option<Value> {
+    /// A permission request: the approval to record and the answer to send before it, if
+    /// any; `None` for a request already recorded. Under `deny` the ones for this prompt's
+    /// tool calls (matched by `toolCallId`; through a leader, other clients' turns raise
+    /// them too) get the `reject_once` option.
+    fn on_permission(&self, request_id: Value, params: Value) -> Option<(Approval, Option<Value>)> {
         let req = PermissionRequest::deserialize(&params).unwrap_or_default();
         let call = req.tool_call;
         // A request already recorded is not answered again. Unverified whether Grok
@@ -445,9 +453,12 @@ impl<'s> Watch<'s> {
             },
             raw: params,
         };
+        Some((a, answer))
+    }
+
+    fn add_approval(&mut self, a: Approval) {
         record(self.store, &a);
         self.approvals.push(a);
-        answer
     }
 
     /// The turn as `result` reports it; `final_text` is the agent text after the last
@@ -627,7 +638,9 @@ mod tests {
 
     fn permission(w: &mut Watch, id: u64, params: &str) -> Option<Value> {
         let params = serde_json::from_str(&params.replace("$S", SESSION)).unwrap();
-        w.on_permission(json!(id), params)
+        let (a, answer) = w.on_permission(json!(id), params)?;
+        w.add_approval(a);
+        answer
     }
 
     /// In direct mode every request is this prompt's: `deny` answers `reject_once`, once;
@@ -689,5 +702,21 @@ mod tests {
             outcomes,
             [ApprovalOutcome::Resolved, ApprovalOutcome::Declined]
         );
+    }
+
+    /// Fields of a permission request that do not fit leave the rest usable: `deny` still
+    /// finds `reject_once` and the tool call.
+    #[test]
+    fn odd_permission_fields_still_decline() {
+        let store = store_with_intent("p");
+        let mut w = prompt(&store, "p", ApprovalPolicy::Deny, false);
+        let odd = PERMISSION
+            .replace(r#""kind":"allow_always""#, r#""kind":null"#)
+            .replace(r#""title":"Execute"#, r#""title":7,"x":"Execute"#);
+        assert_eq!(
+            permission(&mut w, 0, &odd),
+            Some(json!({"outcome": {"outcome": "selected", "optionId": "reject-once"}}))
+        );
+        assert_eq!(w.approvals[0].item_id.as_deref(), Some("call-f3cb…-0"));
     }
 }

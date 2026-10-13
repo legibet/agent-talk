@@ -53,7 +53,21 @@ struct Incoming {
     #[serde(default)]
     params: Value,
     result: Option<Value>,
-    error: Option<AgentError>,
+    /// Kept raw: an error object that does not fit JSON-RPC's shape still answers its
+    /// request (`agent_error`).
+    error: Option<Value>,
+}
+
+/// The agent's error object; one without an integer code or a message keeps what it has,
+/// with the whole object as data.
+fn agent_error(e: Value) -> AgentError {
+    AgentError::deserialize(&e).unwrap_or_else(|_| AgentError {
+        code: e["code"].as_i64().unwrap_or_default(),
+        message: e["message"]
+            .as_str()
+            .map_or_else(|| e.to_string(), String::from),
+        data: Some(e),
+    })
 }
 
 #[derive(Default)]
@@ -237,14 +251,16 @@ impl Conn {
             }
             p.waiters.insert(id, tx);
         }
-        tracing::debug!(id, method, %params, "send");
-        self.write(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))
-            .await?;
-        Ok(Response {
+        // The guard owns the waiter from here: a failed or cancelled write removes it.
+        let response = Response {
             id,
             rx,
             shared: self.shared.clone(),
-        })
+        };
+        tracing::debug!(id, method, %params, "send");
+        self.write(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))
+            .await?;
+        Ok(response)
     }
 
     /// Send a request and wait for its response, at most `RPC_TIMEOUT`; after that the
@@ -360,7 +376,7 @@ async fn read_loop(
                 let waiter = shared.pending.lock().unwrap().waiters.remove(&id);
                 if let Some(w) = waiter {
                     let _ = w.send(match msg.error {
-                        Some(e) => Err(e),
+                        Some(e) => Err(agent_error(e)),
                         None => Ok(msg.result.unwrap_or(Value::Null)),
                     });
                 }

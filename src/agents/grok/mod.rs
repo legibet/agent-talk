@@ -36,7 +36,8 @@ use crate::model::{
     Result, Session, SessionState, TurnStatus,
 };
 use crate::store::{NewIntent, Store};
-use serde::Deserialize;
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
 use std::fmt::Write as _;
 use std::fs::File;
@@ -94,25 +95,35 @@ async fn set_config(conn: &Conn, id: &str, config: &str, value: &str) -> Result<
     }
 }
 
+/// A field that is missing or does not fit reads as its default, so a non-essential field
+/// never drops the record it is part of. For
+/// `#[serde(default, deserialize_with = "or_default")]`.
+fn or_default<'de, D: Deserializer<'de>, T: DeserializeOwned + Default>(
+    d: D,
+) -> std::result::Result<T, D::Error> {
+    Ok(T::deserialize(Value::deserialize(d)?).unwrap_or_default())
+}
+
 /// One entry of the `initialize` response's `_meta.modelState.availableModels`.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AvailableModel {
     #[serde(default)]
     model_id: String,
-    #[serde(rename = "_meta", default)]
+    #[serde(rename = "_meta", default, deserialize_with = "or_default")]
     meta: ModelMeta,
 }
 
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ModelMeta {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "or_default")]
     reasoning_efforts: Vec<Effort>,
 }
 
 #[derive(Deserialize)]
 struct Effort {
+    #[serde(default, deserialize_with = "or_default")]
     value: Option<String>,
 }
 
@@ -123,9 +134,9 @@ struct Effort {
 #[serde(rename_all = "camelCase")]
 struct Listed {
     session_id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "or_default")]
     resident: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "or_default")]
     activity: Activity,
 }
 
@@ -1091,5 +1102,17 @@ mod tests {
             "EACCES"
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A leader row whose activity (or residency) does not fit keeps the row: residency
+    /// decides the route, and dropping the row would pick a direct child beside the leader.
+    #[test]
+    fn odd_listed_fields_keep_the_row() {
+        let row =
+            |s: &str| Listed::deserialize(&serde_json::from_str::<Value>(s).unwrap()).unwrap();
+        let l = row(r#"{"sessionId":"s1","resident":true,"activity":null}"#);
+        assert!(l.session_id == "s1" && l.resident && l.activity == Activity::Unknown);
+        let l = row(r#"{"sessionId":"s1","resident":null,"activity":"sleeping"}"#);
+        assert!(!l.resident && l.activity == Activity::Unknown);
     }
 }

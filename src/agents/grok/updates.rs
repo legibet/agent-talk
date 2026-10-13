@@ -27,24 +27,29 @@ use std::path::Path;
 #[serde(tag = "sessionUpdate", rename_all = "snake_case")]
 pub enum SessionUpdate {
     UserMessageChunk {
-        #[serde(default)]
+        #[serde(default, deserialize_with = "super::or_default")]
         content: Content,
-        #[serde(rename = "_meta", default)]
+        #[serde(rename = "_meta", default, deserialize_with = "super::or_default")]
         meta: PromptMeta,
     },
     AgentMessageChunk {
-        #[serde(default)]
+        #[serde(default, deserialize_with = "super::or_default")]
         content: Content,
     },
     ToolCall(ToolCall),
     #[serde(rename_all = "camelCase")]
     ToolCallUpdate {
+        #[serde(default, deserialize_with = "super::or_default")]
         tool_call_id: Option<String>,
+        #[serde(default, deserialize_with = "super::or_default")]
         status: Option<String>,
     },
     TurnCompleted {
+        #[serde(default, deserialize_with = "super::or_default")]
         prompt_id: Option<String>,
+        #[serde(default, deserialize_with = "super::or_default")]
         stop_reason: Option<String>,
+        #[serde(default, deserialize_with = "super::or_default")]
         elapsed_ms: Option<i64>,
     },
     /// Live only: the permission request of this tool call was answered.
@@ -71,8 +76,9 @@ impl SessionUpdate {
 
 #[derive(Debug, Default, Deserialize)]
 pub struct Content {
+    #[serde(default, deserialize_with = "super::or_default")]
     pub text: Option<String>,
-    #[serde(rename = "_meta", default)]
+    #[serde(rename = "_meta", default, deserialize_with = "super::or_default")]
     meta: ContentMeta,
 }
 
@@ -80,14 +86,16 @@ pub struct Content {
 #[serde(rename_all = "camelCase")]
 struct ContentMeta {
     /// A steer message's own text; `text` wraps it in instructions to the model.
+    #[serde(default, deserialize_with = "super::or_default")]
     display_text: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PromptMeta {
+    #[serde(default, deserialize_with = "super::or_default")]
     prompt_index: Option<u64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "super::or_default")]
     interjection: bool,
 }
 
@@ -95,23 +103,27 @@ pub struct PromptMeta {
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolCall {
+    #[serde(default, deserialize_with = "super::or_default")]
     pub tool_call_id: Option<String>,
+    #[serde(default, deserialize_with = "super::or_default")]
     title: Option<String>,
     #[serde(default)]
     raw_input: Value,
+    #[serde(default, deserialize_with = "super::or_default")]
     status: Option<String>,
-    #[serde(rename = "_meta", default)]
+    #[serde(rename = "_meta", default, deserialize_with = "super::or_default")]
     meta: ToolMeta,
 }
 
 #[derive(Debug, Default, Deserialize)]
 struct ToolMeta {
-    #[serde(rename = "x.ai/tool")]
+    #[serde(rename = "x.ai/tool", default, deserialize_with = "super::or_default")]
     tool: Option<ToolInfo>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ToolInfo {
+    #[serde(default, deserialize_with = "super::or_default")]
     name: Option<String>,
 }
 
@@ -571,5 +583,23 @@ mod tests {
         let h = History::new(parse(&lines.join("\n")));
         assert_eq!(h.turn_id(0), "line-1");
         assert!(h.turn("grok:s".into(), 0, &h.messages()).is_none());
+    }
+
+    /// A turn's opening and closing lines whose other fields do not fit still open and
+    /// close it.
+    #[test]
+    fn odd_fields_keep_turn_markers() {
+        let update = |s: &str| SessionUpdate::of(&serde_json::from_str::<Value>(s).unwrap());
+        let open = update(
+            r#"{"update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":7},"_meta":{"promptIndex":0,"interjection":null}}}"#,
+        );
+        assert!(open.opens_turn());
+        let end = update(
+            r#"{"update":{"sessionUpdate":"turn_completed","prompt_id":"p","stop_reason":"end_turn","elapsed_ms":1.5}}"#,
+        );
+        assert!(matches!(
+            end,
+            SessionUpdate::TurnCompleted { prompt_id: Some(ref p), elapsed_ms: None, .. } if p == "p"
+        ));
     }
 }

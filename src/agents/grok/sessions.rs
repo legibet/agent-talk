@@ -10,9 +10,12 @@ use std::path::{Path, PathBuf};
 pub struct Summary {
     pub info: SummaryInfo,
     /// Set by `_x.ai/session/rename` (with `title_is_manual: true`) or generated.
+    #[serde(default, deserialize_with = "super::or_default")]
     pub generated_title: Option<String>,
     /// `headless` for `-p`; null for the TUI and ACP.
+    #[serde(default, deserialize_with = "super::or_default")]
     pub session_kind: Option<String>,
+    #[serde(default, deserialize_with = "super::or_default")]
     updated_at: Option<String>,
 }
 
@@ -26,6 +29,7 @@ impl Summary {
 #[derive(Debug, Deserialize)]
 pub struct SummaryInfo {
     pub id: String,
+    #[serde(default, deserialize_with = "super::or_default")]
     pub cwd: Option<String>,
 }
 
