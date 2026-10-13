@@ -336,7 +336,7 @@ impl Server {
             handle: p.handle,
             query: ReadQuery {
                 limit: p.limit.unwrap_or(READ_LIMIT),
-                before: p.cursor,
+                cursor: p.cursor,
                 all: p.all.unwrap_or(false),
             },
             raw: false,

@@ -9,8 +9,9 @@ use serde_json::Value;
 /// previous read's `next_cursor` names (DESIGN.md §5).
 pub struct ReadQuery {
     pub limit: usize,
-    /// The cursor: an item id, or a `Boundary` for Codex and OpenCode.
-    pub before: Option<String>,
+    /// The cursor a previous read returned: an item id, or a `Boundary` for Codex and
+    /// OpenCode.
+    pub cursor: Option<String>,
     /// Every message; the default is prompts and final replies.
     pub all: bool,
 }
@@ -47,19 +48,20 @@ impl Cut {
     }
 }
 
-/// Cuts the page `q` asks for. `records` is the number of records the messages came from
-/// and `older` whether records exist before them (a remote history fetched newest first
-/// stops once the page is full).
+/// Cuts the page `q` asks for, ending before the item `before` names. `records` is the
+/// number of records the messages came from and `older` whether records exist before them
+/// (a remote history fetched newest first stops once the page is full).
 pub fn cut(
     q: &ReadQuery,
+    before: Option<&str>,
     messages: Vec<(usize, Message)>,
     records: usize,
     older: bool,
 ) -> Result<Cut> {
-    let end = match &q.before {
+    let end = match before {
         Some(c) => messages
             .iter()
-            .position(|(_, m)| m.item_id == *c)
+            .position(|(_, m)| m.item_id == c)
             .ok_or_else(|| Error::new(ErrorCode::Precondition, format!("unknown cursor {c}")))?,
         None => messages.len(),
     };
@@ -84,19 +86,104 @@ pub fn cut(
 /// `read` cursor of a remote history: the item a page starts with and the agent's cursor
 /// that fetched the page holding it, so the next read refetches at most one extra page.
 #[derive(Serialize, Deserialize)]
-pub struct Boundary {
-    pub item: String,
-    pub page: Option<String>,
+struct Boundary {
+    item: String,
+    page: Option<String>,
 }
 
-impl Boundary {
-    pub fn parse(cursor: &str) -> Result<Boundary> {
-        serde_json::from_str(cursor)
-            .map_err(|_| Error::new(ErrorCode::Precondition, format!("invalid cursor {cursor}")))
+/// A remote history (Codex turns, OpenCode message rows) fetched newest first, page by
+/// page, until it holds the page `read` asks for.
+pub struct RemoteHistory {
+    /// Records oldest first.
+    records: Vec<Value>,
+    /// For each record, the agent cursor that fetched its page.
+    fetched_with: Vec<Option<String>>,
+    /// The agent cursor of the next older page, when one exists.
+    older: Option<String>,
+    /// The item the page ends before, from the `Boundary` the caller passed.
+    before: Option<String>,
+}
+
+impl RemoteHistory {
+    /// `fetch` returns the page an agent cursor names (the newest without one), records
+    /// newest first, and the cursor of the next older page. `normalize` turns records,
+    /// oldest first, into messages tagged with their record's index.
+    pub async fn fetch(
+        q: &ReadQuery,
+        mut fetch: impl AsyncFnMut(Option<&str>) -> Result<(Vec<Value>, Option<String>)>,
+        normalize: impl Fn(&[Value]) -> Result<Vec<(usize, Message)>>,
+    ) -> Result<RemoteHistory> {
+        let (before, mut cursor) = match &q.cursor {
+            Some(c) => {
+                let b: Boundary = serde_json::from_str(c).map_err(|_| {
+                    Error::new(ErrorCode::Precondition, format!("invalid cursor {c}"))
+                })?;
+                (Some(b.item), b.page)
+            }
+            None => (None, None),
+        };
+        let mut h = RemoteHistory {
+            records: Vec::new(),
+            fetched_with: Vec::new(),
+            older: None,
+            before,
+        };
+        loop {
+            let (page, next) = fetch(cursor.as_deref()).await?;
+            h.fetched_with
+                .splice(0..0, std::iter::repeat_n(cursor.clone(), page.len()));
+            h.records.splice(0..0, page.into_iter().rev());
+            let messages = normalize(&h.records)?;
+            let cut = cut(
+                q,
+                h.before.as_deref(),
+                messages,
+                h.records.len(),
+                next.is_some(),
+            )?;
+            match next {
+                Some(c) if cut.messages.len() < q.limit => cursor = Some(c),
+                older => {
+                    h.older = older;
+                    return Ok(h);
+                }
+            }
+        }
     }
 
-    pub fn encode(&self) -> String {
-        serde_json::to_string(self).unwrap()
+    /// The fetched records, oldest first.
+    pub fn records(&self) -> &[Value] {
+        &self.records
+    }
+
+    /// The agent cursor of the next older page, when one exists.
+    pub fn older(&self) -> Option<&str> {
+        self.older.as_deref()
+    }
+
+    /// The page `q` asks for, out of `messages` normalized from `records()`.
+    pub fn page(mut self, q: &ReadQuery, messages: Vec<(usize, Message)>) -> Result<ReadPage> {
+        let cut = cut(
+            q,
+            self.before.as_deref(),
+            messages,
+            self.records.len(),
+            self.older.is_some(),
+        )?;
+        let next_cursor = cut.cursor_item().map(|(i, m)| {
+            let b = Boundary {
+                item: m.item_id.clone(),
+                page: self.fetched_with[*i].clone(),
+            };
+            serde_json::to_string(&b).unwrap()
+        });
+        Ok(ReadPage {
+            messages: Page {
+                next_cursor,
+                items: cut.messages.into_iter().map(|(_, m)| m).collect(),
+            },
+            raw: self.records.drain(cut.records).collect(),
+        })
     }
 }
 
@@ -157,30 +244,22 @@ mod tests {
     fn read_pages_newest_first_counting_shown_messages() {
         let q = ReadQuery {
             limit: 2,
-            before: None,
+            cursor: None,
             all: false,
         };
         // The newest two shown messages skip the tool call; the raw span runs to the end.
-        let c = cut(&q, tagged(HISTORY), 5, false).unwrap();
+        let c = cut(&q, None, tagged(HISTORY), 5, false).unwrap();
         assert_eq!(ids(&c), ["2-prompt", "3-final"]);
         assert_eq!((c.records.clone(), c.more), (2..5, true));
-        let older = ReadQuery {
-            before: Some("2-prompt".into()),
-            ..q
-        };
-        let c = cut(&older, tagged(HISTORY), 5, false).unwrap();
+        let c = cut(&q, Some("2-prompt"), tagged(HISTORY), 5, false).unwrap();
         assert_eq!(ids(&c), ["1-prompt", "1-final"]);
         assert_eq!((c.records.clone(), c.more), (1..2, false));
         // With every message, a page can end inside a record, which the raw span then
         // includes; a remote history that may hold older records reports more.
-        let all = ReadQuery {
-            limit: 2,
-            before: Some("3-final".into()),
-            all: true,
-        };
-        let c = cut(&all, tagged(HISTORY), 5, true).unwrap();
+        let all = ReadQuery { all: true, ..q };
+        let c = cut(&all, Some("3-final"), tagged(HISTORY), 5, true).unwrap();
         assert_eq!(ids(&c), ["2-prompt", "3-other"]);
         assert_eq!((c.records.clone(), c.more), (2..4, true));
-        assert!(cut(&older, tagged(&HISTORY[3..]), 5, false).is_err());
+        assert!(cut(&all, Some("2-prompt"), tagged(&HISTORY[3..]), 5, false).is_err());
     }
 }

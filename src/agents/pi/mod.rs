@@ -487,7 +487,7 @@ impl Agent for Pi<'_> {
                 m.from = self.store.sender_of(&m.item_id)?;
             }
         }
-        let cut = cut(q, messages, entries.len(), false)?;
+        let cut = cut(q, q.cursor.as_deref(), messages, entries.len(), false)?;
         Ok(ReadPage {
             messages: Page {
                 next_cursor: cut.cursor_item().map(|(_, m)| m.item_id.clone()),

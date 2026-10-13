@@ -743,7 +743,7 @@ impl Agent for Antigravity<'_> {
                 m.from = self.store.sender_by_turn(&h, &m.turn_id)?;
             }
         }
-        let cut = cut(q, messages, lines.len(), false)?;
+        let cut = cut(q, q.cursor.as_deref(), messages, lines.len(), false)?;
         Ok(ReadPage {
             messages: Page {
                 next_cursor: cut.cursor_item().map(|(_, m)| m.item_id.clone()),

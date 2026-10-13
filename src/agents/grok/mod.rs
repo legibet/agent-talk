@@ -1224,7 +1224,7 @@ impl Agent for Grok<'_> {
             }
         }
         let messages = messages.into_iter().map(|m| (m.line, m.message)).collect();
-        let cut = cut(q, messages, history.lines.len(), false)?;
+        let cut = cut(q, q.cursor.as_deref(), messages, history.lines.len(), false)?;
         Ok(ReadPage {
             messages: Page {
                 next_cursor: cut.cursor_item().map(|(_, m)| m.item_id.clone()),

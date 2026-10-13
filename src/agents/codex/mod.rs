@@ -6,7 +6,7 @@ pub mod transport;
 use self::protocol::*;
 use self::transport::{Conn, Event, ServerRequest, decode};
 use crate::agents::child::cli_version;
-use crate::agents::history::{Boundary, ReadPage, ReadQuery, cut};
+use crate::agents::history::{ReadPage, ReadQuery, RemoteHistory};
 use crate::agents::lifecycle::{
     ApprovalPolicy, approval_policy, bounded, record, reject, resolve, settle, wait_receipt,
 };
@@ -917,53 +917,24 @@ impl Agent for Codex<'_> {
 
     async fn read(&self, thread_id: &str, q: &ReadQuery) -> Result<ReadPage> {
         let conn = self.connect().await?;
-        let before = q.before.as_deref().map(Boundary::parse).transpose()?;
-        let local = ReadQuery {
-            limit: q.limit,
-            before: before.as_ref().map(|b| b.item.clone()),
-            all: q.all,
-        };
-        // Turns oldest first, each with the cursor its page was fetched with; pages come
-        // newest first until they hold the page asked for.
-        let mut fetch = before.and_then(|b| b.page);
-        let mut turns: Vec<(Option<String>, Value)> = Vec::new();
-        let cut = loop {
+        let fetch = async |cursor: Option<&str>| {
             let mut params = json!({
                 "threadId": thread_id,
                 "limit": 20,
                 "sortDirection": "desc",
                 "itemsView": "full",
             });
-            if let Some(c) = &fetch {
+            if let Some(c) = cursor {
                 params["cursor"] = json!(c);
             }
             let page = conn.call::<TurnsPage>("thread/turns/list", params).await?;
-            turns.splice(
-                0..0,
-                page.data.into_iter().rev().map(|t| (fetch.clone(), t)),
-            );
-            let messages = self.messages(turns.iter().map(|(_, t)| t))?;
-            let cut = cut(&local, messages, turns.len(), page.next_cursor.is_some())?;
-            match page.next_cursor {
-                Some(c) if cut.messages.len() < q.limit => fetch = Some(c),
-                _ => break cut,
-            }
+            Ok((page.data, page.next_cursor))
         };
+        let normalize = |turns: &[Value]| self.messages(turns.iter());
+        let history = RemoteHistory::fetch(q, fetch, normalize).await?;
         conn.close().await;
-        let next_cursor = cut.cursor_item().map(|(i, m)| {
-            Boundary {
-                item: m.item_id.clone(),
-                page: turns[*i].0.clone(),
-            }
-            .encode()
-        });
-        Ok(ReadPage {
-            messages: Page {
-                next_cursor,
-                items: cut.messages.into_iter().map(|(_, m)| m).collect(),
-            },
-            raw: turns.drain(cut.records).map(|(_, t)| t).collect(),
-        })
+        let messages = normalize(history.records())?;
+        history.page(q, messages)
     }
 
     async fn wait(

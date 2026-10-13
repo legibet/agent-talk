@@ -12,7 +12,7 @@
 mod transport;
 
 use self::transport::{Events, Service};
-use crate::agents::history::{Boundary, ReadPage, ReadQuery, cut};
+use crate::agents::history::{ReadPage, ReadQuery, RemoteHistory};
 use crate::agents::lifecycle::{
     ApprovalPolicy, approval_policy, bounded, record, reject, resolve, settle, wait_receipt,
 };
@@ -934,47 +934,14 @@ impl Agent for OpenCode<'_> {
 
     async fn read(&self, session_id: &str, q: &ReadQuery) -> Result<ReadPage> {
         let svc = self.connect().await?;
-        let before = q.before.as_deref().map(Boundary::parse).transpose()?;
-        let local = ReadQuery {
-            limit: q.limit,
-            before: before.as_ref().map(|b| b.item.clone()),
-            all: q.all,
-        };
-        // Rows oldest first, each with the cursor its page was fetched with; pages come
-        // newest first until they hold the page asked for.
-        let mut fetch = before.and_then(|b| b.page);
-        let mut rows: Vec<(Option<String>, Value)> = Vec::new();
-        let older = loop {
-            let (page, next) = svc.history(session_id, fetch.as_deref()).await?;
-            rows.splice(0..0, page.into_iter().rev().map(|r| (fetch.clone(), r)));
-            // Which messages the page shows does not depend on their turn.
-            let messages = self.messages(rows.iter().map(|(_, r)| r), None)?;
-            let have = cut(&local, messages, rows.len(), next.is_some())?
-                .messages
-                .len();
-            match next {
-                Some(c) if have < q.limit => fetch = Some(c),
-                _ => break next,
-            }
-        };
-        let oldest = rows.first().map(|(_, r)| r);
-        let turn = turn_before(&svc, session_id, oldest, older.as_deref()).await?;
-        let messages = self.messages(rows.iter().map(|(_, r)| r), turn)?;
-        let cut = cut(&local, messages, rows.len(), older.is_some())?;
-        let next_cursor = cut.cursor_item().map(|(i, m)| {
-            Boundary {
-                item: m.item_id.clone(),
-                page: rows[*i].0.clone(),
-            }
-            .encode()
-        });
-        Ok(ReadPage {
-            messages: Page {
-                next_cursor,
-                items: cut.messages.into_iter().map(|(_, m)| m).collect(),
-            },
-            raw: rows.drain(cut.records).map(|(_, r)| r).collect(),
-        })
+        let fetch = async |cursor: Option<&str>| svc.history(session_id, cursor).await;
+        // Which messages the page shows does not depend on their turn.
+        let normalize = |rows: &[Value]| self.messages(rows.iter(), None);
+        let history = RemoteHistory::fetch(q, fetch, normalize).await?;
+        let oldest = history.records().first();
+        let turn = turn_before(&svc, session_id, oldest, history.older()).await?;
+        let messages = self.messages(history.records().iter(), turn)?;
+        history.page(q, messages)
     }
 
     async fn wait(

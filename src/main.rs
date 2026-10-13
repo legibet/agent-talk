@@ -366,11 +366,7 @@ async fn run(store: &Store, cmd: Cmd, json: bool) -> model::Result<()> {
         } => {
             let args = ReadArgs {
                 handle,
-                query: ReadQuery {
-                    limit,
-                    before: cursor,
-                    all,
-                },
+                query: ReadQuery { limit, cursor, all },
                 raw,
             };
             print(json, &ops::read(store, args).await?, print_read);
