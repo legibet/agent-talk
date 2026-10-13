@@ -6,10 +6,11 @@
 //! reader never answers server requests; the adapter decides. Writes go through
 //! one mutex-guarded sink.
 
-use super::protocol::{Incoming, InitializeResponse, classify_error};
+use super::protocol::{CursorPage, Incoming, classify_error};
 use crate::model::{AgentError, Error, ErrorCode, Result};
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
+use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -29,6 +30,8 @@ type Waiter = oneshot::Sender<std::result::Result<Value, AgentError>>;
 /// Notifications retained while the command is busy elsewhere (e.g. awaiting an RPC).
 const EVENT_BUFFER: usize = 4096;
 const RPC_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long `close` waits for the WebSocket close handshake.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug)]
 pub enum Event {
@@ -58,7 +61,6 @@ pub struct Conn {
     requests: mpsc::UnboundedReceiver<ServerRequest>,
     overflow: Arc<AtomicBool>,
     reader: JoinHandle<()>,
-    pub user_agent: Option<String>,
 }
 
 impl Drop for Conn {
@@ -117,7 +119,7 @@ pub async fn connect(socket: &Path) -> Result<Conn> {
         req_tx,
         overflow.clone(),
     ));
-    let mut conn = Conn {
+    let conn = Conn {
         sink,
         pending,
         next_id: AtomicU64::new(1),
@@ -125,22 +127,19 @@ pub async fn connect(socket: &Path) -> Result<Conn> {
         requests,
         overflow,
         reader,
-        user_agent: None,
     };
-    let init: InitializeResponse = conn
-        .call(
-            "initialize",
-            json!({
-                "clientInfo": {
-                    "name": "agent-talk",
-                    "title": "agent-talk",
-                    "version": env!("CARGO_PKG_VERSION"),
-                },
-                "capabilities": {"experimentalApi": true},
-            }),
-        )
-        .await?;
-    conn.user_agent = init.user_agent;
+    conn.request(
+        "initialize",
+        json!({
+            "clientInfo": {
+                "name": "agent-talk",
+                "title": "agent-talk",
+                "version": env!("CARGO_PKG_VERSION"),
+            },
+            "capabilities": {"experimentalApi": true},
+        }),
+    )
+    .await?;
     conn.write(json!({"method": "initialized", "params": {}}))
         .await?;
     Ok(conn)
@@ -148,7 +147,9 @@ pub async fn connect(socket: &Path) -> Result<Conn> {
 
 impl Conn {
     /// Send a request and wait for its response. Agent errors keep code/message/data.
-    pub async fn request(&self, method: &str, params: Value) -> Result<Value> {
+    pub async fn request(&self, method: &str, params: impl Serialize) -> Result<Value> {
+        let params = serde_json::to_value(params)
+            .map_err(|e| Error::transport(format!("encode {method} params"), e))?;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         {
@@ -179,9 +180,22 @@ impl Conn {
     }
 
     /// `request` plus decoding of the result into a narrow struct.
-    pub async fn call<T: DeserializeOwned>(&self, method: &str, params: Value) -> Result<T> {
+    pub async fn call<T: DeserializeOwned>(
+        &self,
+        method: &str,
+        params: impl Serialize,
+    ) -> Result<T> {
         let v = self.request(method, params).await?;
         decode(method, &v)
+    }
+
+    /// A cursor-paged list method, read page by page starting from `params`.
+    pub fn pages<'c>(&'c self, method: &'c str, params: Value) -> Pages<'c> {
+        Pages {
+            conn: self,
+            method,
+            params: Some(params),
+        }
     }
 
     /// Next buffered event, server requests first; `None` once the connection is
@@ -213,8 +227,12 @@ impl Conn {
         self.overflow.swap(false, Ordering::Relaxed)
     }
 
+    /// Close the WebSocket, waiting at most `CLOSE_TIMEOUT` for the close handshake.
     pub async fn close(self) {
-        let _ = self.sink.lock().await.close().await;
+        let _ = tokio::time::timeout(CLOSE_TIMEOUT, async {
+            let _ = self.sink.lock().await.close().await;
+        })
+        .await;
     }
 
     async fn write(&self, msg: Value) -> Result<()> {
@@ -224,6 +242,30 @@ impl Conn {
             .send(WsMessage::text(msg.to_string()))
             .await
             .map_err(|e| Error::transport("write", e))
+    }
+}
+
+/// The pages of a list method (`CursorPage`): each request passes the previous page's
+/// `nextCursor` as `cursor`.
+pub struct Pages<'c> {
+    conn: &'c Conn,
+    method: &'c str,
+    /// The next request's params; `None` after the last page.
+    params: Option<Value>,
+}
+
+impl Pages<'_> {
+    /// The next page's entries; `None` after the last page.
+    pub async fn next<T: DeserializeOwned>(&mut self) -> Result<Option<Vec<T>>> {
+        let Some(params) = &mut self.params else {
+            return Ok(None);
+        };
+        let page: CursorPage<T> = self.conn.call(self.method, &*params).await?;
+        match page.next_cursor {
+            Some(c) => params["cursor"] = json!(c),
+            None => self.params = None,
+        }
+        Ok(Some(page.data))
     }
 }
 

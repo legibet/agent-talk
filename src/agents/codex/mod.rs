@@ -1,11 +1,16 @@
 //! Codex adapter: talks to the shared app-server daemon over its control socket.
 
-pub mod protocol;
-pub mod transport;
+mod protocol;
+mod transport;
 
-use self::protocol::*;
+use self::protocol::{
+    ALL_SOURCE_KINDS, AgentMessage, AgentPhase, CursorPage, DEFAULT_SOURCE_KINDS, Item,
+    ItemNotification, ModelInfo, QueuedEntry, Thread, ThreadQueueAddResponse, ThreadStartResponse,
+    ThreadStatus, TurnCompletedNotification, TurnResponse, TurnSteerResponse, deny_response,
+    history_not_ready, nothing_dormant, resume_error, resume_latest_turn, text_input,
+};
 use self::transport::{Conn, Event, ServerRequest, decode};
-use crate::agents::child::cli_version;
+use crate::agents::child::{agent_cmd, cli_version};
 use crate::agents::history::{ReadPage, ReadQuery, RemoteHistory};
 use crate::agents::lifecycle::{
     ApprovalPolicy, approval_policy, bounded, record, reject, resolve, settle, wait_receipt,
@@ -23,11 +28,11 @@ use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration;
-use tokio::process::Command;
 use tokio::time::Instant;
 
 const DUMMY_THREAD: &str = "00000000-0000-0000-0000-000000000000";
-/// Seconds `subscribe` keeps retrying while a just-started thread's rollout is empty.
+/// How often `subscribe` retries `thread/resume`, a second apart, while a just-started
+/// thread's history is not readable yet.
 const RESUME_RETRIES: u32 = 10;
 /// How long `send` waits for a `turn/started` after `thread/queue/add` on an idle thread
 /// before it starts the submission itself (`start_if_dormant`).
@@ -88,19 +93,6 @@ fn handle(thread_id: &str) -> String {
     format!("codex:{thread_id}")
 }
 
-/// History of a thread created moments ago is not readable yet. Two transient shapes:
-/// `-32603 "… rollout at <path> is empty"` (`thread/resume`, `thread/turns/list`) while
-/// the rollout file has no line, and `-32601 "list_turns is not supported yet"` from
-/// `thread/turns/list` while the thread has no row in the daemon's state DB (its
-/// paginated reads check that row first). Other -32603s are thread-store failures and
-/// other -32601s are really unsupported methods.
-fn history_not_ready(e: &Error) -> bool {
-    e.agent_error.as_ref().is_some_and(|v| {
-        (v.code == -32603 && v.message.ends_with(" is empty"))
-            || (v.code == -32601 && v.message == "list_turns is not supported yet")
-    })
-}
-
 fn approval_summary(method: &str, params: &Value) -> String {
     match method {
         "item/commandExecution/requestApproval" | "execCommandApproval" => params["command"]
@@ -134,11 +126,11 @@ impl<'a> Codex<'a> {
     }
 
     /// Subscribe to the thread's events (`thread/resume`, which also loads a not-loaded
-    /// thread). For about a second after `new` the thread's history is not readable yet
-    /// and the daemon cannot resume it; that is retried once a second, at most
-    /// `RESUME_RETRIES` times, within the caller's deadline. A thread another app-server
-    /// process holds is `E_FOREIGN_LIVE` (`resume_error`).
-    async fn subscribe(&self, conn: &Conn, thread_id: &str) -> Result<ThreadResumeResponse> {
+    /// thread) and return its newest turn, without items. For about a second after `new`
+    /// the thread's history is not readable yet and the daemon cannot resume it; that is
+    /// retried once a second, at most `RESUME_RETRIES` times, within the caller's deadline.
+    /// A thread another app-server process holds is `E_FOREIGN_LIVE` (`resume_error`).
+    async fn subscribe(&self, conn: &Conn, thread_id: &str) -> Result<Option<protocol::Turn>> {
         let mut params = resume_latest_turn(thread_id);
         let settings = self.store.settings(&handle(thread_id))?;
         if settings.is_some_and(|s| s.full_access) {
@@ -146,15 +138,86 @@ impl<'a> Codex<'a> {
             // policy survives (observed on codex 0.160.1, DESIGN.md §6.1).
             params["sandbox"] = json!("danger-full-access");
         }
-        for _ in 0..RESUME_RETRIES {
-            match conn.call("thread/resume", params.clone()).await {
-                Err(e) if history_not_ready(&e) => tokio::time::sleep(Duration::from_secs(1)).await,
-                r => return r.map_err(resume_error),
+        let mut retries = 0;
+        let resumed: protocol::ThreadResumeResponse = loop {
+            match conn.call("thread/resume", &params).await {
+                Err(e) if history_not_ready(&e) && retries < RESUME_RETRIES => {
+                    retries += 1;
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+                r => break r.map_err(resume_error)?,
             }
-        }
-        conn.call("thread/resume", params)
+        };
+        Ok(resumed
+            .initial_turns_page
+            .and_then(|p| p.data.into_iter().next()))
+    }
+
+    /// `turn/start`, accepted with the turn it started.
+    async fn start_turn(&self, conn: &Conn, receipt_id: &str, params: Value) -> Result<Target> {
+        let started: TurnResponse = conn
+            .call("turn/start", params)
             .await
-            .map_err(resume_error)
+            .map_err(|e| reject(self.store, receipt_id, e))?;
+        self.store
+            .accept(receipt_id, None, Some(&started.turn.id), None)?;
+        Ok(Target::Turn(started.turn.id))
+    }
+
+    /// `turn/steer` into `expected_turn`, accepted with that turn.
+    async fn steer(
+        &self,
+        conn: &Conn,
+        thread_id: &str,
+        intent: &NewIntent<'_>,
+        expected_turn: &str,
+    ) -> Result<Target> {
+        let params = json!({
+            "threadId": thread_id,
+            "expectedTurnId": expected_turn,
+            "input": text_input(intent.message.delivered),
+            "clientUserMessageId": intent.client_msg_id,
+        });
+        let steered: TurnSteerResponse = conn
+            .call("turn/steer", params)
+            .await
+            .map_err(|e| reject(self.store, intent.receipt_id, e))?;
+        self.store
+            .accept(intent.receipt_id, None, Some(&steered.turn_id), None)?;
+        Ok(Target::Turn(steered.turn_id))
+    }
+
+    /// `thread/queue/add`, accepted with the queue id. On an `idle` thread this also runs
+    /// `start_if_dormant`, without --wait too, so a plain send to an interrupted thread
+    /// runs: the command stays connected up to `DORMANT_WINDOW` longer for it.
+    async fn queue(
+        &self,
+        conn: &mut Conn,
+        w: &mut Watch<'_>,
+        intent: &NewIntent<'_>,
+        idle: bool,
+    ) -> Result<Target> {
+        let params = json!({
+            "threadId": w.thread_id,
+            "clientUserMessageId": intent.client_msg_id,
+            "input": text_input(intent.message.delivered),
+        });
+        let added: ThreadQueueAddResponse = conn
+            .call("thread/queue/add", params)
+            .await
+            .map_err(|e| reject(self.store, intent.receipt_id, e))?;
+        let queue_id = added.queued_submission.id;
+        self.store
+            .accept(intent.receipt_id, Some(&queue_id), None, None)?;
+        if idle {
+            self.start_if_dormant(conn, w, &queue_id, intent.receipt_id)
+                .await?;
+        }
+        Ok(Target::Client {
+            client_id: intent.client_msg_id.into(),
+            receipt_id: intent.receipt_id.into(),
+            queued: true,
+        })
     }
 
     /// Start a submission `thread/queue/add` left dormant. On an idle thread the daemon
@@ -191,21 +254,13 @@ impl<'a> Codex<'a> {
         }
         let params = json!({"threadId": w.thread_id, "queuedSubmissionId": queue_id});
         match conn
-            .call::<ThreadQueueStartResponse>("thread/queue/start", params)
+            .call::<TurnResponse>("thread/queue/start", params)
             .await
         {
             Ok(started) => self
                 .store
                 .accept(receipt_id, None, Some(&started.turn.id), None),
-            Err(e)
-                if e.agent_error.as_ref().is_some_and(|v| {
-                    v.code == -32600
-                        && (v.message.starts_with("queued submission not found: ")
-                            || v.message == "thread already has an active or pending turn")
-                }) =>
-            {
-                Ok(())
-            }
+            Err(e) if nothing_dormant(&e) => Ok(()),
             Err(e) => Err(e),
         }
     }
@@ -260,7 +315,7 @@ impl<'a> Codex<'a> {
                 tracing::warn!("{e}");
             }
         }
-        let _ = tokio::time::timeout(Duration::from_secs(2), conn.close()).await;
+        conn.close().await;
         settle(
             self.store,
             handle(w.thread_id),
@@ -274,24 +329,23 @@ impl<'a> Codex<'a> {
     /// Search persisted history (ascending, full items) for the target. A client
     /// id found in history is resolved to its turn.
     async fn lookup(&self, conn: &Conn, thread_id: &str, target: &mut Target) -> Result<Lookup> {
-        let mut cursor: Option<String> = None;
-        loop {
-            let mut params = json!({
+        let mut pages = conn.pages(
+            "thread/turns/list",
+            json!({
                 "threadId": thread_id,
                 "limit": 50,
                 "sortDirection": "asc",
                 "itemsView": "full",
-            });
-            if let Some(c) = &cursor {
-                params["cursor"] = json!(c);
-            }
-            let page: TurnsPage = match conn.call("thread/turns/list", params).await {
-                Ok(p) => p,
+            }),
+        );
+        loop {
+            let turns = match pages.next::<protocol::Turn>().await {
+                Ok(Some(turns)) => turns,
+                Ok(None) => return Ok(Lookup::Absent),
                 Err(e) if history_not_ready(&e) => return Ok(Lookup::Absent),
                 Err(e) => return Err(e),
             };
-            for raw in page.data {
-                let turn: protocol::Turn = decode("turn", &raw)?;
+            for turn in turns {
                 let found = match &*target {
                     Target::Turn(id) => *id == turn.id,
                     Target::Client {
@@ -299,66 +353,26 @@ impl<'a> Codex<'a> {
                         receipt_id,
                         ..
                     } => {
-                        let item = turn.items.iter().find_map(|i| match Item::parse(i) {
+                        let item = turn.items.iter().find_map(|i| match i {
                             Item::User(u) if u.client_id.as_deref() == Some(client_id) => {
-                                Some(u.id)
+                                Some(&u.id)
                             }
                             _ => None,
                         });
-                        match item {
-                            Some(item_id) => {
-                                self.store.accept(
-                                    receipt_id,
-                                    None,
-                                    Some(&turn.id),
-                                    Some(&item_id),
-                                )?;
-                                true
-                            }
-                            None => false,
+                        if let Some(item_id) = item {
+                            self.store
+                                .accept(receipt_id, None, Some(&turn.id), Some(item_id))?;
                         }
+                        item.is_some()
                     }
                 };
                 if found {
                     *target = Target::Turn(turn.id.clone());
-                    return Ok(if turn.status == "inProgress" {
-                        Lookup::Running
-                    } else {
-                        Lookup::Done(to_turn(thread_id, turn))
+                    return Ok(match turn.status {
+                        protocol::TurnStatus::InProgress => Lookup::Running,
+                        _ => Lookup::Done(to_turn(thread_id, turn)),
                     });
                 }
-            }
-            match page.next_cursor {
-                Some(c) => cursor = Some(c),
-                None => return Ok(Lookup::Absent),
-            }
-        }
-    }
-
-    /// The queue id of a client message still waiting in the thread's queue.
-    async fn queued(
-        &self,
-        conn: &Conn,
-        thread_id: &str,
-        client_id: &str,
-    ) -> Result<Option<String>> {
-        let mut cursor: Option<String> = None;
-        loop {
-            let mut params = json!({"threadId": thread_id});
-            if let Some(c) = &cursor {
-                params["cursor"] = json!(c);
-            }
-            let page: ThreadQueueListResponse = conn.call("thread/queue/list", params).await?;
-            if let Some(e) = page
-                .data
-                .into_iter()
-                .find(|e| e.client_user_message_id.as_deref() == Some(client_id))
-            {
-                return Ok(Some(e.id));
-            }
-            match page.next_cursor {
-                Some(c) => cursor = Some(c),
-                None => return Ok(None),
             }
         }
     }
@@ -410,7 +424,7 @@ impl<'a> Codex<'a> {
                     },
                 ) => {
                     let n: ItemNotification = decode(&method, &params)?;
-                    if let Item::User(u) = Item::parse(&n.item)
+                    if let Item::User(u) = n.item
                         && u.client_id.as_deref() == Some(client_id)
                     {
                         self.store
@@ -418,12 +432,12 @@ impl<'a> Codex<'a> {
                         *target = Target::Turn(n.turn_id);
                     }
                 }
-                ("turn/completed", Target::Turn(turn_id)) => {
+                // Other turns' completions are skipped undecoded.
+                ("turn/completed", Target::Turn(turn_id))
+                    if params["turn"]["id"] == turn_id.as_str() =>
+                {
                     let n: TurnCompletedNotification = decode(&method, &params)?;
-                    if n.turn["id"] == turn_id.as_str() {
-                        let turn = decode("turn", &n.turn)?;
-                        return Ok(to_turn(&n.thread_id, turn));
-                    }
+                    return Ok(to_turn(&n.thread_id, n.turn));
                 }
                 _ => {}
             }
@@ -431,23 +445,16 @@ impl<'a> Codex<'a> {
     }
 
     /// Normalized messages of Codex turns (full items), each with the index of its turn.
-    fn messages<'t>(
-        &self,
-        turns: impl Iterator<Item = &'t Value>,
-    ) -> Result<Vec<(usize, Message)>> {
-        let at = |turn: &Value, key: &str| {
-            turn[key]
-                .as_i64()
-                .and_then(|s| jiff::Timestamp::from_second(s).ok())
-                .map(|t| t.to_string())
-        };
+    fn messages(&self, turns: &[Value]) -> Result<Vec<(usize, Message)>> {
         let mut messages = Vec::new();
-        for (i, turn) in turns.enumerate() {
-            let turn_id = turn["id"].as_str().unwrap_or_default();
-            for item in turn["items"].as_array().into_iter().flatten() {
-                let message = match Item::parse(item) {
+        for (i, turn) in turns.iter().enumerate() {
+            let turn: protocol::Turn = decode("turn", turn)?;
+            let started = timestamp(turn.started_at);
+            let completed = timestamp(turn.completed_at).or_else(|| started.clone());
+            for item in turn.items {
+                let message = match item {
                     Item::User(u) => Message {
-                        turn_id: turn_id.into(),
+                        turn_id: turn.id.clone(),
                         role: Role::User,
                         phase: Phase::Prompt,
                         text: u.text(),
@@ -455,21 +462,21 @@ impl<'a> Codex<'a> {
                             Some(c) => self.store.sender_of(c)?,
                             None => None,
                         },
-                        timestamp: at(turn, "startedAt"),
+                        timestamp: started.clone(),
                         item_id: u.id,
                     },
                     Item::Agent(a) => Message {
-                        turn_id: turn_id.into(),
+                        turn_id: turn.id.clone(),
                         item_id: a.id,
                         role: Role::Assistant,
-                        phase: match a.phase.as_deref() {
-                            Some("final_answer") => Phase::Final,
-                            Some("commentary") => Phase::Commentary,
+                        phase: match a.phase {
+                            Some(AgentPhase::FinalAnswer) => Phase::Final,
+                            Some(AgentPhase::Commentary) => Phase::Commentary,
                             _ => Phase::Other,
                         },
                         text: a.text,
                         from: None,
-                        timestamp: at(turn, "completedAt").or_else(|| at(turn, "startedAt")),
+                        timestamp: completed.clone(),
                     },
                     Item::Other => continue,
                 };
@@ -491,43 +498,56 @@ impl<'a> Codex<'a> {
     }
 }
 
-/// Build the normalized turn from a decoded Codex turn (summary or full items).
+/// The queue id of a client message still waiting in the thread's queue.
+async fn queued(conn: &Conn, thread_id: &str, client_id: &str) -> Result<Option<String>> {
+    let mut pages = conn.pages("thread/queue/list", json!({"threadId": thread_id}));
+    while let Some(entries) = pages.next::<QueuedEntry>().await? {
+        if let Some(e) = entries
+            .into_iter()
+            .find(|e| e.client_user_message_id.as_deref() == Some(client_id))
+        {
+            return Ok(Some(e.id));
+        }
+    }
+    Ok(None)
+}
+
+/// Unix seconds as an RFC 3339 timestamp.
+fn timestamp(secs: Option<i64>) -> Option<String> {
+    secs.and_then(|s| jiff::Timestamp::from_second(s).ok())
+        .map(|t| t.to_string())
+}
+
+/// Build the normalized turn from a decoded Codex turn (summary or full items). The
+/// final text is the last `final_answer` agent message, else the last agent message.
 fn to_turn(thread_id: &str, t: protocol::Turn) -> model::Turn {
-    let agents: Vec<AgentMessage> = t
+    let replies: Vec<AgentMessage> = t
         .items
-        .iter()
-        .filter_map(|i| match Item::parse(i) {
+        .into_iter()
+        .filter_map(|i| match i {
             Item::Agent(a) => Some(a),
             _ => None,
         })
         .collect();
-    let final_text = agents
+    let final_text = replies
         .iter()
         .rev()
-        .find(|a| a.phase.as_deref() == Some("final_answer"))
-        .or(agents.last())
+        .find(|a| a.phase == Some(AgentPhase::FinalAnswer))
+        .or(replies.last())
         .map(|a| a.text.clone());
     model::Turn {
         handle: handle(thread_id),
         turn_id: t.id,
-        status: match t.status.as_str() {
-            "completed" => TurnStatus::Completed,
-            "failed" => TurnStatus::Failed,
-            "interrupted" => TurnStatus::Interrupted,
-            _ => TurnStatus::Unknown,
+        status: match t.status {
+            protocol::TurnStatus::Completed => TurnStatus::Completed,
+            protocol::TurnStatus::Failed => TurnStatus::Failed,
+            protocol::TurnStatus::Interrupted => TurnStatus::Interrupted,
+            protocol::TurnStatus::InProgress | protocol::TurnStatus::Unknown => TurnStatus::Unknown,
         },
-        error: t.error.filter(|e| !e.is_null()),
+        error: t.error,
         final_text,
         duration_ms: t.duration_ms,
         basis: None,
-    }
-}
-
-async fn run(program: &str, args: &[&str]) -> std::result::Result<String, String> {
-    match Command::new(program).args(args).output().await {
-        Ok(out) if out.status.success() => Ok(String::from_utf8_lossy(&out.stdout).trim().into()),
-        Ok(out) => Err(String::from_utf8_lossy(&out.stderr).trim().into()),
-        Err(e) => Err(e.to_string()),
     }
 }
 
@@ -544,27 +564,18 @@ impl Agent for Codex<'_> {
     async fn models(&self) -> Result<Vec<Model>> {
         let conn = self.connect().await?;
         let mut models = Vec::new();
-        let mut cursor = Value::Null;
-        loop {
-            let page = conn
-                .request("model/list", json!({"cursor": cursor, "limit": 100}))
-                .await?;
-            for m in page["data"].as_array().into_iter().flatten() {
-                models.push(Model {
-                    id: m["model"].as_str().unwrap_or_default().into(),
-                    efforts: m["supportedReasoningEfforts"]
-                        .as_array()
+        let mut pages = conn.pages("model/list", json!({"cursor": null, "limit": 100}));
+        while let Some(page) = pages.next::<ModelInfo>().await? {
+            models.extend(page.into_iter().map(|m| {
+                Model {
+                    id: m.model,
+                    efforts: m
+                        .supported_reasoning_efforts
                         .into_iter()
-                        .flatten()
-                        .filter_map(|e| e["reasoningEffort"].as_str())
-                        .map(String::from)
+                        .map(|e| e.reasoning_effort)
                         .collect(),
-                });
-            }
-            match page["nextCursor"].as_str() {
-                Some(c) => cursor = json!(c),
-                None => break,
-            }
+                }
+            }));
         }
         conn.close().await;
         Ok(models)
@@ -595,10 +606,13 @@ impl Agent for Codex<'_> {
                     .await;
                 conn.close().await;
                 // The daemon can be older than the CLI until it is restarted.
-                let server = run("codex", &["app-server", "daemon", "version"])
+                let server = agent_cmd("codex")
+                    .args(["app-server", "daemon", "version"])
+                    .output()
                     .await
                     .ok()
-                    .and_then(|out| serde_json::from_str::<Value>(&out).ok())
+                    .filter(|out| out.status.success())
+                    .and_then(|out| serde_json::from_slice::<Value>(&out.stdout).ok())
                     .and_then(|v| v["appServerVersion"].as_str().map(String::from));
                 let shared = match server {
                     Some(v) => format!("daemon running (app-server {v})"),
@@ -648,20 +662,11 @@ impl Agent for Codex<'_> {
         if let Some(cwd) = filter.cwd {
             params["cwd"] = json!(cwd);
         }
-        let threads: ThreadListResponse = conn.call("thread/list", params).await?;
+        let threads: CursorPage<Thread> = conn.call("thread/list", params).await?;
         let mut loaded = HashSet::new();
-        let mut loaded_cursor: Option<String> = None;
-        loop {
-            let mut params = json!({"limit": 200});
-            if let Some(c) = &loaded_cursor {
-                params["cursor"] = json!(c);
-            }
-            let page: ThreadLoadedListResponse = conn.call("thread/loaded/list", params).await?;
-            loaded.extend(page.data);
-            match page.next_cursor {
-                Some(c) => loaded_cursor = Some(c),
-                None => break,
-            }
+        let mut pages = conn.pages("thread/loaded/list", json!({"limit": 200}));
+        while let Some(ids) = pages.next::<String>().await? {
+            loaded.extend(ids);
         }
         conn.close().await;
         let mut items = Vec::new();
@@ -747,23 +752,15 @@ impl Agent for Codex<'_> {
                 client_msg_id: &client_msg_id,
                 message: &req.message,
             })?;
-            let started: TurnStartResponse = conn
-                .call(
-                    "turn/start",
-                    json!({
-                        "threadId": thread_id,
-                        "input": text_input(req.message.delivered),
-                        "clientUserMessageId": client_msg_id,
-                        // thread/start takes no effort; this one applies to the thread's
-                        // later turns too.
-                        "effort": req.settings.effort,
-                    }),
-                )
-                .await
-                .map_err(|e| reject(self.store, &receipt_id, e))?;
-            self.store
-                .accept(&receipt_id, None, Some(&started.turn.id), None)?;
-            let target = target.insert(Target::Turn(started.turn.id));
+            let params = json!({
+                "threadId": thread_id,
+                "input": text_input(req.message.delivered),
+                "clientUserMessageId": client_msg_id,
+                // thread/start takes no effort; this one applies to the thread's later
+                // turns too.
+                "effort": req.settings.effort,
+            });
+            let target = target.insert(self.start_turn(&conn, &receipt_id, params).await?);
             if deadline.is_none() {
                 return Ok(None);
             }
@@ -787,6 +784,12 @@ impl Agent for Codex<'_> {
         let handle = handle(thread_id);
         let receipt_id = uuid::Uuid::new_v4().to_string();
         let client_msg_id = uuid::Uuid::new_v4().to_string();
+        let intent = NewIntent {
+            receipt_id: &receipt_id,
+            handle: &handle,
+            client_msg_id: &client_msg_id,
+            message: &req.message,
+        };
         let mut w = Watch::new(thread_id, approval_policy(self.store, &handle)?);
         let mut conn = self.connect().await?;
         // Set once the agent accepted the submission.
@@ -798,14 +801,11 @@ impl Agent for Codex<'_> {
             // - with --wait, no event of the resulting turn may be missed;
             // - the response carries the newest turn: whether the thread is idle (queue
             //   then checks for a dormant submission) and which turn steer targets.
-            let resumed = self.subscribe(&conn, thread_id).await?;
-            let newest: Option<protocol::Turn> = resumed
-                .initial_turns_page
-                .and_then(|p| p.data.into_iter().next())
-                .map(|t| decode("turn", &t))
-                .transpose()?;
-            let idle = newest.as_ref().is_none_or(|t| t.status != "inProgress");
-            let expected_turn = match (req.steer, newest) {
+            let newest = self.subscribe(&conn, thread_id).await?;
+            let idle = newest
+                .as_ref()
+                .is_none_or(|t| t.status != protocol::TurnStatus::InProgress);
+            let steer_into = match (req.steer, newest) {
                 (false, _) => None,
                 (true, Some(t)) => Some(t.id),
                 (true, None) => {
@@ -825,13 +825,9 @@ impl Agent for Codex<'_> {
                      or full access; send the change when the thread is idle",
                 ));
             }
-            self.store.insert_intent(&NewIntent {
-                receipt_id: &receipt_id,
-                handle: &handle,
-                client_msg_id: &client_msg_id,
-                message: &req.message,
-            })?;
-            let target = target.insert(match expected_turn {
+            self.store.insert_intent(&intent)?;
+            let submitted = match steer_into {
+                Some(turn) => self.steer(&conn, thread_id, &intent, &turn).await?,
                 None if change => {
                     // The thread keeps these for its later turns; the sandbox only until
                     // it unloads, so subscribe passes it again (DESIGN.md §6.1).
@@ -849,59 +845,11 @@ impl Agent for Codex<'_> {
                     if req.change.full_access {
                         params["sandboxPolicy"] = json!({"type": "dangerFullAccess"});
                     }
-                    let started: TurnStartResponse = conn
-                        .call("turn/start", params)
-                        .await
-                        .map_err(|e| reject(self.store, &receipt_id, e))?;
-                    self.store
-                        .accept(&receipt_id, None, Some(&started.turn.id), None)?;
-                    Target::Turn(started.turn.id)
+                    self.start_turn(&conn, &receipt_id, params).await?
                 }
-                None => {
-                    let added: ThreadQueueAddResponse = conn
-                        .call(
-                            "thread/queue/add",
-                            json!({
-                                "threadId": thread_id,
-                                "clientUserMessageId": client_msg_id,
-                                "input": text_input(req.message.delivered),
-                            }),
-                        )
-                        .await
-                        .map_err(|e| reject(self.store, &receipt_id, e))?;
-                    let queue_id = added.queued_submission.id;
-                    self.store
-                        .accept(&receipt_id, Some(&queue_id), None, None)?;
-                    // Also without --wait, so a plain send to an interrupted thread runs:
-                    // the command stays connected up to DORMANT_WINDOW longer for it.
-                    if idle {
-                        self.start_if_dormant(&mut conn, &mut w, &queue_id, &receipt_id)
-                            .await?;
-                    }
-                    Target::Client {
-                        client_id: client_msg_id.clone(),
-                        receipt_id: receipt_id.clone(),
-                        queued: true,
-                    }
-                }
-                Some(expected) => {
-                    let steered: TurnSteerResponse = conn
-                        .call(
-                            "turn/steer",
-                            json!({
-                                "threadId": thread_id,
-                                "expectedTurnId": expected,
-                                "input": text_input(req.message.delivered),
-                                "clientUserMessageId": client_msg_id,
-                            }),
-                        )
-                        .await
-                        .map_err(|e| reject(self.store, &receipt_id, e))?;
-                    self.store
-                        .accept(&receipt_id, None, Some(&steered.turn_id), None)?;
-                    Target::Turn(steered.turn_id)
-                }
-            });
+                None => self.queue(&mut conn, &mut w, &intent, idle).await?,
+            };
+            let target = target.insert(submitted);
             if deadline.is_none() {
                 return Ok(None);
             }
@@ -927,10 +875,10 @@ impl Agent for Codex<'_> {
             if let Some(c) = cursor {
                 params["cursor"] = json!(c);
             }
-            let page = conn.call::<TurnsPage>("thread/turns/list", params).await?;
+            let page: CursorPage<Value> = conn.call("thread/turns/list", params).await?;
             Ok((page.data, page.next_cursor))
         };
-        let normalize = |turns: &[Value]| self.messages(turns.iter());
+        let normalize = |turns: &[Value]| self.messages(turns);
         let history = RemoteHistory::fetch(q, fetch, normalize).await?;
         conn.close().await;
         let messages = normalize(history.records())?;
@@ -968,24 +916,20 @@ impl Agent for Codex<'_> {
         let mut conn = self.connect().await?;
         let work = async {
             // History first: the turn may already be complete.
-            let found = self.lookup(&conn, thread_id, &mut target).await?;
-            if let Lookup::Done(t) = found {
+            if let Lookup::Done(t) = self.lookup(&conn, thread_id, &mut target).await? {
                 return Ok(Some(t));
             }
-            // Not in history: the submission may still sit in the queue, which proves the
+            // A client message not in history may still sit in the queue, which proves the
             // daemon took it. Never resubmit.
-            if let (
-                Lookup::Absent,
-                Target::Client {
-                    client_id,
-                    receipt_id,
-                    queued,
-                },
-            ) = (&found, &mut target)
-                && let Some(queue_id) = self.queued(&conn, thread_id, client_id).await?
+            if let Target::Client {
+                client_id,
+                receipt_id,
+                queued: in_queue,
+            } = &mut target
+                && let Some(queue_id) = queued(&conn, thread_id, client_id).await?
             {
                 self.store.accept(receipt_id, Some(&queue_id), None, None)?;
-                *queued = true;
+                *in_queue = true;
             }
             // Subscribe. This loads a not-loaded thread, whose queue the daemon then
             // drains unless its last turn was interrupted, and replays pending approvals;

@@ -44,28 +44,27 @@ pub const ALL_SOURCE_KINDS: &[&str] = &[
 
 // ---- responses ----
 
+/// One page of a cursor-paged list method (`thread/list`, `thread/loaded/list`,
+/// `thread/turns/list`, `thread/queue/list`, `model/list`); also the resume
+/// `initialTurnsPage`.
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
-pub struct InitializeResponse {
-    #[serde(default)]
-    pub user_agent: Option<String>,
+pub struct CursorPage<T> {
+    pub data: Vec<T>,
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct Thread {
     pub id: String,
-    #[serde(default)]
     pub cwd: Option<String>,
     #[serde(default)]
     pub source: Value,
-    #[serde(default)]
     pub originator: Option<String>,
     #[serde(default)]
     pub status: ThreadStatus,
-    #[serde(default)]
     pub name: Option<String>,
-    #[serde(default)]
     pub preview: Option<String>,
 }
 
@@ -89,16 +88,16 @@ pub struct ThreadStartResponse {
     pub thread: Thread,
 }
 
+/// `turn/start` and `thread/queue/start`.
 #[derive(Deserialize, Debug)]
-pub struct TurnStartResponse {
+pub struct TurnResponse {
     pub turn: Turn,
 }
 
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadResumeResponse {
-    #[serde(default)]
-    pub initial_turns_page: Option<TurnsPage>,
+    pub initial_turns_page: Option<CursorPage<Turn>>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -110,43 +109,15 @@ pub struct TurnSteerResponse {
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadQueueAddResponse {
-    pub queued_submission: QueuedSubmission,
+    pub queued_submission: QueuedEntry,
 }
 
+/// An entry of `thread/queue/list`; also the submission `thread/queue/add` returns.
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
-pub struct QueuedSubmission {
+pub struct QueuedEntry {
     pub id: String,
-}
-
-#[derive(Deserialize, Debug)]
-pub struct ThreadQueueStartResponse {
-    pub turn: Turn,
-}
-
-#[derive(Deserialize, Debug)]
-#[serde(rename_all = "camelCase")]
-pub struct ThreadListResponse {
-    pub data: Vec<Thread>,
-    #[serde(default)]
-    pub next_cursor: Option<String>,
-}
-
-#[derive(Deserialize, Debug)]
-#[serde(rename_all = "camelCase")]
-pub struct ThreadLoadedListResponse {
-    pub data: Vec<String>,
-    #[serde(default)]
-    pub next_cursor: Option<String>,
-}
-
-/// `thread/turns/list` result; also the resume `initialTurnsPage`.
-#[derive(Deserialize, Debug)]
-#[serde(rename_all = "camelCase")]
-pub struct TurnsPage {
-    pub data: Vec<Value>,
-    #[serde(default)]
-    pub next_cursor: Option<String>,
+    pub client_user_message_id: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -154,37 +125,51 @@ pub struct TurnsPage {
 pub struct Turn {
     pub id: String,
     #[serde(default)]
-    pub items: Vec<Value>,
-    pub status: String,
-    #[serde(default)]
+    pub items: Vec<Item>,
+    pub status: TurnStatus,
     pub error: Option<Value>,
-    #[serde(default)]
     pub duration_ms: Option<i64>,
+    /// Unix seconds.
+    pub started_at: Option<i64>,
+    /// Unix seconds.
+    pub completed_at: Option<i64>,
+}
+
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum TurnStatus {
+    Completed,
+    Failed,
+    Interrupted,
+    InProgress,
+    #[serde(other)]
+    Unknown,
+}
+
+/// A `model/list` entry.
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelInfo {
+    pub model: String,
+    #[serde(default)]
+    pub supported_reasoning_efforts: Vec<EffortOption>,
 }
 
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
-pub struct ThreadQueueListResponse {
-    pub data: Vec<QueuedEntry>,
-    #[serde(default)]
-    pub next_cursor: Option<String>,
-}
-
-#[derive(Deserialize, Debug)]
-#[serde(rename_all = "camelCase")]
-pub struct QueuedEntry {
-    pub id: String,
-    #[serde(default)]
-    pub client_user_message_id: Option<String>,
+pub struct EffortOption {
+    pub reasoning_effort: String,
 }
 
 // ---- notifications ----
 
+/// `turn/completed`, decoded only for the turn being observed: another turn's completion
+/// is skipped by its raw id before decoding.
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct TurnCompletedNotification {
     pub thread_id: String,
-    pub turn: Value,
+    pub turn: Turn,
 }
 
 /// `item/started` and `item/completed`.
@@ -192,16 +177,35 @@ pub struct TurnCompletedNotification {
 #[serde(rename_all = "camelCase")]
 pub struct ItemNotification {
     pub turn_id: String,
-    pub item: Value,
+    pub item: Item,
 }
 
 // ---- items ----
+
+/// A turn item. Only user and agent messages are read; any other kind, and a user or
+/// agent message that does not decode, is `Other`, never displayed or matched.
+#[derive(Deserialize, Debug)]
+#[serde(from = "Value")]
+pub enum Item {
+    User(UserMessage),
+    Agent(AgentMessage),
+    Other,
+}
+
+impl From<Value> for Item {
+    fn from(v: Value) -> Item {
+        match v["type"].as_str() {
+            Some("userMessage") => UserMessage::deserialize(&v).map_or(Item::Other, Item::User),
+            Some("agentMessage") => AgentMessage::deserialize(&v).map_or(Item::Other, Item::Agent),
+            _ => Item::Other,
+        }
+    }
+}
 
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct UserMessage {
     pub id: String,
-    #[serde(default)]
     pub client_id: Option<String>,
     #[serde(default)]
     pub content: Vec<Value>,
@@ -224,25 +228,16 @@ pub struct AgentMessage {
     pub id: String,
     #[serde(default)]
     pub text: String,
-    #[serde(default)]
-    pub phase: Option<String>,
+    pub phase: Option<AgentPhase>,
 }
 
-#[derive(Debug)]
-pub enum Item {
-    User(UserMessage),
-    Agent(AgentMessage),
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentPhase {
+    FinalAnswer,
+    Commentary,
+    #[serde(other)]
     Other,
-}
-
-impl Item {
-    pub fn parse(v: &Value) -> Item {
-        match v["type"].as_str() {
-            Some("userMessage") => UserMessage::deserialize(v).map_or(Item::Other, Item::User),
-            Some("agentMessage") => AgentMessage::deserialize(v).map_or(Item::Other, Item::Agent),
-            _ => Item::Other,
-        }
-    }
 }
 
 // ---- wire envelope ----
@@ -250,17 +245,15 @@ impl Item {
 /// One incoming JSON-RPC message. Server requests carry both `id` and `method`.
 #[derive(Deserialize, Debug)]
 pub struct Incoming {
-    #[serde(default)]
     pub id: Option<Value>,
-    #[serde(default)]
     pub method: Option<String>,
     #[serde(default)]
     pub params: Value,
-    #[serde(default)]
     pub result: Option<Value>,
-    #[serde(default)]
     pub error: Option<AgentError>,
 }
+
+// ---- errors ----
 
 /// Classify a Codex error. `-32600` is reused for several unrelated conditions
 /// (not initialized, missing capability, stale or idle steer), so the message decides.
@@ -274,6 +267,29 @@ pub fn classify_error(e: &AgentError) -> ErrorCode {
     } else {
         ErrorCode::Precondition
     }
+}
+
+/// History of a thread created moments ago is not readable yet. Two transient shapes:
+/// `-32603 "… rollout at <path> is empty"` (`thread/resume`, `thread/turns/list`) while
+/// the rollout file has no line, and `-32601 "list_turns is not supported yet"` from
+/// `thread/turns/list` while the thread has no row in the daemon's state DB (its
+/// paginated reads check that row first). Other -32603s are thread-store failures and
+/// other -32601s are really unsupported methods.
+pub fn history_not_ready(e: &Error) -> bool {
+    e.agent_error.as_ref().is_some_and(|v| {
+        (v.code == -32603 && v.message.ends_with(" is empty"))
+            || (v.code == -32601 && v.message == "list_turns is not supported yet")
+    })
+}
+
+/// `thread/queue/start` found nothing dormant to start: the submission already started
+/// (`queued submission not found: <id>`) or waits behind an active turn (DESIGN.md §6.1).
+pub fn nothing_dormant(e: &Error) -> bool {
+    e.agent_error.as_ref().is_some_and(|v| {
+        v.code == -32600
+            && (v.message.starts_with("queued submission not found: ")
+                || v.message == "thread already has an active or pending turn")
+    })
 }
 
 /// `thread/resume` refused because another app-server process holds the thread's
@@ -380,14 +396,16 @@ mod tests {
         assert_eq!(m.method.as_deref(), Some("turn/completed"));
         let n = TurnCompletedNotification::deserialize(&m.params).unwrap();
         assert_eq!(n.thread_id, "01a101c5-fcb5-77c1-804d-5c1bd9358f1f");
-        let turn = Turn::deserialize(&n.turn).unwrap();
+        let turn = n.turn;
         assert_eq!(turn.id, "01a101c6-07f8-7063-a319-3aa3e4bb0727");
-        assert_eq!(turn.status, "completed");
+        assert_eq!(turn.status, TurnStatus::Completed);
+        assert!(turn.error.is_none());
         assert_eq!(turn.duration_ms, Some(6982));
-        match Item::parse(&turn.items[0]) {
+        assert_eq!(turn.completed_at, Some(1791031124));
+        match &turn.items[0] {
             Item::Agent(a) => {
                 assert_eq!(a.text, "pong");
-                assert_eq!(a.phase.as_deref(), Some("final_answer"));
+                assert_eq!(a.phase, Some(AgentPhase::FinalAnswer));
             }
             other => panic!("unexpected item {other:?}"),
         }
@@ -398,7 +416,7 @@ mod tests {
         let m = incoming(ITEM_COMPLETED_QUEUED);
         let n = ItemNotification::deserialize(&m.params).unwrap();
         assert_eq!(n.turn_id, "01a101d3-6fba-75f2-8968-568ad3ee019e");
-        match Item::parse(&n.item) {
+        match n.item {
             Item::User(u) => {
                 assert_eq!(
                     u.client_id.as_deref(),
