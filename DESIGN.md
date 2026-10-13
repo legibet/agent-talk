@@ -48,11 +48,10 @@ State lives where the agent already keeps it:
 | Claude, Grok, Antigravity TUI (foreign)              | the user's terminal process         | read-only                                                 |
 | pi TUI (foreign)                                     | the user's terminal process         | undetectable; a send branches the session (§6.6)          |
 
-"Owned" means agent-talk started the session; it records creation, not current exclusivity.
-Each CLI command holds its connection, subscription and correlation state only while it runs.
-`agent-talk mcp` is the one long-lived process, one per agent session, started and stopped by the
-agent like any MCP server; state that must outlive a command would belong there, not in a system
-daemon (§7).
+"Owned" means agent-talk started the session; it records creation, not current exclusivity. Each CLI
+command holds its connection, subscription and correlation state only while it runs. `agent-talk
+mcp` is the one long-lived process, started and stopped by the agent like any MCP server; state that
+must outlive a command would belong there, not in a system daemon (§7).
 
 ### Local state (`~/.agent-talk/`)
 
@@ -99,14 +98,14 @@ ran. Adapters supply discovery, submission, the event source, history lookup and
 normalization, and each keeps its own observe loop, because what proves a turn ended differs
 between agents (§7).
 
-Agent records and events are decoded into small structs where that reads better than indexing
-JSON. The decoding is tolerant, so that one field an agent writes differently does not lose a
-record, a listing or the end of a turn: optional fields default, unknown variants are tolerated,
-and a field that does not fit reads as its default (an odd list entry is skipped) instead of
-dropping the record around it (`agents/decode.rs`). The raw record is kept for `read --raw` and
-error data, and content a struct does not recognize never counts as the end of a turn. Decoding
-is strict only where a failure must be an error, such as the ids that correlate a response or a
-record with agent-talk's own request. Payloads agent-talk only passes through stay
+Agent records and events are decoded into small structs where that reads better than indexing JSON.
+Fields read for their content are decoded tolerantly, so that a field an agent writes differently
+does not lose a record, a listing or the end of a turn: optional fields default, unknown variants
+are tolerated, and a field that does not fit reads as its default (an odd list entry is skipped)
+where dropping the record would cost more (`agents/decode.rs`). The raw record is kept for `read
+--raw` and error data, and content a struct does not recognize never counts as the end of a turn.
+Decoding is strict only where a failure must be an error, such as the ids that correlate a response
+or a record with agent-talk's own request. Payloads agent-talk only passes through stay
 `serde_json::Value`.
 
 ## 4. Model
@@ -257,10 +256,10 @@ agent-talk mcp [--caller H]
 - `send` without `--wait` promises only that the agent accepted the message. On Claude, Grok,
   Antigravity and pi the command still runs to the end of the turn, because the turn lives in the
   child (and, for Grok, because a direct-mode turn dies with it).
-- On agents with an event stream (Codex, OpenCode, Grok) `send` subscribes before it submits,
-  so no event of the turn is missed.
-- `wait` checks history first (the turn may be complete), then observes. It names one turn or
-  receipt; there is no "latest".
+- On agents with an event stream (Codex, OpenCode, Grok), a command that observes the turn
+  subscribes before it submits, so no event of the turn is missed.
+- `wait` first checks what is persisted (history, or the run log of an agent-talk child), since the
+  turn may be complete, then observes. It names one turn or receipt; there is no "latest".
 - `send` queues by default: the message runs after the current reply, as its own turn on Codex,
   Grok, Antigravity and pi, inside the same execution on OpenCode. `--steer` joins the running turn
   (Codex, OpenCode, Grok through a live leader) and is refused when the session is idle.
@@ -340,13 +339,13 @@ intent is recorded.
   file repeats and only its newest row counts. (The state-DB-only listing avoids the repeats but
   has null `originator` and stale `updatedAt` on most rows.)
 
-**Settings.** What `turn/start` sets (`model`, `effort`, `sandboxPolicy`, `approvalPolicy`)
-becomes the thread's setting for later turns (daemon 0.161.0). Effort exists only there, as a
+**Settings.** What `turn/start` sets (`model`, `effort`, `sandboxPolicy`, `approvalPolicy`) becomes
+the thread's setting for later turns (daemon 0.161.0). agent-talk sets effort there, as a
 model-specific string; an invalid value fails the turn. Model, effort and approval policy survive
-unloading; the sandbox does not (a resume after an unload restores the daemon's, codex 0.160.1),
-so every resume of a full-access thread passes it again. `thread/queue/add` ignores all four
-fields (0.161.0), so a send that changes settings goes through `turn/start` and is refused
-(`E_PRECONDITION`) while a turn is running.
+unloading; the sandbox does not (a resume after an unload restores the daemon's, codex 0.160.1), so
+every resume of a full-access thread passes it again (a loaded busy thread ignores it, 0.161.0).
+`thread/queue/add` ignores all four fields (0.161.0), so a send that changes settings goes through
+`turn/start` and is refused (`E_PRECONDITION`) while a turn is running.
 
 **Sending and turn end.**
 
@@ -383,10 +382,10 @@ the server entry sets `default_tools_approval_mode = "approve"`.
 
 ### 6.2 Claude Code (2.1.288)
 
-**Interface.** Owned sessions only: one `claude -p --verbose --input-format stream-json
---output-format stream-json` process per `new` (`--session-id <uuid>`) or `send` (`--resume
-<id>`), in the session's recorded cwd. agent-talk writes one user line with `"uuid": <client
-message id>` and closes stdin; the process runs the turn to its `result` event and exits.
+**Interface.** One `claude -p --verbose --input-format stream-json --output-format stream-json`
+process per `new` (`--session-id <uuid>`) or `send` (`--resume <id>`, also on an idle session
+agent-talk did not start), in the session's cwd. agent-talk writes one user line with `"uuid":
+<client message id>` and closes stdin; the process runs the turn to its `result` event and exits.
 
 **Sessions and turns.**
 
@@ -394,10 +393,11 @@ message id>` and closes stdin; the process runs the turn to its `result` event a
   before the run.
 - Transcripts `~/.claude/projects/<slug>/<id>.jsonl` are append-only. `--resume` from another cwd
   appends to the original file, so transcripts are located by id across all project folders.
-- Turns group by `promptId`; user lines that only carry tool results, and lines the runtime
-  injects, do not start a turn. The live branch is the `parentUuid` chain from the newest
-  `last-prompt.leafUuid` (`logicalParentUuid` crosses a compaction); other branches are left out
-  except by `read --raw`. Sub-agent transcripts are not read.
+- Turns group by `promptId`. User lines that only carry tool results, meta lines, local-command
+  bookkeeping and interrupt markers do not start a turn; input the runtime injects (a task
+  notification) does, shown `from: runtime`. The live branch is the `parentUuid` chain from the
+  newest `last-prompt.leafUuid` (`logicalParentUuid` crosses a compaction); other branches are left
+  out except by `read --raw`. Sub-agent transcripts are not read.
 - The TUI ends a turn with `system/turn_duration`, or a `[Request interrupted by user]` line after
   Esc; `-p` writes no end marker. So a turn agent-talk ran is decided by its run log: the `result`
   event ends it, with the denials in `result.permission_denials`; a pid gone without one ends it
@@ -481,12 +481,12 @@ starting. Queue items pending at a user interrupt stay dormant until another exe
 
 **Settings.** The session stores its model, variant and rules, so `send --model`, `--effort` and
 `--full-access` change the session itself (`POST /api/session/{id}/model`, `PATCH` of its
-permissions), before the message is recorded: a refused change is a plain error without a
-receipt. The service reads the session's values at each step, so a change also covers the rest
-of an execution already running and the prompts queued behind it, and the user's TUI follows it
-(2.0.23). A changed toolset writes a `system` row into history and the model's context (about
-8.7 KB for allow-all), and a model that was refused a tool earlier can go on treating it as
-missing (2.0.23).
+permissions), before the message is recorded: a refused change is a plain error without a receipt.
+The service reads the session's values at each step, so a change also covers the rest of an
+execution already running and the prompts queued behind it, and the user's TUI follows it (2.0.23);
+a permission request already pending is not re-evaluated. A changed toolset writes a `system` row
+into history and the model's context, and a model that was refused a tool earlier can go on treating
+it as missing (2.0.23).
 
 **Approvals.** `permission.asked` goes to every subscriber and is not replayed, so agent-talk also
 lists pending requests. An unanswered request blocks with no timeout. `reject` with a `message`
@@ -778,7 +778,7 @@ with `--caller`.
   (§6), so a turn found later is the turn that was sent.
 - **History is paged to the answer.** `read` and turn lookup follow the agent's cursor, newest
   first, until the page is full, the turn is found or history ends, because the wanted turn is
-  usually recent (Codex: about 105 s oldest first on a thread of about 700 turns, 0.162.1).
+  usually recent.
 - **Shared lifecycle, separate observe loops.** Receipt and approval handling lives once (§3). The
   end of a turn has a different authority on each agent: the `turn/completed` event in Codex, a
   re-read of history in OpenCode, the child and its run log in Claude, Antigravity and pi, the
