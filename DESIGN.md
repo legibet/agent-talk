@@ -748,6 +748,9 @@ no way to join a conversation another process holds.
   proof the message was taken, and its step index is the turn id; `wait --receipt` recovers it,
   the `result` and the denials from the run log (without the log an unknown receipt stays unknown;
   no text matching).
+- A run that took the message and exited without `result` is `failed` when the sending command
+  saw an unsuccessful exit status, as for Claude and pi, and `unknown` otherwise (a successful
+  exit, or a `wait` that only saw the pid gone).
 - `result.response` joins every response of the turn, commentary included, so the reply is the
   last `agent_response` step's text. On a resumed conversation `result` reports conversation
   totals, not the turn's.

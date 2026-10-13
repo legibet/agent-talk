@@ -328,9 +328,10 @@ impl<'a> Antigravity<'a> {
 
     /// What the run log of a run that is over (a `result`, or the process gone) means:
     /// without a user step agy never took the message and the receipt is `rejected` with
-    /// agy's error (DESIGN.md §3); without a `result` the turn's outcome is unknown;
-    /// otherwise the turn is the `result`, and its denials are recorded. `status` is known
-    /// when this command saw the process exit.
+    /// agy's error (DESIGN.md §3); without a `result` the turn `failed` when the process
+    /// exited unsuccessfully, else its outcome is unknown; otherwise the turn is the
+    /// `result`, and its denials are recorded. `status` is known when this command saw the
+    /// process exit.
     fn finished(
         &self,
         h: &str,
@@ -347,7 +348,10 @@ impl<'a> Antigravity<'a> {
             let turn = model::Turn {
                 handle: h.to_string(),
                 turn_id,
-                status: TurnStatus::Unknown,
+                status: match status {
+                    Some(s) if !s.success() => TurnStatus::Failed,
+                    _ => TurnStatus::Unknown,
+                },
                 error: Some(json!({
                     "message": "agy exited without a result event",
                     "exit_code": status.and_then(|s| s.code()),
@@ -860,6 +864,55 @@ mod tests {
         let e = w.on_event(&s, init).unwrap_err();
         assert_eq!(e.code, ErrorCode::Precondition);
         assert!(e.message.contains("06615f44") && e.message.contains("11111111"));
+    }
+
+    /// A run that never took the message rejects its receipt; one that took it but has no
+    /// `result` failed when the process exited unsuccessfully, else its outcome is unknown.
+    #[test]
+    fn finished_runs() {
+        use crate::agents::Outgoing;
+        use crate::model::{Caller, ReceiptState};
+        use std::os::unix::process::ExitStatusExt;
+
+        let store = Store::memory();
+        let agy = Antigravity::new(&store);
+        let receipt_id = uuid::Uuid::new_v4().to_string();
+        let message = Outgoing {
+            text: "x",
+            delivered: "x",
+            from: &Caller::UNKNOWN,
+            depth: 0,
+        };
+        store
+            .insert_intent(&NewIntent {
+                receipt_id: &receipt_id,
+                handle: "antigravity:x",
+                client_msg_id: &receipt_id,
+                message: &message,
+            })
+            .unwrap();
+        let mut run = Run::default();
+        let exit = |code| Some(ExitStatus::from_raw(code << 8));
+
+        let e = agy
+            .finished("antigravity:x", &receipt_id, &run, exit(1))
+            .unwrap_err();
+        assert_eq!(e.code, ErrorCode::Precondition);
+        let state = store.receipt(&receipt_id).unwrap().unwrap().state;
+        assert_eq!(state, ReceiptState::Rejected);
+
+        let user =
+            r#"{"event":"step_update","step_update":{"step_index":0,"step_type":"user_input"}}"#;
+        run.apply(decode(user).unwrap());
+        let status = |exit| {
+            let (turn, _) = agy.finished("antigravity:x", "r", &run, exit).unwrap();
+            assert_eq!(turn.turn_id, "0");
+            turn.status
+        };
+        assert_eq!(status(exit(1)), TurnStatus::Failed);
+        assert_eq!(status(exit(0)), TurnStatus::Unknown);
+        // `wait` did not see the process exit.
+        assert_eq!(status(None), TurnStatus::Unknown);
     }
 
     /// The decision table of a turn agent-talk did not run.
