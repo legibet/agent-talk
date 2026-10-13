@@ -445,13 +445,16 @@ so `send` is synchronous. `--verbose` is mandatory for stream-json in print mode
   `last-prompt.leafUuid` (`logicalParentUuid` crosses a compaction); `read --raw` adds orphan
   branches. Sub-agent transcripts are not read.
 - End markers: the TUI writes `system/turn_duration`, or a `[Request interrupted by user]` line
-  after Esc; `-p` writes none. So `wait` ends an owned turn at its run log's `result` or pid exit.
+  after Esc; `-p` writes none. So `wait` on a turn agent-talk ran reads its run log, not the
+  transcript: the `result` ends the turn, with the denials in `result.permission_denials`; a pid
+  gone without one ends it `unknown`, or rejects the receipt when the run never took the message.
   Other turns end at a marker, a later prompt on the live branch, or once no live process holds
   the session (status from the last assistant line's `stop_reason`), all labelled best effort; a
   foreign `-p` turn that is still running stays `running` until the deadline.
 
 **Liveness and writers.** `claude agents --json --all` lists every live process, TUI and `-p` alike,
-as `kind: "interactive"` with pid and `busy`/`idle` status; background sessions are `kind:
+as `kind: "interactive"` with pid and `busy`/`idle` status (`ls` reads any other status as
+`unknown`); background sessions are `kind:
 "background"` without pid or status; exited processes disappear. agent-talk classifies pids by its
 `processes` table, never by `kind`, and treats an undecodable entry as an error. Claude has no lock
 between processes: a concurrent `--resume` mid-turn writes a second branch and the next `--resume`
@@ -927,8 +930,6 @@ the server is pinned with `--caller`.
   agent-talk relies on the agent's own denial.
 - Connection loss mid-`wait` ends with `E_TRANSPORT` (OpenCode re-reads history once on a clean
   stream end, Codex does not); recovery is `wait --receipt`.
-- Claude `wait --receipt` needs the transcript before it consults the run log, and returns no
-  approvals (denials after the sending command stopped observing are not recovered).
 - Claude and Grok identify a recorded child by pid and an unfinished turn only; after a crash and
   pid reuse a session can stay `E_LOCKED` until the row ages out of the newest ten.
 - Claude: whether `CLAUDE_CODE_SESSION_ID` reaches a globally registered MCP server the same way,

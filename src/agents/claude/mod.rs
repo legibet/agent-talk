@@ -20,7 +20,7 @@ mod transcript;
 use self::process::{AgentEntry, TurnArgs, agents};
 use self::stream::{Run, StreamEvent, System};
 use self::transcript::{TurnEnd, head, live_branch, load, slug, transcript_turn, turn_end};
-use crate::agents::child::{Runs, cli_version, lock, observe, tail};
+use crate::agents::child::{Runs, cli_version, lock, observe, pid_alive, tail};
 use crate::agents::history::{ReadPage, ReadQuery, cut, first_line};
 use crate::agents::lifecycle::{
     ApprovalPolicy, bounded, note_waiting, record, reject_unstarted, settle, wait_receipt,
@@ -31,12 +31,13 @@ use crate::agents::{
 };
 use crate::model::{
     self, Approval, ApprovalOutcome, Error, ErrorCode, History, Loaded, Model, Observations,
-    Outcome, Page, Progress, ReceiptState, Result, Session, SessionState, TurnStatus,
+    Outcome, Page, Progress, Result, Session, SessionState, TurnStatus,
 };
 use crate::store::{NewIntent, Store};
 use serde_json::json;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::process::ExitStatus;
 use std::time::{Duration, UNIX_EPOCH};
 use tokio::process::Command;
 use tokio::time::Instant;
@@ -390,7 +391,6 @@ impl<'a> Claude<'a> {
             match status {
                 Some("busy" | "running") => SessionState::Running,
                 Some("idle") => SessionState::Idle,
-                Some(s) if s.contains("wait") || s.contains("permission") => SessionState::Waiting,
                 _ => SessionState::Unknown,
             }
         } else {
@@ -477,31 +477,13 @@ impl<'a> Claude<'a> {
                 .deliver(&mut child, format!("{line}\n").as_bytes())
                 .await?;
             let status = tail(&mut child, &log, |l| watch.on_event(self.store, l)).await?;
-            // Neither init nor result: claude never took the message (DESIGN.md §3).
-            if !watch.run.started() {
-                let e = self.runs.startup_error(&watch.receipt_id, Some(status));
-                let e = Error::from_agent(ErrorCode::Precondition, e);
-                return Err(reject_unstarted(self.store, &watch.receipt_id, e));
-            }
-            let Some(r) = &watch.run.result else {
-                return Ok(model::Turn {
-                    handle: h.clone(),
-                    turn_id: watch.turn_id.clone(),
-                    status: if status.success() {
-                        TurnStatus::Unknown
-                    } else {
-                        TurnStatus::Failed
-                    },
-                    error: Some(json!({
-                        "message": "claude exited without a result event",
-                        "exit_code": status.code(),
-                    })),
-                    final_text: None,
-                    duration_ms: None,
-                    basis: Some("claude -p process exited".into()),
-                });
-            };
-            Ok(r.turn(h.clone(), watch.turn_id.clone()))
+            self.finished(
+                &watch.id,
+                &watch.receipt_id,
+                &watch.turn_id,
+                &watch.run,
+                Some(status),
+            )
         };
         let res = observe(deadline, work).await;
         settle(
@@ -512,6 +494,101 @@ impl<'a> Claude<'a> {
             watch.approvals,
             Progress::Running,
         )
+    }
+
+    /// The turn `turn_id` of a run of session `id` that ended: its `result` event, or how the
+    /// process exited without one (`status` is `None` when this command did not see the
+    /// exit). A run that never took the message rejects the receipt (DESIGN.md §3).
+    fn finished(
+        &self,
+        id: &str,
+        receipt_id: &str,
+        turn_id: &str,
+        run: &Run,
+        status: Option<ExitStatus>,
+    ) -> Result<model::Turn> {
+        if !run.started() {
+            let e = self.runs.startup_error(receipt_id, status);
+            let e = Error::from_agent(ErrorCode::Precondition, e);
+            return Err(reject_unstarted(self.store, receipt_id, e));
+        }
+        Ok(match &run.result {
+            Some(r) => r.turn(handle(id), turn_id.into()),
+            None => model::Turn {
+                handle: handle(id),
+                turn_id: turn_id.into(),
+                status: if status.is_some_and(|s| !s.success()) {
+                    TurnStatus::Failed
+                } else {
+                    TurnStatus::Unknown
+                },
+                error: Some(json!({
+                    "message": "claude exited without a result event",
+                    "exit_code": status.and_then(|s| s.code()),
+                })),
+                final_text: None,
+                duration_ms: None,
+                basis: Some("claude -p process exited".into()),
+            },
+        })
+    }
+
+    /// The turn `turn_id` of session `id` as its transcript shows it (DESIGN.md §6.2): ended,
+    /// or what it is still waiting for.
+    async fn turn_in_transcript(
+        &self,
+        id: &str,
+        turn_id: &str,
+    ) -> Result<std::result::Result<model::Turn, String>> {
+        let entries = load(&self.require_transcript(id)?)?;
+        let branch = live_branch(&entries);
+        // Only the live branch is read: a prompt superseded by a resume from an earlier
+        // point has no answer of its own there.
+        let found = entries
+            .iter()
+            .position(|e| e.uuid() == Some(turn_id) && e.is_prompt());
+        let Some(start) = found.filter(|i| branch.contains(i)) else {
+            return Err(Error::new(
+                ErrorCode::Precondition,
+                match found {
+                    Some(_) => {
+                        format!("turn {turn_id} is on a superseded branch of this transcript")
+                    }
+                    None => format!("turn {turn_id} is not a user message in this transcript"),
+                },
+            ));
+        };
+        let live = self.live(id).await?;
+        let agent_status = match &live {
+            Some(Live::Foreign(a)) => a.status.as_deref(),
+            _ => None,
+        };
+        // A transcript marker or a later prompt closes the turn; so does the end of every
+        // process that could still write it.
+        let end = match (turn_end(&entries, &branch, start), &live) {
+            (Some(end), _) => end,
+            (None, None) => TurnEnd::ProcessGone,
+            (None, Some(Live::Own(pid))) => {
+                return Ok(Err(format!(
+                    "waiting for the result event of the claude process agent-talk started (pid {pid})"
+                )));
+            }
+            (None, Some(Live::Foreign(a))) => {
+                return Ok(Err(format!(
+                    "transcript-derived: waiting for system/turn_duration, an interrupt line or a later user message after the prompt (best effort; claude -p sessions write no turn marker); claude agents: pid {} status {}",
+                    a.pid.unwrap_or_default(),
+                    a.status.as_deref().unwrap_or("unknown")
+                )));
+            }
+        };
+        Ok(Ok(transcript_turn(
+            handle(id),
+            &entries,
+            &branch,
+            start,
+            end,
+            agent_status,
+        )))
     }
 }
 
@@ -694,97 +771,46 @@ impl Agent for Claude<'_> {
                 (rec.client_msg_id.clone(), Some(rec))
             }
         };
-        let path = self.require_transcript(id)?;
         // The sending command stopped observing before its run started: accept the
         // receipt here, once, when the run log shows the start.
-        let mut unaccepted = receipt.as_ref().is_some_and(|r| {
-            matches!(r.state, ReceiptState::Pending | ReceiptState::Unknown) && r.turn_id.is_none()
-        });
+        let mut unaccepted = receipt.as_ref().is_some_and(|r| r.turn_id.is_none());
+        let receipt_id = receipt.map(|r| r.receipt_id);
+        let run_log = receipt_id.as_deref().map(|r| (r, self.runs.log(r)));
+        let mut approvals = Vec::new();
         // What the last poll was waiting for, reported at the deadline.
         let mut waiting_for = String::new();
         let work = async {
             loop {
-                // 1. Own run: its result event is authoritative.
-                if let Some(r) = &receipt {
-                    let run = Run::from_log(&self.runs.log(&r.receipt_id));
+                // The run agent-talk started: its log is authoritative.
+                if let Some((r, log)) = &run_log
+                    && log.is_file()
+                {
+                    let run = Run::from_log(log);
                     if unaccepted && run.started() {
-                        self.store
-                            .accept(&r.receipt_id, None, Some(&turn_id), Some(&turn_id))?;
+                        self.store.accept(r, None, Some(&turn_id), Some(&turn_id))?;
                         unaccepted = false;
                     }
-                    if let Some(result) = &run.result {
-                        return Ok(result.turn(h.clone(), turn_id.clone()));
-                    }
-                }
-                let entries = load(&path)?;
-                let branch = live_branch(&entries);
-                // Only the live branch is read: a prompt superseded by a resume from an
-                // earlier point has no answer of its own there.
-                let found = entries
-                    .iter()
-                    .position(|e| e.uuid() == Some(turn_id.as_str()) && e.is_prompt());
-                let start = found.filter(|i| branch.contains(i));
-                if start.is_none() && receipt.is_none() {
-                    return Err(Error::new(
-                        ErrorCode::Precondition,
-                        match found {
-                            Some(_) => format!(
-                                "turn {turn_id} is on a superseded branch of this transcript"
-                            ),
-                            None => {
-                                format!("turn {turn_id} is not a user message in this transcript")
+                    let pid = self.store.process(r)?;
+                    if run.result.is_some() || !pid.is_some_and(pid_alive) {
+                        // This command did not start the process: no exit status.
+                        let turn = self.finished(id, r, &turn_id, &run, None)?;
+                        if let Some(result) = &run.result {
+                            approvals = result.denials(&h, &turn_id);
+                            for a in &approvals {
+                                record(self.store, a);
                             }
-                        },
-                    ));
-                }
-                let live = self.live(id).await?;
-                let agent_status = match &live {
-                    Some(Live::Foreign(a)) => a.status.as_deref(),
-                    _ => None,
-                };
-                // 2. A transcript marker or a later prompt closes the turn; 3. so does
-                // the end of every process that could still write it.
-                if let Some(s) = start {
-                    let end = match turn_end(&entries, &branch, s) {
-                        None if live.is_none() => Some(TurnEnd::ProcessGone),
-                        end => end,
-                    };
-                    if let Some(end) = end {
-                        return Ok(transcript_turn(
-                            h.clone(),
-                            &entries,
-                            &branch,
-                            s,
-                            end,
-                            agent_status,
-                        ));
+                        }
+                        return Ok(turn);
                     }
-                }
-                match &live {
-                    None => {
-                        return Ok(model::Turn {
-                            handle: h.clone(),
-                            turn_id: turn_id.clone(),
-                            status: TurnStatus::Unknown,
-                            error: Some(json!({
-                                "message": "the claude process exited without a result event and the turn is not in the transcript",
-                            })),
-                            final_text: None,
-                            duration_ms: None,
-                            basis: Some("claude -p process exited".into()),
-                        });
-                    }
-                    Some(Live::Own(pid)) => {
-                        waiting_for = format!(
-                            "waiting for the result event of the claude process agent-talk started (pid {pid})"
-                        );
-                    }
-                    Some(Live::Foreign(a)) => {
-                        waiting_for = format!(
-                            "transcript-derived: waiting for system/turn_duration, an interrupt line or a later user message after the prompt (best effort; claude -p sessions write no turn marker); claude agents: pid {} status {}",
-                            a.pid.unwrap_or_default(),
-                            a.status.as_deref().unwrap_or("unknown")
-                        );
+                    waiting_for = format!(
+                        "waiting for the result event of the claude process agent-talk started (pid {})",
+                        pid.unwrap_or_default()
+                    );
+                } else {
+                    // Anything else: the transcript rule.
+                    match self.turn_in_transcript(id, &turn_id).await? {
+                        Ok(turn) => return Ok(turn),
+                        Err(w) => waiting_for = w,
                     }
                 }
                 tokio::time::sleep(Duration::from_secs(1)).await;
@@ -794,14 +820,72 @@ impl Agent for Claude<'_> {
             .await
             .map(Some)
             .map_err(|e| note_waiting(e, &waiting_for));
-        let receipt_id = receipt.map(|r| r.receipt_id);
         settle(
             self.store,
             h,
             res,
             receipt_id.as_deref(),
-            Vec::new(),
+            approvals,
             Progress::Running,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Caller, ReceiptState};
+
+    // From a `claude -p` run log of agent-talk (claude 2.1.29x; tools, usage, cost and
+    // sub-agent fields trimmed, the reply shortened, the path anonymized).
+    const SESSION: &str = "0a0c3984-fba5-4c1f-9113-5881b430bce4";
+    const INIT: &str = r#"{"type":"system","subtype":"init","cwd":"/Users/me/projects/demo","session_id":"0a0c3984-fba5-4c1f-9113-5881b430bce4","tools":["Task","Bash"],"mcp_servers":[],"model":"claude-sonnet-5-5","permissionMode":"default"}"#;
+    const PERMISSION_DENIED: &str = r#"{"type":"system","subtype":"permission_denied","tool_name":"Bash","tool_use_id":"toolu_016xLoVCqChMMsF8Nuh8xx18","message":"Output redirection to '/Users/me/projects/demo/probe.txt' needs approval.","uuid":"5c4648b1-088c-4c55-95ed-177354468ed4","session_id":"0a0c3984-fba5-4c1f-9113-5881b430bce4"}"#;
+    const RESULT: &str = r#"{"duration_api_ms":17555,"stop_reason":"end_turn","session_id":"0a0c3984-fba5-4c1f-9113-5881b430bce4","permission_denials":[{"tool_name":"Bash","tool_use_id":"toolu_016xLoVCqChMMsF8Nuh8xx18","tool_input":{"command":"echo hi > probe.txt","description":"Write \"hi\" to probe.txt"}}],"terminal_reason":"completed","is_error":false,"num_turns":2,"subtype":"success","api_error_status":null,"result":"The command did not run.","type":"result","duration_ms":6327,"uuid":"5a3c14e1-59fa-401a-8eee-c43175a2be64","queued_turn_count":0,"result_index":0}"#;
+
+    /// The watch over a run delivering a fresh intent.
+    fn watch(store: &Store) -> RunWatch {
+        let message = Outgoing {
+            text: "x",
+            delivered: "x",
+            from: &Caller::UNKNOWN,
+            depth: 0,
+        };
+        Claude::new(store).intent(SESSION, &message).unwrap()
+    }
+
+    fn state(store: &Store, w: &RunWatch) -> ReceiptState {
+        store.receipt(&w.receipt_id).unwrap().unwrap().state
+    }
+
+    #[test]
+    fn run_watch_accepts_once_started_and_records_each_denial_once() {
+        let s = Store::memory();
+        let mut w = watch(&s);
+        assert_eq!(state(&s, &w), ReceiptState::Pending);
+        w.on_event(&s, INIT).unwrap();
+        let r = s.receipt(&w.receipt_id).unwrap().unwrap();
+        assert_eq!(r.state, ReceiptState::Accepted);
+        assert_eq!(r.turn_id.as_deref(), Some(w.turn_id.as_str()));
+        // The result lists the denial the live event already reported: one approval.
+        w.on_event(&s, PERMISSION_DENIED).unwrap();
+        w.on_event(&s, RESULT).unwrap();
+        assert_eq!(w.approvals.len(), 1);
+        assert_eq!(w.approvals[0].kind, "system/permission_denied");
+
+        // A result without init: accepted, and the result reports the denial.
+        let mut w = watch(&s);
+        w.on_event(&s, RESULT).unwrap();
+        assert_eq!(state(&s, &w), ReceiptState::Accepted);
+        assert_eq!(w.approvals.len(), 1);
+        let a = &w.approvals[0];
+        assert_eq!(
+            (a.kind.as_str(), a.summary.as_str(), a.outcome),
+            (
+                "permission_denial",
+                "denied: [tool_use Bash] echo hi > probe.txt",
+                ApprovalOutcome::Denied
+            )
+        );
     }
 }
