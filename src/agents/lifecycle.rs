@@ -7,7 +7,6 @@ use crate::model::{
     Turn,
 };
 use crate::store::Store;
-use serde_json::Value;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::signal::unix::{SignalKind, signal};
@@ -68,11 +67,11 @@ pub fn record(store: &Store, a: &Approval) {
     }
 }
 
-/// Another client answered the request: pending approvals with this id are resolved.
-pub fn resolve(store: &Store, approvals: &mut [Approval], request_id: &Value) {
+/// Someone answered a request: the pending approvals `answered` matches are resolved.
+pub fn resolve(store: &Store, approvals: &mut [Approval], answered: impl Fn(&Approval) -> bool) {
     for a in approvals
         .iter_mut()
-        .filter(|a| a.request_id == *request_id && a.outcome == ApprovalOutcome::Pending)
+        .filter(|a| a.outcome == ApprovalOutcome::Pending && answered(a))
     {
         a.outcome = ApprovalOutcome::Resolved;
         record(store, a);

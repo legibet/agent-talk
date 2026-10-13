@@ -431,7 +431,8 @@ impl<'a> Codex<'a> {
             }
             if method == "serverRequest/resolved" {
                 // Someone answered; a pending approval is no longer pending.
-                resolve(self.store, &mut w.approvals, &params["requestId"]);
+                let id = &params["requestId"];
+                resolve(self.store, &mut w.approvals, |a| a.request_id == *id);
                 continue;
             }
             match (method.as_str(), &*target) {

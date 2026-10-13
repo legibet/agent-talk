@@ -306,7 +306,8 @@ impl<'a> OpenCode<'a> {
                     self.on_permission(svc, w, data).await?;
                 }
                 Event::PermissionReplied { data } if data.session_id == session_id => {
-                    resolve(self.store, &mut w.approvals, &json!(data.request_id));
+                    let id = json!(data.request_id);
+                    resolve(self.store, &mut w.approvals, |a| a.request_id == id);
                 }
                 Event::InboxDelivered { data }
                     if data.session_id == session_id && data.inbox_id == w.msg_id =>

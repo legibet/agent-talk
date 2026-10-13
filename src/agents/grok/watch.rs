@@ -8,7 +8,7 @@ use super::handle;
 use super::updates::{self, SessionUpdate, ToolCall};
 use crate::agents::decode::{entries, or_default};
 use crate::agents::history::first_line;
-use crate::agents::lifecycle::{ApprovalPolicy, record};
+use crate::agents::lifecycle::{ApprovalPolicy, record, resolve};
 use crate::model::{self, Approval, ApprovalOutcome, Error, ErrorCode, Progress, Result};
 use crate::store::Store;
 use serde::Deserialize;
@@ -385,13 +385,9 @@ impl<'s> Watch<'s> {
                 if let SessionUpdate::InteractionResolved { tool_call_id } =
                     SessionUpdate::of(params)
                 {
-                    for a in self.approvals.iter_mut().filter(|a| {
-                        a.outcome == ApprovalOutcome::Pending
-                            && a.item_id.as_ref() == Some(&tool_call_id)
-                    }) {
-                        a.outcome = ApprovalOutcome::Resolved;
-                        record(self.store, a);
-                    }
+                    resolve(self.store, &mut self.approvals, |a| {
+                        a.item_id.as_ref() == Some(&tool_call_id)
+                    });
                 }
             }
             _ => {}
