@@ -452,7 +452,7 @@ impl Agent for OpenCode<'_> {
         for s in sessions {
             let handle = handle(&s.id);
             let owned = self.store.is_owned(&handle)?;
-            let title = s.title.clone().filter(|t| !t.is_empty());
+            let title = s.title.clone();
             items.push(Session {
                 handle,
                 agent: "opencode",

@@ -3,7 +3,7 @@
 //! shows.
 
 use super::handle;
-use super::transport::Service;
+use super::transport::{Service, text};
 use crate::agents::history::RemoteHistory;
 use crate::model::{self, Message, Phase, Result, Role, TurnStatus};
 use serde::Deserialize;
@@ -59,6 +59,7 @@ enum Part {
         text: Option<String>,
     },
     Tool {
+        #[serde(default, deserialize_with = "text")]
         name: Option<String>,
         #[serde(default)]
         state: ToolState,
@@ -70,6 +71,7 @@ enum Part {
 
 #[derive(Deserialize, Default)]
 struct ToolState {
+    #[serde(default, deserialize_with = "text")]
     status: Option<String>,
     #[serde(default)]
     input: Value,
@@ -523,5 +525,8 @@ mod tests {
         // A page starting mid-turn takes the turn id handed in.
         let m = messages(&page[1..2], Some("msg_u0".into()));
         assert_eq!(m[0].1.turn_id, "msg_u0");
+        // An empty tool name or status is unknown.
+        let tool = json!({"id":"msg_a","type":"assistant","content":[{"type":"tool","name":"","state":{"status":""}}]});
+        assert_eq!(messages(&[tool], None)[0].1.text, "[tool ?] ? null");
     }
 }

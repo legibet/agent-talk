@@ -6,7 +6,7 @@ use crate::agents::child::pid_alive;
 use crate::model::{AgentError, Error, ErrorCode, Result};
 use futures_util::StreamExt;
 use serde::de::{DeserializeOwned, IgnoredAny};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -36,13 +36,48 @@ pub struct Service {
     pub version: String,
 }
 
-/// `Model.Ref`: a model as the service stores it on a session; the variant is the effort.
+/// A string field: an empty string, or a value of another type, reads as absent. For
+/// `#[serde(default, deserialize_with = "text")]`.
+pub fn text<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<Option<String>, D::Error> {
+    Ok(match Value::deserialize(d)? {
+        Value::String(s) if !s.is_empty() => Some(s),
+        _ => None,
+    })
+}
+
+/// The entries of an array field that decode: one odd entry does not fail the whole
+/// response, and a value other than an array has none.
+fn entries<'de, D: Deserializer<'de>, T: DeserializeOwned>(
+    d: D,
+) -> std::result::Result<Vec<T>, D::Error> {
+    let Value::Array(items) = Value::deserialize(d)? else {
+        return Ok(Vec::new());
+    };
+    Ok(items
+        .into_iter()
+        .filter_map(|v| {
+            T::deserialize(v)
+                .inspect_err(|e| tracing::warn!("opencode service: skipped an entry: {e}"))
+                .ok()
+        })
+        .collect())
+}
+
+/// A stored model: one that does not name both its provider and its id reads as none.
+fn model<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<Option<ModelRef>, D::Error> {
+    Ok(ModelRef::deserialize(Value::deserialize(d)?)
+        .ok()
+        .filter(|m| !m.provider.is_empty() && !m.id.is_empty()))
+}
+
+/// `Model.Ref`: a model as the service stores it on a session; the variant is the effort,
+/// which agent-talk sends but never reads back.
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct ModelRef {
     #[serde(rename = "providerID")]
     pub provider: String,
     pub id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_deserializing, skip_serializing_if = "Option::is_none")]
     pub variant: Option<String>,
 }
 
@@ -63,20 +98,25 @@ impl ModelRef {
     }
 }
 
-/// `Session.Info`, as far as agent-talk reads it.
+/// `Session.Info`, as far as agent-talk reads it. Only the id is required: a listed
+/// session without one is skipped, since no command could address it.
 #[derive(Deserialize)]
 pub struct SessionInfo {
     pub id: String,
+    #[serde(default, deserialize_with = "text")]
     pub title: Option<String>,
-    #[serde(rename = "parentID")]
+    #[serde(rename = "parentID", default, deserialize_with = "text")]
     pub parent_id: Option<String>,
+    #[serde(default, deserialize_with = "text")]
     pub agent: Option<String>,
+    #[serde(default, deserialize_with = "model")]
     pub model: Option<ModelRef>,
     location: Option<Location>,
 }
 
 #[derive(Deserialize)]
 struct Location {
+    #[serde(default, deserialize_with = "text")]
     directory: Option<String>,
 }
 
@@ -86,13 +126,14 @@ impl SessionInfo {
     }
 }
 
-/// A model of a configured provider, with its variants (efforts).
+/// A model of a configured provider, with its variants (efforts). A model without its
+/// provider or id is skipped: `--model` could not name it.
 #[derive(Deserialize)]
 pub struct ApiModel {
     #[serde(rename = "providerID")]
     pub provider: String,
     pub id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "entries")]
     pub variants: Vec<Variant>,
 }
 
@@ -102,11 +143,13 @@ pub struct Variant {
 }
 
 /// `Permission.Request`, from a `permission.asked` event or `GET …/permission`; `raw` is
-/// the request as the service sent it.
+/// the request as the service sent it. Only the id is required, since the reply names it;
+/// a listed request without one is skipped.
 #[derive(Deserialize)]
 #[serde(try_from = "Value")]
 pub struct PermissionRequest {
     pub id: String,
+    /// Empty when the service sent none: such an event matches no session.
     pub session_id: String,
     pub action: Option<String>,
     pub resources: Vec<String>,
@@ -122,15 +165,17 @@ impl TryFrom<Value> for PermissionRequest {
         #[derive(Deserialize)]
         struct Fields {
             id: String,
-            #[serde(rename = "sessionID")]
+            #[serde(rename = "sessionID", default)]
             session_id: String,
+            #[serde(default, deserialize_with = "text")]
             action: Option<String>,
-            #[serde(default)]
+            #[serde(default, deserialize_with = "entries")]
             resources: Vec<String>,
             source: Option<Source>,
         }
         #[derive(Deserialize)]
         struct Source {
+            #[serde(default, deserialize_with = "text")]
             id: Option<String>,
         }
         let f = Fields::deserialize(&raw)?;
@@ -196,9 +241,9 @@ struct Data<T> {
 
 /// A list response; `cursor.next` names the next page.
 #[derive(Deserialize)]
-#[serde(bound(deserialize = "T: Deserialize<'de>"))]
+#[serde(bound(deserialize = "T: DeserializeOwned"))]
 struct List<T> {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "entries")]
     data: Vec<T>,
     #[serde(default)]
     cursor: Cursor,
@@ -206,6 +251,7 @@ struct List<T> {
 
 #[derive(Deserialize, Default)]
 struct Cursor {
+    #[serde(default, deserialize_with = "text")]
     next: Option<String>,
 }
 
@@ -216,14 +262,10 @@ struct Id {
 }
 
 #[derive(Deserialize)]
-struct Agent {
-    permissions: Option<Vec<Value>>,
-}
-
-#[derive(Deserialize)]
 struct Info {
     #[serde(default)]
     pid: u64,
+    #[serde(default, deserialize_with = "text")]
     version: Option<String>,
 }
 
@@ -481,7 +523,12 @@ impl Service {
 
     /// The user's default model for `directory`.
     pub async fn default_model(&self, directory: &str) -> Result<Option<ModelRef>> {
-        let default: Data<Option<ModelRef>> = self
+        #[derive(Deserialize)]
+        struct DefaultModel {
+            #[serde(default, deserialize_with = "model")]
+            data: Option<ModelRef>,
+        }
+        let default: DefaultModel = self
             .get(
                 "/api/model/default",
                 &[("location[directory]", directory.into())],
@@ -491,12 +538,19 @@ impl Service {
     }
 
     /// The rules of the agent a new session in `directory` runs: the default agent, which
-    /// the service lists first.
+    /// the service lists first (read as `Value`, so that no entry is skipped before it).
     pub async fn default_agent_rules(&self, directory: &str) -> Result<Option<Vec<Value>>> {
-        let agents: List<Agent> = self
+        let agents: List<Value> = self
             .get("/api/agent", &[("location[directory]", directory.into())])
             .await?;
-        Ok(agents.data.into_iter().next().and_then(|a| a.permissions))
+        Ok(agents
+            .data
+            .into_iter()
+            .next()
+            .and_then(|mut a| match a["permissions"].take() {
+                Value::Array(rules) => Some(rules),
+                _ => None,
+            }))
     }
 
     /// `integration.list`, which returns once the location's plugins are active, and with
@@ -660,5 +714,35 @@ mod tests {
         );
         assert_eq!(req.call_id.as_deref(), Some("call_1"));
         assert_eq!(req.raw, raw["data"]);
+    }
+
+    /// An odd entry or field does not fail a listing; an empty string is absent.
+    #[test]
+    fn lists_tolerate_odd_entries() {
+        let sessions: List<SessionInfo> = serde_json::from_value(json!({"data": [
+            {"id": "ses_a", "title": "", "model": {"id": "m"}, "location": {"directory": ""}},
+            {"title": "no id"},
+            {"id": "ses_b", "model": {"providerID": "p", "id": "m", "variant": 3}},
+        ], "cursor": {"next": ""}}))
+        .unwrap();
+        let [a, b] = &sessions.data[..] else {
+            panic!("expected two sessions");
+        };
+        assert!(a.title.is_none() && a.model.is_none() && a.directory().is_none());
+        assert_eq!(b.model.as_ref().map(|m| m.id.as_str()), Some("m"));
+        assert!(sessions.cursor.next.is_none());
+
+        let requests: List<PermissionRequest> = serde_json::from_value(json!({"data": [
+            {"id": "per_1", "action": "", "resources": ["a.txt", {"path": "b"}]},
+            {"action": "edit"},
+        ]}))
+        .unwrap();
+        let [req] = &requests.data[..] else {
+            panic!("expected one request");
+        };
+        assert_eq!(
+            (req.action.as_deref(), &req.resources[..]),
+            (None, &["a.txt".to_string()][..])
+        );
     }
 }
