@@ -563,7 +563,9 @@ impl<'a> Grok<'a> {
                 message: &req.message,
             })?;
             let params = json!({"sessionId": id, "text": req.message.delivered});
-            conn.request("_x.ai/interject", params)
+            // Bounded like the observation below: a deadline or a signal leaves the receipt
+            // `unknown` instead of `pending`.
+            bounded(deadline, conn.request("_x.ai/interject", params))
                 .await
                 .map_err(|e| reject(self.store, &receipt_id, e))?;
             // The ack (`status: queued`) is the acceptance; the turn it joined comes with
@@ -577,18 +579,18 @@ impl<'a> Grok<'a> {
                 running,
                 policy,
             );
-            let res = match deadline {
-                Some(d) => bounded(Some(d), w.finish(&mut conn)).await.map(Some),
-                None => {
-                    // Without --wait: only until the joined turn is known.
-                    let _ = tokio::time::timeout(
-                        Duration::from_secs(5),
-                        w.until_running(&mut conn),
-                    )
-                    .await;
-                    Ok(None)
+            let observe = async {
+                match deadline {
+                    Some(_) => w.finish(&mut conn).await.map(Some),
+                    None => {
+                        // Without --wait: only until the joined turn is known.
+                        let joined = w.until_running(&mut conn);
+                        let _ = tokio::time::timeout(Duration::from_secs(5), joined).await;
+                        Ok(None)
+                    }
                 }
             };
+            let res = bounded(deadline, observe).await;
             let note = self.leader_change(&leader);
             // A steer message's turn ends with the joined turn's
             // `_x.ai/session/prompt_complete`, never an error.

@@ -697,8 +697,10 @@ stored, so every direct-mode send passes it again. It has no effect on a session
 leader, so `send --full-access` there is refused with `E_UNSUPPORTED` before anything is
 recorded. `session/request_permission` goes to every attached client with one id; the first
 answer wins, `reject_once` ends the turn `cancelled`. An unanswered request was still pending after
-25 s. Which commands prompt with yolo off varied between runs on 1.0.46, and later runs provoked
-none, so the deny and observe paths rest on frames captured earlier.
+25 s. An approval's summary is the tool call as `read --all` shows it: `_meta["x.ai/tool"].name`
+(else the title) and its main argument. Which commands prompt with yolo off varied between runs
+on 1.0.46, and later runs provoked none, so the deny and observe paths rest on frames captured
+earlier; unit tests replay them.
 
 **Identity.** `GROK_SESSION_ID` is set in shell commands and in each MCP server's environment (one
 server per session); `tools/call` `_meta` carries only `progressToken`. Grok also loads MCP servers

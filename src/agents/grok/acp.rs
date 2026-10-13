@@ -87,10 +87,18 @@ impl Shared {
 }
 
 /// The response to a request `Conn::submit` wrote. Agent errors keep code/message/data; a
-/// connection that ends first is a transport error.
+/// connection that ends first is a transport error. Dropping it forgets the request, so a
+/// response that comes later is discarded.
 pub struct Response {
+    id: u64,
     rx: oneshot::Receiver<Reply>,
     shared: Arc<Shared>,
+}
+
+impl Drop for Response {
+    fn drop(&mut self) {
+        self.shared.pending.lock().unwrap().waiters.remove(&self.id);
+    }
 }
 
 impl Future for Response {
@@ -233,12 +241,14 @@ impl Conn {
         self.write(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))
             .await?;
         Ok(Response {
+            id,
             rx,
             shared: self.shared.clone(),
         })
     }
 
-    /// Send a request and wait for its response, at most `RPC_TIMEOUT`.
+    /// Send a request and wait for its response, at most `RPC_TIMEOUT`; after that the
+    /// request is forgotten.
     pub async fn request(&self, method: &str, params: Value) -> Result<Value> {
         let response = self.submit(method, params).await?;
         match tokio::time::timeout(RPC_TIMEOUT, response).await {

@@ -96,7 +96,7 @@ pub struct PromptMeta {
 #[serde(rename_all = "camelCase")]
 pub struct ToolCall {
     pub tool_call_id: Option<String>,
-    pub title: Option<String>,
+    title: Option<String>,
     #[serde(default)]
     raw_input: Value,
     status: Option<String>,
@@ -116,18 +116,15 @@ struct ToolInfo {
 }
 
 impl ToolCall {
-    /// `_meta["x.ai/tool"].name`, such as `run_terminal_command`.
-    pub fn tool_name(&self) -> Option<&str> {
-        self.meta.tool.as_ref()?.name.as_deref()
-    }
-
-    /// The tool name, else the title.
-    fn name(&self) -> &str {
-        self.tool_name().or(self.title.as_deref()).unwrap_or("tool")
+    /// `_meta["x.ai/tool"].name` (`run_terminal_command`), else the title; `read` and
+    /// approval summaries use the same name.
+    pub fn name(&self) -> Option<&str> {
+        let tool = self.meta.tool.as_ref().and_then(|t| t.name.as_deref());
+        tool.or(self.title.as_deref())
     }
 
     /// ` <first line of the input's main argument>`, or nothing.
-    fn detail(&self) -> String {
+    pub fn detail(&self) -> String {
         [
             "command",
             "file_path",
@@ -329,7 +326,7 @@ impl History {
                     let Some(id) = call.tool_call_id.as_deref() else {
                         continue;
                     };
-                    let (name, detail) = (call.name(), call.detail());
+                    let (name, detail) = (call.name().unwrap_or("tool"), call.detail());
                     let status = call.status.as_deref().unwrap_or("pending");
                     out.push(Msg {
                         line: i,

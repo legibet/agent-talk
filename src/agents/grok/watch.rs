@@ -422,12 +422,11 @@ impl<'s> Watch<'s> {
             }
             _ => None,
         };
-        let summary = call
-            .title
-            .as_deref()
-            .or(call.tool_name())
-            .map(|t| first_line(t, 160))
-            .unwrap_or_else(|| "permission request".into());
+        // As `read` shows the tool call: name and main argument.
+        let summary = match call.name() {
+            Some(name) => first_line(&format!("{name}{}", call.detail()), 160),
+            None => "permission request".into(),
+        };
         let a = Approval {
             handle: handle(&self.session_id),
             turn_id: if ours {
@@ -649,7 +648,10 @@ mod tests {
             (a[0].turn_id.as_deref(), a[0].item_id.as_deref()),
             (Some("p"), Some("call-f3cb…-0"))
         );
-        assert_eq!(a[0].summary, "Execute `env | grep -iE 'grok' | sort`");
+        assert_eq!(
+            a[0].summary,
+            "run_terminal_command env | grep -iE 'grok' | sort"
+        );
 
         let mut w = prompt(&store, "p", ApprovalPolicy::Observe, false);
         assert_eq!(permission(&mut w, 0, PERMISSION), None);
