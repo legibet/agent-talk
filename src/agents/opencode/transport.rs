@@ -37,9 +37,8 @@ pub struct Service {
     pub version: String,
 }
 
-/// A string field: an empty string, or a value of another type, reads as absent. For
-/// `#[serde(default, deserialize_with = "text")]`.
-pub fn text<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<Option<String>, D::Error> {
+/// A string field: an empty string, or a value of another type, reads as absent.
+fn text<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<Option<String>, D::Error> {
     Ok(match Value::deserialize(d)? {
         Value::String(s) if !s.is_empty() => Some(s),
         _ => None,
@@ -125,60 +124,13 @@ pub struct Variant {
     pub id: String,
 }
 
-/// `Permission.Request`, from a `permission.asked` event or `GET …/permission`; `raw` is
-/// the request as the service sent it. Only the id is required, since the reply names it;
-/// a listed request without one is skipped.
-#[derive(Deserialize)]
-#[serde(try_from = "Value")]
-pub struct PermissionRequest {
-    pub id: String,
-    /// Empty when the service sent none: such an event matches no session.
-    pub session_id: String,
-    pub action: Option<String>,
-    pub resources: Vec<String>,
-    /// The tool call that asks (`call_…`).
-    pub call_id: Option<String>,
-    pub raw: Value,
-}
-
-impl TryFrom<Value> for PermissionRequest {
-    type Error = serde_json::Error;
-
-    fn try_from(raw: Value) -> std::result::Result<Self, Self::Error> {
-        #[derive(Deserialize)]
-        struct Fields {
-            id: String,
-            #[serde(rename = "sessionID", default)]
-            session_id: String,
-            #[serde(default, deserialize_with = "text")]
-            action: Option<String>,
-            #[serde(default, deserialize_with = "entries")]
-            resources: Vec<String>,
-            source: Option<Source>,
-        }
-        #[derive(Deserialize)]
-        struct Source {
-            #[serde(default, deserialize_with = "text")]
-            id: Option<String>,
-        }
-        let f = Fields::deserialize(&raw)?;
-        Ok(PermissionRequest {
-            id: f.id,
-            session_id: f.session_id,
-            action: f.action,
-            resources: f.resources,
-            call_id: f.source.and_then(|s| s.id),
-            raw,
-        })
-    }
-}
-
 /// The `/api/event` events agent-talk acts on; every other one is `Other`.
 #[derive(Deserialize)]
 #[serde(tag = "type")]
 pub enum Event {
     #[serde(rename = "permission.asked")]
-    PermissionAsked { data: PermissionRequest },
+    /// `Permission.Request`, read where it is answered; it becomes the approval's `raw`.
+    PermissionAsked { data: Value },
     #[serde(rename = "permission.replied")]
     PermissionReplied { data: Replied },
     #[serde(rename = "session.inbox.delivered")]
@@ -423,8 +375,8 @@ impl Service {
     }
 
     /// Requests already pending are not replayed on a new subscription (DESIGN.md §6.3).
-    pub async fn permissions(&self, session_id: &str) -> Result<Vec<PermissionRequest>> {
-        let list: List<PermissionRequest> = self
+    pub async fn permissions(&self, session_id: &str) -> Result<Vec<Value>> {
+        let list: List<Value> = self
             .get(&format!("/api/session/{session_id}/permission"), &[])
             .await?;
         Ok(list.data)
@@ -684,19 +636,14 @@ mod tests {
 
     /// Shapes observed on opencode 2.0.22.
     #[test]
-    fn permission_requests_keep_their_raw_form() {
+    fn permission_asked_carries_the_request() {
         let raw = json!({"id":"evt_1","type":"permission.asked","location":{"directory":"/w"},
             "data":{"id":"per_1","sessionID":"ses_x","action":"edit","resources":["a.txt"],"save":["*"],
                 "source":{"type":"tool","messageID":"msg_a","id":"call_1"}}});
         let Event::PermissionAsked { data: req } = Event::deserialize(&raw).unwrap() else {
             panic!("expected a permission request");
         };
-        assert_eq!(
-            (req.id.as_str(), req.session_id.as_str()),
-            ("per_1", "ses_x")
-        );
-        assert_eq!(req.call_id.as_deref(), Some("call_1"));
-        assert_eq!(req.raw, raw["data"]);
+        assert_eq!(req, raw["data"]);
     }
 
     /// An odd entry or field does not fail a listing; an empty string is absent.
@@ -714,18 +661,5 @@ mod tests {
         assert!(a.title.is_none() && a.model.is_none() && a.directory().is_none());
         assert_eq!(b.model.as_ref().map(|m| m.id.as_str()), Some("m"));
         assert!(sessions.cursor.next.is_none());
-
-        let requests: List<PermissionRequest> = serde_json::from_value(json!({"data": [
-            {"id": "per_1", "action": "", "resources": ["a.txt", {"path": "b"}]},
-            {"action": "edit"},
-        ]}))
-        .unwrap();
-        let [req] = &requests.data[..] else {
-            panic!("expected one request");
-        };
-        assert_eq!(
-            (req.action.as_deref(), &req.resources[..]),
-            (None, &["a.txt".to_string()][..])
-        );
     }
 }

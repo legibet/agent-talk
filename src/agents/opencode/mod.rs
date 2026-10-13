@@ -13,7 +13,7 @@ mod history;
 mod transport;
 
 use self::history::{find_span, messages, turn_before};
-use self::transport::{Event, Events, ModelRef, PermissionRequest, Service};
+use self::transport::{Event, Events, ModelRef, Service};
 use crate::agents::history::{ReadPage, ReadQuery, RemoteHistory};
 use crate::agents::lifecycle::{
     ApprovalPolicy, approval_policy, bounded, record, reject, resolve, settle, wait_receipt,
@@ -191,35 +191,45 @@ impl<'a> OpenCode<'a> {
         transport::connect(&self.registration).await
     }
 
-    /// A permission request reached us (live event or `GET …/permission`). Under
-    /// `observe` it stays unanswered; under `deny` it gets `reject` with a message (a
-    /// message-less reject interrupts the execution and writes no idle message;
-    /// DESIGN.md §6.3). Never `once` or `always`.
-    async fn on_permission(
-        &self,
-        svc: &Service,
-        w: &mut Watch<'_>,
-        req: PermissionRequest,
-    ) -> Result<()> {
-        if w.approvals.iter().any(|a| a.request_id == req.id.as_str()) {
+    /// A permission request (`Permission.Request`) reached us (live event or
+    /// `GET …/permission`). Under `observe` it stays unanswered; under `deny` it gets
+    /// `reject` with a message (a message-less reject interrupts the execution and writes no
+    /// idle message; DESIGN.md §6.3). Never `once` or `always`.
+    async fn on_permission(&self, svc: &Service, w: &mut Watch<'_>, req: Value) -> Result<()> {
+        // The reply names the request: one without an id cannot be answered.
+        let Some(request_id) = req["id"].as_str().map(String::from) else {
+            return Ok(());
+        };
+        if w.approvals
+            .iter()
+            .any(|a| a.request_id == request_id.as_str())
+        {
             return Ok(());
         }
+        let text = |v: &Value| v.as_str().filter(|s| !s.is_empty()).map(String::from);
+        let action = text(&req["action"]).unwrap_or_else(|| "unknown".into());
+        let resources: Vec<&str> = req["resources"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
         let delivered = w.delivery == Delivery::Delivered;
-        let action = req.action.unwrap_or_else(|| "unknown".into());
         let mut a = Approval {
             handle: handle(w.session_id),
             turn_id: delivered.then(|| w.msg_id.to_string()),
-            item_id: req.call_id,
-            request_id: json!(req.id),
-            summary: format!("{action} {}", req.resources.join(" ")),
+            // The tool call that asks (`call_…`).
+            item_id: text(&req["source"]["id"]),
+            request_id: json!(request_id),
+            summary: format!("{action} {}", resources.join(" ")),
             kind: action,
             outcome: ApprovalOutcome::Pending,
-            raw: req.raw,
+            raw: req,
         };
         // Deny only requests of the turn being observed: while the message is still
         // queued, whatever asks belongs to the execution before it.
         if w.policy == ApprovalPolicy::Deny && delivered {
-            a.outcome = match svc.reject(w.session_id, &req.id, DENY_MESSAGE).await {
+            a.outcome = match svc.reject(w.session_id, &request_id, DENY_MESSAGE).await {
                 Ok(()) => ApprovalOutcome::Declined,
                 // Gone already: one reject answers every pending request of the session
                 // (DESIGN.md §6.3), or someone else replied first.
@@ -302,7 +312,7 @@ impl<'a> OpenCode<'a> {
                 };
             };
             match ev {
-                Event::PermissionAsked { data } if data.session_id == session_id => {
+                Event::PermissionAsked { data } if data["sessionID"] == session_id => {
                     self.on_permission(svc, w, data).await?;
                 }
                 Event::PermissionReplied { data } if data.session_id == session_id => {
