@@ -5,12 +5,11 @@
 
 use super::acp::{Conn, Event, Response};
 use super::handle;
-use super::updates::{self, SessionUpdate, ToolCall};
+use super::updates;
 use crate::agents::history::first_line;
 use crate::agents::lifecycle::{ApprovalPolicy, record, resolve};
 use crate::model::{self, Approval, ApprovalOutcome, Error, ErrorCode, Progress, Result};
 use crate::store::Store;
-use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashSet;
 
@@ -318,14 +317,15 @@ impl<'s> Watch<'s> {
                     *running = true;
                 }
                 self.accept()?;
-                match SessionUpdate::of(params) {
-                    SessionUpdate::AgentMessageChunk { content } => {
-                        self.text.push_str(content.text.as_deref().unwrap_or(""))
-                    }
-                    SessionUpdate::ToolCall(call) => {
+                let u = &params["update"];
+                match updates::kind(u) {
+                    "agent_message_chunk" => self
+                        .text
+                        .push_str(u["content"]["text"].as_str().unwrap_or("")),
+                    "tool_call" => {
                         self.text.clear();
-                        if let Some(id) = call.tool_call_id {
-                            self.tools.insert(id);
+                        if let Some(id) = u["toolCallId"].as_str() {
+                            self.tools.insert(id.to_string());
                         }
                     }
                     _ => {}
@@ -346,11 +346,12 @@ impl<'s> Watch<'s> {
             }
             "_x.ai/session_notification" => {
                 // Someone answered (or agent-talk's own answer took effect).
-                if let SessionUpdate::InteractionResolved { tool_call_id } =
-                    SessionUpdate::of(params)
+                let u = &params["update"];
+                if updates::kind(u) == "interaction_resolved"
+                    && let Some(call_id) = u["tool_call_id"].as_str()
                 {
                     resolve(self.store, &mut self.approvals, |a| {
-                        a.item_id.as_ref() == Some(&tool_call_id)
+                        a.item_id.as_deref() == Some(call_id)
                     });
                 }
             }
@@ -364,21 +365,18 @@ impl<'s> Watch<'s> {
     /// tool calls (matched by `toolCallId`; through a leader, other clients' turns raise
     /// them too) get the `reject_once` option.
     fn on_permission(&self, request_id: Value, params: Value) -> Option<(Approval, Option<Value>)> {
-        let call = ToolCall::deserialize(&params["toolCall"]).unwrap_or_default();
+        let call = &params["toolCall"];
+        let call_id = call["toolCallId"].as_str().map(String::from);
         // A request already recorded is not answered again. Unverified whether Grok
         // ever sends the same request twice to one client.
         if self
             .approvals
             .iter()
-            .any(|a| a.request_id == request_id && a.item_id == call.tool_call_id)
+            .any(|a| a.request_id == request_id && a.item_id == call_id)
         {
             return None;
         }
-        let ours = !self.shared
-            || call
-                .tool_call_id
-                .as_ref()
-                .is_some_and(|c| self.tools.contains(c));
+        let ours = !self.shared || call_id.as_ref().is_some_and(|c| self.tools.contains(c));
         let reject = params["options"]
             .as_array()
             .into_iter()
@@ -392,8 +390,8 @@ impl<'s> Watch<'s> {
             _ => None,
         };
         // As `read` shows the tool call: name and main argument.
-        let summary = match call.name() {
-            Some(name) => first_line(&format!("{name}{}", call.detail()), 160),
+        let summary = match updates::tool_name(call) {
+            Some(name) => first_line(&format!("{name}{}", updates::tool_detail(call)), 160),
             None => "permission request".into(),
         };
         let a = Approval {
@@ -403,7 +401,7 @@ impl<'s> Watch<'s> {
             } else {
                 None
             },
-            item_id: call.tool_call_id,
+            item_id: call_id,
             request_id,
             kind: REQUEST_PERMISSION.into(),
             summary,

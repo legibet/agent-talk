@@ -2,6 +2,10 @@
 //! updates as persisted, one JSON object per line, append-only (DESIGN.md §6.4). Streamed
 //! chunks are coalesced on disk: one `agent_message_chunk` line per stretch of text.
 //!
+//! An update (`params.update`, as Grok sends it live in `session/update` and
+//! `_x.ai/session_notification`) stays the `Value` it was, read field by field: a field of
+//! an unexpected type reads as absent and never hides the update (DESIGN.md §3).
+//!
 //! Turns: a `user_message_chunk` with `_meta.promptIndex` opens one, a `turn_completed
 //! {prompt_id, stop_reason}` closes it. Lines the agent writes during a turn carry its
 //! prompt id in `params._meta.promptId`, and the turn id is that prompt id (the
@@ -11,162 +15,69 @@
 //! prompt id where they carry one and by position otherwise, and the last
 //! `turn_completed` of a prompt id is its end.
 
-use crate::agents::decode::or_default;
 use crate::agents::history::first_line;
 use crate::model::{self, Error, Message, Phase, Result, Role, TurnStatus};
-use serde::Deserialize;
 use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
-/// One ACP session update (`params.update`), as Grok sends it live (`session/update`,
-/// `_x.ai/session_notification`) and persists it in `updates.jsonl`. Unknown kinds, and
-/// known ones whose fields do not decode, are `Other`.
-#[derive(Debug, Deserialize)]
-#[serde(tag = "sessionUpdate", rename_all = "snake_case")]
-pub enum SessionUpdate {
-    UserMessageChunk {
-        #[serde(default, deserialize_with = "or_default")]
-        content: Content,
-        #[serde(rename = "_meta", default, deserialize_with = "or_default")]
-        meta: PromptMeta,
-    },
-    AgentMessageChunk {
-        #[serde(default, deserialize_with = "or_default")]
-        content: Content,
-    },
-    ToolCall(ToolCall),
-    #[serde(rename_all = "camelCase")]
-    ToolCallUpdate {
-        #[serde(default, deserialize_with = "or_default")]
-        tool_call_id: Option<String>,
-        #[serde(default, deserialize_with = "or_default")]
-        status: Option<String>,
-    },
-    TurnCompleted {
-        #[serde(default, deserialize_with = "or_default")]
-        prompt_id: Option<String>,
-        #[serde(default, deserialize_with = "or_default")]
-        stop_reason: Option<String>,
-        #[serde(default, deserialize_with = "or_default")]
-        elapsed_ms: Option<i64>,
-    },
-    /// Live only: the permission request of this tool call was answered.
-    InteractionResolved {
-        tool_call_id: String,
-    },
-    #[serde(other)]
-    Other,
+/// The kind of a session update (`sessionUpdate`); empty when it names none.
+pub fn kind(update: &Value) -> &str {
+    update["sessionUpdate"].as_str().unwrap_or_default()
 }
 
-impl SessionUpdate {
-    /// The update in a notification's (or a line's) `params`.
-    pub fn of(params: &Value) -> SessionUpdate {
-        SessionUpdate::deserialize(&params["update"]).unwrap_or(SessionUpdate::Other)
-    }
-
-    /// A user prompt that opens a turn; steer messages (`interjection`) join the running
-    /// one.
-    fn opens_turn(&self) -> bool {
-        matches!(self, SessionUpdate::UserMessageChunk { meta, .. }
-            if meta.prompt_index.is_some() && !meta.interjection)
-    }
+/// A user prompt that opens a turn; steer messages (`interjection`) join the running one.
+fn opens_turn(update: &Value) -> bool {
+    let meta = &update["_meta"];
+    kind(update) == "user_message_chunk"
+        && meta["promptIndex"].is_u64()
+        && meta["interjection"] != true
 }
 
-#[derive(Debug, Default, Deserialize)]
-pub struct Content {
-    #[serde(default, deserialize_with = "or_default")]
-    pub text: Option<String>,
-    #[serde(rename = "_meta", default, deserialize_with = "or_default")]
-    meta: ContentMeta,
+/// The name of a tool call (a `tool_call` update, or a permission request's `toolCall`):
+/// `_meta["x.ai/tool"].name` (`run_terminal_command`), else the title; `read` and approval
+/// summaries use the same name.
+pub fn tool_name(call: &Value) -> Option<&str> {
+    call["_meta"]["x.ai/tool"]["name"]
+        .as_str()
+        .or(call["title"].as_str())
 }
 
-#[derive(Debug, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ContentMeta {
-    /// A steer message's own text; `text` wraps it in instructions to the model.
-    #[serde(default, deserialize_with = "or_default")]
-    display_text: Option<String>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PromptMeta {
-    #[serde(default, deserialize_with = "or_default")]
-    prompt_index: Option<u64>,
-    #[serde(default, deserialize_with = "or_default")]
-    interjection: bool,
-}
-
-/// A tool call as a `tool_call` update or a `session/request_permission` describes it.
-#[derive(Debug, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ToolCall {
-    #[serde(default, deserialize_with = "or_default")]
-    pub tool_call_id: Option<String>,
-    #[serde(default, deserialize_with = "or_default")]
-    title: Option<String>,
-    #[serde(default)]
-    raw_input: Value,
-    #[serde(default, deserialize_with = "or_default")]
-    status: Option<String>,
-    #[serde(rename = "_meta", default, deserialize_with = "or_default")]
-    meta: ToolMeta,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct ToolMeta {
-    #[serde(rename = "x.ai/tool", default, deserialize_with = "or_default")]
-    tool: Option<ToolInfo>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ToolInfo {
-    #[serde(default, deserialize_with = "or_default")]
-    name: Option<String>,
-}
-
-impl ToolCall {
-    /// `_meta["x.ai/tool"].name` (`run_terminal_command`), else the title; `read` and
-    /// approval summaries use the same name.
-    pub fn name(&self) -> Option<&str> {
-        let tool = self.meta.tool.as_ref().and_then(|t| t.name.as_deref());
-        tool.or(self.title.as_deref())
-    }
-
-    /// ` <first line of the input's main argument>`, or nothing.
-    pub fn detail(&self) -> String {
-        [
-            "command",
-            "file_path",
-            "path",
-            "url",
-            "query",
-            "description",
-        ]
-        .iter()
-        .find_map(|k| self.raw_input[k].as_str())
-        .map(|d| format!(" {}", first_line(d, 120)))
-        .unwrap_or_default()
-    }
+/// ` <first line of the tool call's main argument>`, or nothing.
+pub fn tool_detail(call: &Value) -> String {
+    let input = &call["rawInput"];
+    [
+        "command",
+        "file_path",
+        "path",
+        "url",
+        "query",
+        "description",
+    ]
+    .iter()
+    .find_map(|k| input[k].as_str())
+    .map(|d| format!(" {}", first_line(d, 120)))
+    .unwrap_or_default()
 }
 
 pub struct Line {
     /// 1-based line number in the file, the item id.
     pub no: usize,
     pub raw: Value,
-    update: SessionUpdate,
 }
 
 impl Line {
+    fn update(&self) -> &Value {
+        &self.raw["params"]["update"]
+    }
+
     /// The prompt id a line names: `turn_completed.prompt_id`, else `params._meta.promptId`.
     fn prompt_id(&self) -> Option<&str> {
-        match &self.update {
-            SessionUpdate::TurnCompleted {
-                prompt_id: Some(p), ..
-            } => Some(p),
+        let u = self.update();
+        match u["prompt_id"].as_str() {
+            Some(p) if kind(u) == "turn_completed" => Some(p),
             _ => self.raw["params"]["_meta"]["promptId"].as_str(),
         }
     }
@@ -176,12 +87,8 @@ pub fn parse(text: &str) -> Vec<Line> {
     text.lines()
         .enumerate()
         .filter_map(|(i, l)| {
-            let raw: Value = serde_json::from_str(l).ok()?;
-            Some(Line {
-                no: i + 1,
-                update: SessionUpdate::of(&raw["params"]),
-                raw,
-            })
+            let raw = serde_json::from_str(l).ok()?;
+            Some(Line { no: i + 1, raw })
         })
         .collect()
 }
@@ -218,7 +125,7 @@ impl History {
         let mut owner = Vec::with_capacity(lines.len());
         let mut current: Option<usize> = None;
         for (i, l) in lines.iter().enumerate() {
-            if l.update.opens_turn() {
+            if opens_turn(l.update()) {
                 spans.push(Span {
                     start: i,
                     id: None,
@@ -226,7 +133,7 @@ impl History {
                 });
                 current = Some(spans.len() - 1);
             }
-            let completed = matches!(l.update, SessionUpdate::TurnCompleted { .. });
+            let completed = kind(l.update()) == "turn_completed";
             let prompt = l.prompt_id();
             let this = match prompt {
                 Some(p) => match spans.iter().rposition(|s| s.id.as_deref() == Some(p)) {
@@ -303,23 +210,25 @@ impl History {
                 from: None,
                 timestamp: at.clone(),
             };
-            match &l.update {
-                SessionUpdate::UserMessageChunk { content, .. } => {
-                    let text = content
-                        .meta
-                        .display_text
-                        .as_deref()
-                        .or(content.text.as_deref())
+            let u = l.update();
+            match kind(u) {
+                "user_message_chunk" => {
+                    // A steer message's own text; `text` wraps it in instructions to the
+                    // model.
+                    let content = &u["content"];
+                    let text = content["_meta"]["displayText"]
+                        .as_str()
+                        .or(content["text"].as_str())
                         .unwrap_or("");
                     out.push(Msg {
                         line: i,
                         span,
-                        prompt: l.update.opens_turn(),
+                        prompt: opens_turn(u),
                         message: message(Role::User, Phase::Prompt, text.to_string()),
                     });
                 }
-                SessionUpdate::AgentMessageChunk { content } => {
-                    let text = content.text.as_deref().unwrap_or("");
+                "agent_message_chunk" => {
+                    let text = u["content"]["text"].as_str().unwrap_or("");
                     let extends = out.last().is_some_and(|m| {
                         m.span == span
                             && m.message.role == Role::Assistant
@@ -335,12 +244,12 @@ impl History {
                         }),
                     }
                 }
-                SessionUpdate::ToolCall(call) => {
-                    let Some(id) = call.tool_call_id.as_deref() else {
+                "tool_call" => {
+                    let Some(id) = u["toolCallId"].as_str() else {
                         continue;
                     };
-                    let (name, detail) = (call.name().unwrap_or("tool"), call.detail());
-                    let status = call.status.as_deref().unwrap_or("pending");
+                    let (name, detail) = (tool_name(u).unwrap_or("tool"), tool_detail(u));
+                    let status = u["status"].as_str().unwrap_or("pending");
                     out.push(Msg {
                         line: i,
                         span,
@@ -353,11 +262,11 @@ impl History {
                     });
                     tools.insert(id, (out.len() - 1, name, detail));
                 }
-                SessionUpdate::ToolCallUpdate {
-                    tool_call_id: Some(id),
-                    status: Some(status),
-                } => {
-                    if let Some((idx, name, detail)) = tools.get(id.as_str()) {
+                "tool_call_update" => {
+                    if let Some((idx, name, detail)) =
+                        u["toolCallId"].as_str().and_then(|id| tools.get(id))
+                        && let Some(status) = u["status"].as_str()
+                    {
                         out[*idx].message.text = tool_text(name, status, detail);
                     }
                 }
@@ -378,19 +287,8 @@ impl History {
     /// The finished turn of a span: status from `stop_reason`, the final message as
     /// `final_text`.
     pub fn turn(&self, handle: String, span: usize, messages: &[Msg]) -> Option<model::Turn> {
-        let end = &self.lines[self.spans[span].end?];
-        let SessionUpdate::TurnCompleted {
-            stop_reason,
-            elapsed_ms,
-            ..
-        } = &end.update
-        else {
-            return None;
-        };
-        let (status, error) = status(
-            stop_reason.as_deref().unwrap_or(""),
-            &end.raw["params"]["update"],
-        );
+        let end = self.lines[self.spans[span].end?].update();
+        let (status, error) = status(end["stop_reason"].as_str().unwrap_or(""), end);
         Some(model::Turn {
             handle,
             turn_id: self.turn_id(span).into_owned(),
@@ -400,7 +298,7 @@ impl History {
                 .iter()
                 .find(|m| m.span == Some(span) && m.message.phase == Phase::Final)
                 .map(|m| m.message.text.clone()),
-            duration_ms: *elapsed_ms,
+            duration_ms: end["elapsed_ms"].as_i64(),
             basis: Some("updates.jsonl turn_completed".into()),
         })
     }
@@ -436,17 +334,15 @@ pub fn status(stop_reason: &str, detail: &Value) -> (TurnStatus, Option<Value>) 
 /// Text of the first user prompt, for `ls` previews.
 pub fn first_prompt(path: &Path) -> Option<String> {
     let f = std::fs::File::open(path).ok()?;
-    let update = BufReader::new(f)
+    let raw = BufReader::new(f)
         .lines()
         .map_while(std::result::Result::ok)
         .take(2000)
         .filter_map(|l| serde_json::from_str::<Value>(&l).ok())
-        .map(|raw| SessionUpdate::of(&raw["params"]))
-        .find(SessionUpdate::opens_turn)?;
-    match update {
-        SessionUpdate::UserMessageChunk { content, .. } => content.text,
-        _ => None,
-    }
+        .find(|raw| opens_turn(&raw["params"]["update"]))?;
+    raw["params"]["update"]["content"]["text"]
+        .as_str()
+        .map(String::from)
 }
 
 #[cfg(test)]
@@ -590,17 +486,16 @@ mod tests {
     /// close it.
     #[test]
     fn odd_fields_keep_turn_markers() {
-        let update = |s: &str| SessionUpdate::of(&serde_json::from_str::<Value>(s).unwrap());
-        let open = update(
-            r#"{"update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":7},"_meta":{"promptIndex":0,"interjection":null}}}"#,
+        let h = History::new(parse(concat!(
+            r#"{"params":{"update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":7},"_meta":{"promptIndex":0,"interjection":null}}}}"#,
+            "\n",
+            r#"{"params":{"update":{"sessionUpdate":"turn_completed","prompt_id":"p","stop_reason":"end_turn","elapsed_ms":1.5}}}"#,
+        )));
+        assert_eq!((h.spans.len(), h.spans[0].end), (1, Some(1)));
+        let t = h.turn("grok:s".into(), 0, &h.messages()).unwrap();
+        assert_eq!(
+            (t.turn_id.as_str(), t.status, t.duration_ms),
+            ("p", TurnStatus::Completed, None)
         );
-        assert!(open.opens_turn());
-        let end = update(
-            r#"{"update":{"sessionUpdate":"turn_completed","prompt_id":"p","stop_reason":"end_turn","elapsed_ms":1.5}}"#,
-        );
-        assert!(matches!(
-            end,
-            SessionUpdate::TurnCompleted { prompt_id: Some(ref p), elapsed_ms: None, .. } if p == "p"
-        ));
     }
 }
