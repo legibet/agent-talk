@@ -69,25 +69,27 @@ pub struct StepUpdate {
     text_delta: Option<String>,
 }
 
-/// The `result` event's payload, kept raw for `AgentError.data`.
-#[derive(Debug, Deserialize)]
-pub struct RunResult {
-    /// SUCCESS | ERROR
-    status: Option<String>,
-    error: Option<String>,
-    /// Tools headless agy denied (not allow-listed in the user's settings.json); passed
-    /// through as `Approval.raw`.
-    #[serde(default)]
-    denied_actions: Vec<Value>,
-    #[serde(skip)]
-    raw: Value,
-}
+/// The `result` event's payload. The event ends the turn whatever its fields hold, and the
+/// payload passes through as `AgentError.data`, so it stays as agy wrote it.
+#[derive(Debug)]
+pub struct RunResult(Value);
 
 impl RunResult {
-    /// `None` for a payload these fields do not fit: it does not end the turn.
-    fn decode(raw: Value) -> Option<RunResult> {
-        let r = RunResult::deserialize(&raw).ok()?;
-        Some(RunResult { raw, ..r })
+    /// SUCCESS | ERROR
+    fn status(&self) -> Option<&str> {
+        self.0["status"].as_str()
+    }
+
+    fn error(&self) -> Option<&str> {
+        self.0["error"].as_str()
+    }
+
+    /// Tools headless agy denied (not allow-listed in the user's settings.json); passed
+    /// through as `Approval.raw`.
+    fn denied_actions(&self) -> &[Value] {
+        self.0["denied_actions"]
+            .as_array()
+            .map_or(&[], Vec::as_slice)
     }
 }
 
@@ -130,7 +132,7 @@ impl Run {
                 }
                 _ => {}
             },
-            Event::Result { result } => self.result = RunResult::decode(result),
+            Event::Result { result } => self.result = Some(RunResult(result)),
             Event::Other => {}
         }
     }
@@ -153,7 +155,7 @@ impl Run {
     /// The turn, once the run ended with `result`.
     pub fn turn(&self, handle: String) -> Option<model::Turn> {
         let result = self.result.as_ref()?;
-        let failed = result.status.as_deref() != Some("SUCCESS");
+        let failed = result.status() != Some("SUCCESS");
         Some(model::Turn {
             handle,
             turn_id: self.turn_id().unwrap_or_default(),
@@ -162,7 +164,7 @@ impl Run {
             } else {
                 TurnStatus::Completed
             },
-            error: failed.then(|| json!({"status": result.status, "error": result.error})),
+            error: failed.then(|| json!({"status": result.status(), "error": result.error()})),
             final_text: self.final_text(),
             // `duration_seconds`, `num_turns` and `usage` are conversation totals on a resumed
             // conversation, not this turn's.
@@ -173,7 +175,7 @@ impl Run {
 
     /// `result.denied_actions` as approvals: the denial ended the turn.
     pub fn denials(&self, handle: &str, receipt_id: &str) -> Vec<Approval> {
-        let denied = self.result.iter().flat_map(|r| &r.denied_actions);
+        let denied = self.result.iter().flat_map(|r| r.denied_actions());
         denied
             .enumerate()
             .map(|(i, d)| Approval {
@@ -206,10 +208,10 @@ pub fn agent_error(
 ) -> AgentError {
     let mut e = runs.startup_error(receipt_id, status);
     if let Some(result) = &run.result {
-        if let Some(m) = result.error.as_deref().filter(|m| !m.is_empty()) {
+        if let Some(m) = result.error().filter(|m| !m.is_empty()) {
             e.message = m.to_string();
         }
-        e.data = Some(result.raw.clone());
+        e.data = Some(result.0.clone());
     }
     e
 }
