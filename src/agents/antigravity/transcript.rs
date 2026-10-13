@@ -15,7 +15,6 @@ use std::path::Path;
 /// One line of `transcript.jsonl`: one step, written when it first finishes or runs.
 #[derive(Debug, Deserialize)]
 struct Step {
-    #[serde(default)]
     step_index: Option<i64>,
     /// USER_INPUT | PLANNER_RESPONSE | SYSTEM_MESSAGE | GENERIC | RUN_COMMAND | …
     /// Required: a line without it is not a step.
@@ -26,9 +25,7 @@ struct Step {
     source: String,
     #[serde(default)]
     status: String,
-    #[serde(default)]
     created_at: Option<String>,
-    #[serde(default)]
     content: Option<String>,
     #[serde(default)]
     tool_calls: Vec<ToolCall>,
@@ -124,10 +121,15 @@ pub fn preview(path: &Path) -> (bool, Option<String>) {
 
 /// Line position of the USER_INPUT step whose index is `turn_id`.
 pub fn user_input(lines: &[Entry], turn_id: &str) -> Option<usize> {
+    // Only the decimal form names a step: `07` is no turn id.
+    let index = turn_id
+        .parse::<i64>()
+        .ok()
+        .filter(|n| n.to_string() == turn_id)?;
     lines.iter().position(|l| {
-        l.step.as_ref().is_some_and(|s| {
-            s.is_user() && s.step_index.map(|n| n.to_string()).as_deref() == Some(turn_id)
-        })
+        l.step
+            .as_ref()
+            .is_some_and(|s| s.is_user() && s.step_index == Some(index))
     })
 }
 
@@ -434,6 +436,7 @@ mod tests {
     fn transcript_turn_bounds() {
         let chat = parse_entries(CHAT);
         assert_eq!(user_input(&chat, "2"), Some(2));
+        assert_eq!(user_input(&chat, "02"), None);
         // Step 1 is a planner response, not a USER_INPUT.
         assert_eq!(user_input(&chat, "1"), None);
         // Turn 0 is bounded by the next USER_INPUT and ends with a reply.

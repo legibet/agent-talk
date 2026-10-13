@@ -8,21 +8,19 @@
 //! running when the command stops observing, and its pid is recorded, as for Claude.
 //!
 //! History comes from Antigravity's files under `~/.gemini/antigravity-cli/`: the per-
-//! conversation `brain/<id>/.system_generated/logs/transcript.jsonl` (lossy, see `status`),
-//! the shared `conversation_summaries.db` (read-only, in place) and `presence/<id>.lock`,
-//! which the process that has a conversation open keeps flocked. agy itself ignores that
-//! lock, so agent-talk refuses to write while it is held.
+//! conversation `brain/<id>/.system_generated/logs/transcript.jsonl` (lossy, see
+//! `TRANSCRIPT_LOSSES`), the shared `conversation_summaries.db` (read-only, in place) and
+//! `presence/<id>.lock`, which the process that has a conversation open keeps flocked. agy
+//! itself ignores that lock, so agent-talk refuses to write while it is held.
 //!
 //! Approvals: headless agy denies every tool the user's `settings.json` does not allow and
 //! ends the turn; nothing is pending and there is nothing to answer. The denials arrive as
 //! `result.denied_actions` and are recorded as `denied`.
 
-mod process;
-mod stream;
+mod run;
 mod transcript;
 
-use self::process::{agent_error, args, wait_init};
-use self::stream::{Event, Run, decode, denials, result_turn};
+use self::run::{Event, Run, agent_error, args, decode, wait_init};
 use self::transcript::{
     ends_with_reply, load, messages, preview, span_reply, turn_span, user_input,
 };
@@ -95,33 +93,26 @@ impl RunWatch {
             }
             return Ok(());
         };
-        match &ev {
-            // agy starts a new conversation, with a warning only, when it does not find the
-            // id (DESIGN.md §6.5).
-            Event::Init { conversation_id } if *conversation_id != self.id => {
-                return Err(Error::new(
-                    ErrorCode::Precondition,
-                    format!(
-                        "agy ran the message in conversation {} instead of {} (agy starts a new conversation when it does not find the id); see {}",
-                        handle(conversation_id),
-                        handle(&self.id),
-                        handle(conversation_id)
-                    ),
-                ));
-            }
-            Event::StepUpdate { step_update: s }
-                if s.step_type == "user_input" && self.run.turn_id().is_none() =>
-            {
-                store.accept(
-                    &self.receipt_id,
-                    None,
-                    Some(&s.step_index.to_string()),
-                    None,
-                )?;
-            }
-            _ => {}
+        // agy starts a new conversation, with a warning only, when it does not find the id
+        // (DESIGN.md §6.5).
+        if let Event::Init { conversation_id } = &ev
+            && *conversation_id != self.id
+        {
+            return Err(Error::new(
+                ErrorCode::Precondition,
+                format!(
+                    "agy ran the message in conversation {} instead of {} (agy starts a new conversation when it does not find the id); see {}",
+                    handle(conversation_id),
+                    handle(&self.id),
+                    handle(conversation_id)
+                ),
+            ));
         }
-        self.run.apply(&ev);
+        let accepted = self.run.turn_id().is_some();
+        self.run.apply(ev);
+        if !accepted && let Some(t) = self.run.turn_id() {
+            store.accept(&self.receipt_id, None, Some(&t), None)?;
+        }
         Ok(())
     }
 }
@@ -137,6 +128,9 @@ struct Summary {
     /// rewritten since an older version.
     status: String,
 }
+
+/// The summary status during a turn; a killed run may leave it (DESIGN.md §6.5).
+const RUNNING: &str = "CASCADE_RUN_STATUS_RUNNING";
 
 const SUMMARY_COLUMNS: &str = "conversation_id, title, last_modified_time, workspace_uris, status";
 
@@ -261,6 +255,28 @@ impl<'a> Antigravity<'a> {
         Ok(summary)
     }
 
+    /// The directory a `send` runs agy in. agy makes its process cwd the conversation's
+    /// workspace, so one is never picked silently: the cwd agent-talk started the
+    /// conversation in, else the summary's workspace while it exists.
+    fn conversation_cwd(&self, h: &str, summary: Option<Summary>) -> Result<String> {
+        if let Some(c) = self.store.owned_cwd(h)? {
+            return Ok(c);
+        }
+        match summary.and_then(|s| s.cwd) {
+            Some(c) if Path::new(&c).is_dir() => Ok(c),
+            Some(c) => Err(Error::new(
+                ErrorCode::Precondition,
+                format!(
+                    "the conversation's workspace {c} no longer exists; agy would run it elsewhere"
+                ),
+            )),
+            None => Err(Error::new(
+                ErrorCode::Precondition,
+                "conversation_summaries.db records no workspace for this conversation",
+            )),
+        }
+    }
+
     /// Whether some process has the conversation open: a non-blocking flock on
     /// `presence/<id>.lock` fails while agy (TUI or `-p`) holds it. An absent file is
     /// unheld; any other failure is an error, never "held".
@@ -327,7 +343,7 @@ impl<'a> Antigravity<'a> {
             let e = Error::from_agent(ErrorCode::Precondition, e);
             return Err(reject_unstarted(self.store, receipt_id, e));
         };
-        let Some(result) = &run.result else {
+        let Some(turn) = run.turn(h.to_string()) else {
             let turn = model::Turn {
                 handle: h.to_string(),
                 turn_id,
@@ -344,11 +360,11 @@ impl<'a> Antigravity<'a> {
             };
             return Ok((turn, Vec::new()));
         };
-        let approvals = denials(h, &turn_id, receipt_id, result);
+        let approvals = run.denials(h, receipt_id);
         for a in &approvals {
             record(self.store, a);
         }
-        Ok((result_turn(h.to_string(), run, result), approvals))
+        Ok((turn, approvals))
     }
 
     /// Write the message, close stdin, and observe the run to its `result` (or until
@@ -389,15 +405,8 @@ impl<'a> Antigravity<'a> {
     }
 
     /// A turn agent-talk did not run (or whose run log is gone), from the transcript
-    /// (DESIGN.md §6.5): the USER_INPUT `turn_id` must exist; the turn is
-    /// bounded by the next USER_INPUT, or by a final reply while no process holds the
-    /// conversation and the summary is not RUNNING. `Ok(Err(w))`: still open, `w` says what
-    /// the check is waiting for.
-    fn foreign_turn(
-        &self,
-        id: &str,
-        turn_id: &str,
-    ) -> Result<std::result::Result<model::Turn, String>> {
+    /// (DESIGN.md §6.5): the USER_INPUT `turn_id` must exist, and `foreign_end` decides.
+    fn foreign_turn(&self, id: &str, turn_id: &str) -> Result<Foreign> {
         let lines = load(&self.transcript_path(id))?;
         let Some(start) = user_input(&lines, turn_id) else {
             return Err(Error::new(
@@ -410,58 +419,142 @@ impl<'a> Antigravity<'a> {
         };
         let (end, closed) = turn_span(&lines, start);
         let span = &lines[start..end];
-        let replied = ends_with_reply(span);
-        let turn = |status, basis: String| model::Turn {
+        // The presence lock and the summary count only while no later USER_INPUT closes
+        // the turn.
+        let (held, status) = if closed {
+            (false, String::new())
+        } else {
+            let held = self.presence_held(id)?;
+            (
+                held,
+                self.summary(id)?.map(|s| s.status).unwrap_or_default(),
+            )
+        };
+        let turn = model::Turn {
             handle: handle(id),
             turn_id: turn_id.to_string(),
-            status,
+            status: TurnStatus::Unknown,
             error: None,
             final_text: span_reply(span),
             duration_ms: None,
-            basis: Some(format!(
-                "{basis}; the transcript is lossy: {TRANSCRIPT_LOSSES}"
-            )),
+            basis: None,
         };
-        if closed {
-            return Ok(Ok(turn(
-                if replied {
-                    TurnStatus::Completed
-                } else {
-                    TurnStatus::Unknown
-                },
-                "transcript-derived: a later USER_INPUT exists".into(),
-            )));
-        }
-        let held = self.presence_held(id)?;
-        let status = self.summary(id)?.map(|s| s.status).unwrap_or_default();
-        if held {
-            return Ok(Err(format!(
-                "transcript-derived: waiting for a later USER_INPUT, or for the presence lock to be released after a final reply (held by some agy process; summary status {status:?})"
-            )));
-        }
-        // Nobody holds the conversation, so nothing will add to the turn.
-        let running = status == "CASCADE_RUN_STATUS_RUNNING";
-        Ok(Ok(if replied && !running {
-            turn(
-                TurnStatus::Completed,
-                format!(
-                    "transcript-derived, best effort: the turn ends with a reply without tool calls, no process holds the conversation and the summary status is {status:?}"
-                ),
-            )
-        } else {
-            turn(
-                TurnStatus::Unknown,
-                format!(
-                    "transcript-derived: no process holds the conversation, the summary status is {status:?} (a killed run may leave RUNNING) and the transcript {} (a denied tool ends the turn without a reply)",
-                    if replied {
-                        "ends with a reply"
-                    } else {
-                        "does not end with a reply"
-                    }
-                ),
-            )
-        }))
+        Ok(foreign_end(
+            turn,
+            closed,
+            ends_with_reply(span),
+            held,
+            &status,
+        ))
     }
+}
+
+/// Where a turn agent-talk did not run stands.
+enum Foreign {
+    /// Still open: what the check is waiting for.
+    Open(String),
+    Ended(model::Turn),
+}
+
+/// The rule for a turn agent-talk did not run (DESIGN.md §6.5), setting `turn`'s status and
+/// basis. A later USER_INPUT ends it (`closed`). Otherwise it is open while some process
+/// holds the conversation; once none does, nothing will add to it: completed when it ends
+/// with a reply (`replied`) and the summary `status` is not RUNNING, else unknown.
+fn foreign_end(
+    mut turn: model::Turn,
+    closed: bool,
+    replied: bool,
+    held: bool,
+    status: &str,
+) -> Foreign {
+    let (status, basis) = if closed {
+        let status = if replied {
+            TurnStatus::Completed
+        } else {
+            TurnStatus::Unknown
+        };
+        (
+            status,
+            "transcript-derived: a later USER_INPUT exists".into(),
+        )
+    } else if held {
+        return Foreign::Open(format!(
+            "transcript-derived: waiting for a later USER_INPUT, or for the presence lock to be released after a final reply (held by some agy process; summary status {status:?})"
+        ));
+    } else if replied && status != RUNNING {
+        (
+            TurnStatus::Completed,
+            format!(
+                "transcript-derived, best effort: the turn ends with a reply without tool calls, no process holds the conversation and the summary status is {status:?}"
+            ),
+        )
+    } else {
+        (
+            TurnStatus::Unknown,
+            format!(
+                "transcript-derived: no process holds the conversation, the summary status is {status:?} (a killed run may leave RUNNING) and the transcript {} (a denied tool ends the turn without a reply)",
+                if replied {
+                    "ends with a reply"
+                } else {
+                    "does not end with a reply"
+                }
+            ),
+        )
+    };
+    turn.status = status;
+    turn.basis = Some(format!(
+        "{basis}; the transcript is lossy: {TRANSCRIPT_LOSSES}"
+    ));
+    Foreign::Ended(turn)
+}
+
+/// A conversation's `ls` state and `loaded` (DESIGN.md §6.5): from agent-talk's own child
+/// when one runs it, else from the presence lock (`None` when it could not be checked) and
+/// whether the summary status is RUNNING. A killed run leaves RUNNING with the lock released.
+fn session_state(own_run: bool, held: Option<bool>, running: bool) -> (SessionState, Loaded) {
+    let state = match (own_run, held, running) {
+        (true, ..) | (false, Some(true), true) => SessionState::Running,
+        (false, Some(false), true) | (false, None, _) => SessionState::Unknown,
+        (false, Some(_), false) => SessionState::Idle,
+    };
+    let loaded = match (own_run, held) {
+        (true, _) | (_, Some(true)) => Loaded::Yes,
+        (false, Some(false)) => Loaded::No,
+        (false, None) => Loaded::Unknown,
+    };
+    (state, loaded)
+}
+
+/// `agy models` output: one line per model and effort, `gemini-3.8-flash-low\tGemini 3.8
+/// Flash (Low)`. `--model` takes the alias before the effort suffix, with that `--effort`
+/// (DESIGN.md §6.5), so the lines fold into the alias with its efforts.
+fn parse_models(out: &str) -> Vec<Model> {
+    let mut models: Vec<Model> = Vec::new();
+    for line in out.lines() {
+        let Some((id, name)) = line.split_once('\t') else {
+            continue;
+        };
+        let effort = name
+            .trim()
+            .rsplit_once(" (")
+            .and_then(|(_, e)| e.strip_suffix(')'))
+            .map(str::to_lowercase);
+        let alias = effort
+            .as_deref()
+            .and_then(|e| id.strip_suffix(e)?.strip_suffix('-'));
+        let (id, efforts) = match (alias, effort) {
+            (Some(alias), Some(effort)) => (alias, vec![effort]),
+            _ => (id, Vec::new()),
+        };
+        match models.iter_mut().find(|m| m.id == id) {
+            Some(m) => m.efforts.extend(efforts),
+            None => models.push(Model {
+                id: id.into(),
+                efforts,
+            }),
+        }
+    }
+    models
 }
 
 impl Agent for Antigravity<'_> {
@@ -481,35 +574,7 @@ impl Agent for Antigravity<'_> {
                 ),
             ));
         }
-        // One line per model and effort, `gemini-3.8-flash-low\tGemini 3.8 Flash (Low)`;
-        // `--model` takes the alias before the effort suffix, with that `--effort`
-        // (DESIGN.md §6.5).
-        let mut models: Vec<Model> = Vec::new();
-        for line in String::from_utf8_lossy(&out.stdout).lines() {
-            let Some((id, name)) = line.split_once('\t') else {
-                continue;
-            };
-            let effort = name
-                .trim()
-                .rsplit_once(" (")
-                .and_then(|(_, e)| e.strip_suffix(')'))
-                .map(str::to_lowercase);
-            let alias = effort
-                .as_deref()
-                .and_then(|e| id.strip_suffix(e)?.strip_suffix('-'));
-            let (id, efforts) = match (alias, effort) {
-                (Some(alias), Some(effort)) => (alias, vec![effort]),
-                _ => (id, Vec::new()),
-            };
-            match models.iter_mut().find(|m| m.id == id) {
-                Some(m) => m.efforts.extend(efforts),
-                None => models.push(Model {
-                    id: id.into(),
-                    efforts,
-                }),
-            }
-        }
-        Ok(models)
+        Ok(parse_models(&String::from_utf8_lossy(&out.stdout)))
     }
 
     async fn status(&self) -> AgentStatus {
@@ -569,19 +634,11 @@ impl Agent for Antigravity<'_> {
         for row in rows {
             let h = handle(&row.id);
             let owned = self.store.is_owned(&h)?;
-            let own_pid = self.own_run(&self.store.processes(&h)?);
+            let own_run = self.own_run(&self.store.processes(&h)?).is_some();
+            // A lock error leaves this row unknown rather than failing the whole listing
+            // (`send` treats it as fatal).
             let held = self.presence_held(&row.id).ok();
-            let running = row.status == "CASCADE_RUN_STATUS_RUNNING";
-            let state = if own_pid.is_some() {
-                SessionState::Running
-            } else {
-                // A killed run leaves RUNNING with the lock released.
-                match (held, running) {
-                    (Some(true), true) => SessionState::Running,
-                    (Some(false), true) | (None, _) => SessionState::Unknown,
-                    (Some(_), false) => SessionState::Idle,
-                }
-            };
+            let (state, loaded) = session_state(own_run, held, row.status == RUNNING);
             let (has_history, first_prompt) = preview(&self.transcript_path(&row.id));
             items.push(Session {
                 handle: h,
@@ -595,11 +652,7 @@ impl Agent for Antigravity<'_> {
                     } else {
                         History::Absent
                     },
-                    loaded: match (own_pid, held) {
-                        (Some(_), _) | (_, Some(true)) => Loaded::Yes,
-                        (None, Some(false)) => Loaded::No,
-                        (None, None) => Loaded::Unknown,
-                    },
+                    loaded,
                     origin: if owned { "agent-talk" } else { "antigravity" }.into(),
                 },
                 state,
@@ -618,12 +671,7 @@ impl Agent for Antigravity<'_> {
             ));
         }
         let receipt_id = uuid::Uuid::new_v4().to_string();
-        let args = args(
-            None,
-            req.settings.model.as_deref(),
-            req.settings.effort.as_deref(),
-            req.settings.full_access,
-        );
+        let args = args(None, req.settings);
         // No intent yet, so a spawn failure has no receipt to settle.
         let mut child = self
             .runs
@@ -682,36 +730,9 @@ impl Agent for Antigravity<'_> {
         let summary = self.require_conversation(id)?;
         let _lock = lock(&h, SECOND_WRITER)?;
         self.refuse_live(id)?;
-        // agy makes its process cwd the conversation's workspace: never pick one silently.
-        let cwd = match self.store.owned_cwd(&h)? {
-            Some(c) => c,
-            None => match summary.and_then(|s| s.cwd) {
-                Some(c) if Path::new(&c).is_dir() => c,
-                Some(c) => {
-                    return Err(Error::new(
-                        ErrorCode::Precondition,
-                        format!(
-                            "the conversation's workspace {c} no longer exists; agy would run it elsewhere"
-                        ),
-                    ));
-                }
-                None => {
-                    return Err(Error::new(
-                        ErrorCode::Precondition,
-                        "conversation_summaries.db records no workspace for this conversation",
-                    ));
-                }
-            },
-        };
+        let cwd = self.conversation_cwd(&h, summary)?;
         // A resumed conversation keeps none of its settings, so they all pass again.
-        let unset = Settings::default();
-        let settings = req.settings.unwrap_or(&unset);
-        let args = args(
-            Some(id),
-            settings.model.as_deref(),
-            settings.effort.as_deref(),
-            settings.full_access,
-        );
+        let args = args(Some(id), req.settings.unwrap_or(&Settings::default()));
         let receipt_id = uuid::Uuid::new_v4().to_string();
         self.store.insert_intent(&NewIntent {
             receipt_id: &receipt_id,
@@ -764,7 +785,6 @@ impl Agent for Antigravity<'_> {
             }
         };
         self.require_conversation(id)?;
-        let mut approvals = Vec::new();
         // The sending command stopped observing before the user step: accept the receipt
         // here, once, when the run log shows it.
         let mut unaccepted = receipt.as_ref().is_some_and(|r| r.turn_id.is_none());
@@ -786,9 +806,7 @@ impl Agent for Antigravity<'_> {
                     let pid = self.store.process(r)?;
                     if run.result.is_some() || !pid.is_some_and(pid_alive) {
                         // This command did not start the process: no exit code.
-                        let (turn, denied) = self.finished(&h, r, &run, None)?;
-                        approvals = denied;
-                        return Ok(turn);
+                        return self.finished(&h, r, &run, None);
                     }
                     waiting_for = format!(
                         "waiting for the result event of the agy process agent-talk started (pid {})",
@@ -805,16 +823,16 @@ impl Agent for Antigravity<'_> {
                     ));
                 };
                 match self.foreign_turn(id, t)? {
-                    Ok(turn) => return Ok(turn),
-                    Err(w) => waiting_for = w,
+                    Foreign::Ended(turn) => return Ok((turn, Vec::new())),
+                    Foreign::Open(w) => waiting_for = w,
                 }
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
         };
-        let res = bounded(Some(deadline), work)
-            .await
-            .map(Some)
-            .map_err(|e| note_waiting(e, &waiting_for));
+        let (res, approvals) = match bounded(Some(deadline), work).await {
+            Ok((turn, approvals)) => (Ok(Some(turn)), approvals),
+            Err(e) => (Err(note_waiting(e, &waiting_for)), Vec::new()),
+        };
         settle(
             self.store,
             h,
@@ -842,6 +860,79 @@ mod tests {
         let e = w.on_event(&s, init).unwrap_err();
         assert_eq!(e.code, ErrorCode::Precondition);
         assert!(e.message.contains("06615f44") && e.message.contains("11111111"));
+    }
+
+    /// The decision table of a turn agent-talk did not run.
+    #[test]
+    fn foreign_turn_rule() {
+        let end = |closed, replied, held, status| {
+            let turn = model::Turn {
+                handle: "antigravity:x".into(),
+                turn_id: "0".into(),
+                status: TurnStatus::Unknown,
+                error: None,
+                final_text: None,
+                duration_ms: None,
+                basis: None,
+            };
+            match foreign_end(turn, closed, replied, held, status) {
+                Foreign::Ended(t) => Some(t.status),
+                Foreign::Open(_) => None,
+            }
+        };
+        const IDLE: &str = "CASCADE_RUN_STATUS_IDLE";
+        // A later USER_INPUT ends the turn, whoever holds the lock.
+        assert_eq!(end(true, true, true, RUNNING), Some(TurnStatus::Completed));
+        assert_eq!(end(true, false, false, ""), Some(TurnStatus::Unknown));
+        // Open while some process holds the conversation.
+        assert_eq!(end(false, true, true, IDLE), None);
+        // Nobody holds it: a reply completes it unless the summary says RUNNING.
+        assert_eq!(end(false, true, false, IDLE), Some(TurnStatus::Completed));
+        assert_eq!(end(false, true, false, ""), Some(TurnStatus::Completed));
+        assert_eq!(end(false, true, false, RUNNING), Some(TurnStatus::Unknown));
+        assert_eq!(end(false, false, false, IDLE), Some(TurnStatus::Unknown));
+    }
+
+    #[test]
+    fn session_states() {
+        use {Loaded as L, SessionState as S};
+        assert_eq!(
+            session_state(true, Some(false), false),
+            (S::Running, L::Yes)
+        );
+        assert_eq!(session_state(true, None, false), (S::Running, L::Yes));
+        assert_eq!(session_state(false, Some(true), true), (S::Running, L::Yes));
+        assert_eq!(session_state(false, Some(true), false), (S::Idle, L::Yes));
+        // A killed run leaves RUNNING with the lock released.
+        assert_eq!(session_state(false, Some(false), true), (S::Unknown, L::No));
+        assert_eq!(session_state(false, Some(false), false), (S::Idle, L::No));
+        assert_eq!(session_state(false, None, false), (S::Unknown, L::Unknown));
+    }
+
+    #[test]
+    fn models_fold_efforts_into_aliases() {
+        // Literal `agy models` stdout (agy 1.3.4).
+        let out = "gemini-3.8-flash-high\tGemini 3.8 Flash (High)\ngemini-3.8-flash-medium\tGemini 3.8 Flash (Medium)\ngemini-3.8-flash-low\tGemini 3.8 Flash (Low)\nclaude-opus-5-5-low\tClaude Opus 5.5 (Low)\nclaude-opus-5-5-medium\tClaude Opus 5.5 (Medium)\nclaude-opus-5-5-high\tClaude Opus 5.5 (High)\ngpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n";
+        let models: Vec<(String, Vec<String>)> = parse_models(out)
+            .into_iter()
+            .map(|m| (m.id, m.efforts))
+            .collect();
+        let row = |id: &str, efforts: &[&str]| {
+            (
+                id.to_string(),
+                efforts.iter().map(|e| e.to_string()).collect(),
+            )
+        };
+        assert_eq!(
+            models,
+            [
+                row("gemini-3.8-flash", &["high", "medium", "low"]),
+                row("claude-opus-5-5", &["low", "medium", "high"]),
+                row("gpt-oss-120b", &["medium"]),
+            ]
+        );
+        // A line without an effort suffix keeps its id.
+        assert_eq!(parse_models("some-model\tSome Model\n")[0].id, "some-model");
     }
 
     #[test]

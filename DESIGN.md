@@ -96,7 +96,7 @@ src/
   agents/claude/       adapter, transcript rules, stream-json events, command line and `claude agents`
   agents/opencode/     adapter, history rows and turn rules, transport (HTTP + SSE, endpoints)
   agents/grok/         adapter, ACP client of a grok agent child, updates.jsonl rules
-  agents/antigravity/  adapter (summaries db, presence lock), transcript, stream, process
+  agents/antigravity/  adapter (summaries db, presence lock), transcript rules, the `agy -p` run
   agents/pi/           adapter, session file rules, the `pi --mode json` run
 tests/live.py          regression harness against the real agents; see tests/README.md
 skills/agent-talk/     the skill that teaches agents the CLI (installed with `npx skills add`)
