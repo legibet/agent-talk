@@ -49,11 +49,12 @@ in `tests/live.py`. Add a test only when it would catch a real regression. Pytho
 
 - Receipt and approval semantics live once in `src/agents/lifecycle.rs`; each adapter keeps its own
   observe loop (DESIGN.md §3, §7).
-- File records and events are decoded into small structs where that reads better than
-  `Value` indexing: optional fields default, unknown variants are tolerated, the raw record is
-  kept, and content a struct does not recognize never counts as a turn's end. Strict decoding,
-  where a failure is an error, only where it must be. Payloads agent-talk only passes through
-  stay `serde_json::Value`.
+- Records and events are decoded into small structs where the shape is stable or a decoding
+  failure should be an error. A record read for a few fields whose shape must be tolerated stays
+  `serde_json::Value` with accessors, as do payloads agent-talk only passes through. The tolerance
+  rules apply either way (DESIGN.md §3): an odd field never drops its record, an odd list entry
+  is skipped on its own, ids are required, the raw record is kept, and unrecognized content never
+  ends a turn.
 - Comments cite `DESIGN.md §N`; a fact about an agent that the design does not cover names the
   version it was observed on.
 - A behaviour change updates DESIGN.md, and `skills/agent-talk/SKILL.md` where it states that

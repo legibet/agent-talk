@@ -1,6 +1,5 @@
 //! Tolerant field decoders for the small structs records and events are decoded into: a
-//! field that does not fit never drops the record around it (DESIGN.md §3). For
-//! `#[serde(default, deserialize_with = "…")]`.
+//! field that does not fit never drops the record around it (DESIGN.md §3).
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer};

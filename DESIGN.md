@@ -98,15 +98,15 @@ ran. Adapters supply discovery, submission, the event source, history lookup and
 normalization, and each keeps its own observe loop, because what proves a turn ended differs
 between agents (§7).
 
-Agent records and events are decoded into small structs where that reads better than indexing JSON.
-Fields read for their content are decoded tolerantly, so that a field an agent writes differently
-does not lose a record, a listing or the end of a turn: optional fields default, unknown variants
-are tolerated, and a field that does not fit reads as its default (an odd list entry is skipped)
-where dropping the record would cost more (`agents/decode.rs`). The raw record is kept for `read
---raw` and error data, and content a struct does not recognize never counts as the end of a turn.
-Decoding is strict only where a failure must be an error, such as the ids that correlate a response
-or a record with agent-talk's own request. Payloads agent-talk only passes through stay
-`serde_json::Value`.
+Agent records and events are decoded into small structs where their shape is stable or a decoding
+failure must be an error, such as the ids that correlate a response or a record with agent-talk's
+own request. A record read for a few fields whose shape must be tolerated stays `serde_json::Value`
+with a few accessors, as do payloads agent-talk only passes through. The tolerance rules are the
+same either way, so that a field an agent writes differently does not lose a record, a listing or
+the end of a turn: a field that does not fit reads as absent or as its default and never drops its
+record (in a struct through `agents/decode.rs`), an odd list entry is skipped on its own, a record
+without the id it is used by is skipped, the raw record is kept for `read --raw` and error data,
+and content that is not recognized never counts as the end of a turn.
 
 ## 4. Model
 
