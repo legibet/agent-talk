@@ -4,7 +4,7 @@
 use super::session::{self, Body, Entry};
 use crate::model::{self, TurnStatus};
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::path::Path;
 use std::process::ExitStatus;
 
@@ -76,7 +76,15 @@ impl Run {
                 _ => {}
             },
             Ok(Event::AgentSettled) => self.settled = true,
-            _ => {}
+            Ok(Event::Other) => {}
+            // An assistant message this version cannot decode still replaces the one
+            // before it: the reply is then unknown, never an older message.
+            Err(_) => {
+                let v: Value = serde_json::from_str(line).unwrap_or_default();
+                if v["type"] == "message_end" && v["message"]["role"] == "assistant" {
+                    self.assistant = None;
+                }
+            }
         }
     }
 
