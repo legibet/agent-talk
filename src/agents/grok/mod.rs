@@ -23,7 +23,7 @@ use self::sessions::{Active, Summary};
 use self::updates::{History, first_prompt};
 use self::watch::{End, Watch};
 use crate::agents::child::{cli_version, lock, pid_alive};
-use crate::agents::decode::or_default;
+use crate::agents::decode::{entries, or_default};
 use crate::agents::history::{ReadPage, ReadQuery, cut, first_line};
 use crate::agents::lifecycle::{
     ApprovalPolicy, approval_policy, bounded, note_waiting, reject, settle, wait_receipt,
@@ -108,7 +108,7 @@ struct AvailableModel {
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ModelMeta {
-    #[serde(default, deserialize_with = "or_default")]
+    #[serde(default, deserialize_with = "entries")]
     reasoning_efforts: Vec<Effort>,
 }
 
