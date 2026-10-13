@@ -17,29 +17,28 @@ mod process;
 mod stream;
 mod transcript;
 
-use self::process::{AgentEntry, agents};
-use self::stream::{Run, StreamEvent, System, denial, result_turn};
+use self::process::{AgentEntry, TurnArgs, agents};
+use self::stream::{Run, StreamEvent, System};
 use self::transcript::{TurnEnd, head, live_branch, load, slug, transcript_turn, turn_end};
 use crate::agents::child::{Runs, cli_version, lock, observe, tail};
 use crate::agents::history::{ReadPage, ReadQuery, cut, first_line};
 use crate::agents::lifecycle::{
-    ApprovalPolicy, approval_policy, bounded, note_waiting, record, reject_unstarted, settle,
-    wait_receipt,
+    ApprovalPolicy, bounded, note_waiting, record, reject_unstarted, settle, wait_receipt,
 };
 use crate::agents::{
-    Agent, AgentStatus, Check, ListFilter, Operation, SendRequest, Settings, StartRequest,
-    WaitTarget,
+    Agent, AgentStatus, Check, ListFilter, Operation, Outgoing, SendRequest, Settings,
+    StartRequest, WaitTarget,
 };
 use crate::model::{
     self, Approval, ApprovalOutcome, Error, ErrorCode, History, Loaded, Model, Observations,
     Outcome, Page, Progress, ReceiptState, Result, Session, SessionState, TurnStatus,
 };
 use crate::store::{NewIntent, Store};
-use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::json;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, UNIX_EPOCH};
+use tokio::process::Command;
 use tokio::time::Instant;
 
 /// Why agent-talk refuses a second writer (DESIGN.md §6.2).
@@ -73,6 +72,65 @@ fn check_id(id: &str) -> Result<()> {
     })
 }
 
+/// A session `ls` found in a transcript folder, in `claude agents`, or in both.
+struct Row {
+    id: String,
+    agent: Option<AgentEntry>,
+    file: Option<PathBuf>,
+    /// The newer of the transcript's mtime and the process start, in ms.
+    recency_ms: i64,
+}
+
+/// Add the sessions `claude agents` lists to the transcript rows; one without a transcript
+/// only when it runs in `cwd` (any directory without it).
+fn add_agents(rows: &mut HashMap<String, Row>, agents: Vec<AgentEntry>, cwd: Option<&str>) {
+    for a in agents {
+        let Some(id) = a.session_id.clone() else {
+            continue;
+        };
+        let started = a.started_at.unwrap_or(0);
+        match rows.get_mut(&id) {
+            Some(row) => {
+                row.recency_ms = row.recency_ms.max(started);
+                row.agent = Some(a);
+            }
+            None => {
+                if cwd.is_some() && a.cwd.as_deref() != cwd {
+                    continue;
+                }
+                rows.insert(
+                    id.clone(),
+                    Row {
+                        id,
+                        agent: Some(a),
+                        file: None,
+                        recency_ms: started,
+                    },
+                );
+            }
+        }
+    }
+}
+
+/// The page of `rows` at `cursor` (an offset), newest first, and the next page's cursor.
+fn page(
+    mut rows: Vec<Row>,
+    limit: u32,
+    cursor: Option<&str>,
+) -> Result<(Vec<Row>, Option<String>)> {
+    rows.sort_by(|a, b| b.recency_ms.cmp(&a.recency_ms).then(a.id.cmp(&b.id)));
+    let offset: usize = match cursor {
+        Some(c) => c
+            .parse()
+            .map_err(|_| Error::new(ErrorCode::Precondition, format!("invalid cursor {c}")))?,
+        None => 0,
+    };
+    let end = (offset + limit as usize).min(rows.len());
+    let next_cursor = (end < rows.len()).then(|| end.to_string());
+    let rows = rows.into_iter().skip(offset).take(limit as usize).collect();
+    Ok((rows, next_cursor))
+}
+
 /// Who, besides this command, is running the session right now.
 enum Live {
     /// A claude process agent-talk spawned (by an earlier, possibly finished, command).
@@ -92,19 +150,17 @@ struct RunWatch {
 }
 
 impl RunWatch {
-    /// Apply one run-log line: accept the receipt when the run starts and record
-    /// the agent's permission denials.
+    /// Apply one run-log line: accept the receipt when the run starts and record the
+    /// agent's permission denials.
     fn on_event(&mut self, store: &Store, line: &str) -> Result<()> {
-        let Ok(raw) = serde_json::from_str::<Value>(line) else {
-            tracing::warn!("non-JSON line from claude: {line}");
-            return Ok(());
+        let ev = match stream::decode(line) {
+            Ok(ev) => ev,
+            Err(e) => {
+                tracing::warn!("undecodable line from claude ({e}): {line}");
+                return Ok(());
+            }
         };
-        let Ok(ev) = StreamEvent::deserialize(&raw) else {
-            return Ok(());
-        };
-        // Accepted on the first init, or on a result without init: either means claude
-        // took the input.
-        let unaccepted = !self.run.init && self.run.result.is_none();
+        let started = self.run.started();
         match &ev {
             StreamEvent::System(System::Init { session_id }) if !self.run.init => {
                 if session_id.as_deref() != Some(self.id.as_str()) {
@@ -131,15 +187,30 @@ impl RunWatch {
                         _ => "permission-related event".into(),
                     },
                     outcome: ApprovalOutcome::Denied,
-                    raw: raw.clone(),
+                    // The whole event, as the approval's raw record.
+                    raw: serde_json::from_str(line).unwrap_or_default(),
                 };
                 record(store, &a);
                 self.approvals.push(a);
             }
+            StreamEvent::Result(r) => {
+                for a in r.denials(&handle(&self.id), &self.turn_id) {
+                    // A denial already reported live (`system/permission_denied`) stays as
+                    // recorded.
+                    if a.item_id.is_some() && self.approvals.iter().any(|x| x.item_id == a.item_id)
+                    {
+                        continue;
+                    }
+                    record(store, &a);
+                    self.approvals.push(a);
+                }
+            }
             _ => {}
         }
-        self.run.apply(&ev, &raw);
-        if unaccepted && (self.run.init || self.run.result.is_some()) {
+        self.run.apply(ev);
+        // Accepted on the first init, or on a result without init: either means claude
+        // took the input.
+        if !started && self.run.started() {
             store.accept(
                 &self.receipt_id,
                 None,
@@ -181,17 +252,14 @@ impl<'a> Claude<'a> {
                 format!("cannot check whether the session is live: {e}"),
             )
         })?;
-        Ok(agents
-            .into_iter()
-            .find(|a| a.session_id.as_deref() == Some(id) && a.pid.is_some())
-            .map(|a| {
-                let pid = a.pid.and_then(|p| u32::try_from(p).ok()).unwrap_or(0);
-                if procs.iter().any(|(_, p)| *p == pid) {
-                    Live::Own(pid)
-                } else {
-                    Live::Foreign(a)
-                }
-            }))
+        Ok(agents.into_iter().find_map(|a| {
+            let pid = a.pid.filter(|_| a.session_id.as_deref() == Some(id))?;
+            Some(if procs.iter().any(|(_, p)| *p == pid) {
+                Live::Own(pid)
+            } else {
+                Live::Foreign(a)
+            })
+        }))
     }
 
     /// Refuse when anything else runs the session: the agent has no lock and a
@@ -242,13 +310,147 @@ impl<'a> Claude<'a> {
         })
     }
 
+    /// Transcripts under the project folder of `cwd` (every folder without it), by session id.
+    fn transcripts(&self, cwd: Option<&str>) -> HashMap<String, Row> {
+        let want_slug = cwd.map(slug);
+        let mut rows = HashMap::new();
+        for dir in std::fs::read_dir(&self.projects)
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            if let Some(s) = &want_slug
+                && dir.file_name().to_string_lossy() != s.as_str()
+            {
+                continue;
+            }
+            for f in std::fs::read_dir(dir.path())
+                .into_iter()
+                .flatten()
+                .flatten()
+            {
+                let path = f.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                    continue;
+                }
+                let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                if uuid::Uuid::parse_str(id).is_err() {
+                    continue;
+                }
+                let mtime = f
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                rows.insert(
+                    id.to_string(),
+                    Row {
+                        id: id.to_string(),
+                        agent: None,
+                        file: Some(path),
+                        recency_ms: mtime,
+                    },
+                );
+            }
+        }
+        rows
+    }
+
+    /// The `ls` entry of a row. `agents_ok`: `claude agents` answered, so a session it does
+    /// not list is not loaded.
+    fn session(&self, row: Row, agents_ok: bool) -> Result<Session> {
+        let h = handle(&row.id);
+        let owned = self.store.is_owned(&h)?;
+        let head = row.file.as_deref().map(head).unwrap_or_default();
+        let agent = row.agent.as_ref();
+        let live_pid = agent.and_then(|a| a.pid);
+        let procs = self.store.processes(&h)?;
+        let own_pid = self.own_run(&procs);
+        let ours = live_pid.is_some_and(|l| procs.iter().any(|(_, p)| *p == l));
+        let origin = if owned || ours {
+            "agent-talk".to_string()
+        } else {
+            // `interactive` covers TUI sessions and running claude -p processes alike.
+            match agent
+                .and_then(|a| a.kind.as_deref())
+                .or(head.entrypoint.as_deref())
+            {
+                Some(k) => format!("claude-{k}"),
+                None => "claude".into(),
+            }
+        };
+        let status = agent.and_then(|a| a.status.as_deref().or(a.state.as_deref()));
+        let state = if own_pid.is_some() {
+            SessionState::Running
+        } else if live_pid.is_some() {
+            match status {
+                Some("busy" | "running") => SessionState::Running,
+                Some("idle") => SessionState::Idle,
+                Some(s) if s.contains("wait") || s.contains("permission") => SessionState::Waiting,
+                _ => SessionState::Unknown,
+            }
+        } else {
+            SessionState::Unknown
+        };
+        Ok(Session {
+            handle: h,
+            agent: "claude",
+            cwd: agent.and_then(|a| a.cwd.clone()).or(head.cwd),
+            name: agent.and_then(|a| a.name.clone()).or(head.name),
+            preview: head.preview,
+            observations: Observations {
+                history: if row.file.is_some() {
+                    History::Visible
+                } else {
+                    History::Absent
+                },
+                loaded: if live_pid.is_some() || own_pid.is_some() {
+                    Loaded::Yes
+                } else if agents_ok {
+                    Loaded::No
+                } else {
+                    Loaded::Unknown
+                },
+                origin,
+            },
+            state,
+            owned,
+            id: row.id,
+        })
+    }
+
+    /// Record the intent to deliver `message` to session `id`, and the watch over the run
+    /// that will deliver it.
+    fn intent(&self, id: &str, message: &Outgoing) -> Result<RunWatch> {
+        let receipt_id = uuid::Uuid::new_v4().to_string();
+        // The input line's uuid: becomes the transcript user.uuid, i.e. the turn id.
+        let client_msg_id = uuid::Uuid::new_v4().to_string();
+        self.store.insert_intent(&NewIntent {
+            receipt_id: &receipt_id,
+            handle: &handle(id),
+            client_msg_id: &client_msg_id,
+            message,
+        })?;
+        Ok(RunWatch {
+            id: id.to_string(),
+            receipt_id,
+            turn_id: client_msg_id,
+            run: Run::default(),
+            approvals: Vec::new(),
+        })
+    }
+
     /// Run one `claude -p` turn to completion (or until `deadline` / Ctrl-C, after
     /// which the process keeps running and is tracked by its pid), then settle the receipt.
     /// The caller holds the session lock.
     async fn execute(
         &self,
         cwd: &str,
-        args: &[String],
+        mut cmd: Command,
         mut watch: RunWatch,
         prompt: &str,
         deadline: Option<Instant>,
@@ -257,7 +459,7 @@ impl<'a> Claude<'a> {
         let log = self.runs.log(&watch.receipt_id);
         let mut child = self
             .runs
-            .spawn(&mut process::command(args), cwd, &watch.receipt_id)
+            .spawn(&mut cmd, cwd, &watch.receipt_id)
             .map_err(|e| reject_unstarted(self.store, &watch.receipt_id, e))?;
         if let Some(pid) = child.id() {
             self.store.insert_process(&watch.receipt_id, &h, pid)?;
@@ -276,7 +478,7 @@ impl<'a> Claude<'a> {
                 .await?;
             let status = tail(&mut child, &log, |l| watch.on_event(self.store, l)).await?;
             // Neither init nor result: claude never took the message (DESIGN.md §3).
-            if !watch.run.init && watch.run.result.is_none() {
+            if !watch.run.started() {
                 let e = self.runs.startup_error(&watch.receipt_id, Some(status));
                 let e = Error::from_agent(ErrorCode::Precondition, e);
                 return Err(reject_unstarted(self.store, &watch.receipt_id, e));
@@ -299,16 +501,7 @@ impl<'a> Claude<'a> {
                     basis: Some("claude -p process exited".into()),
                 });
             };
-            for d in r["permission_denials"].as_array().into_iter().flatten() {
-                let a = denial(h.clone(), watch.turn_id.clone(), d);
-                // A denial already reported live (`system/permission_denied`) stays as recorded.
-                if a.item_id.is_some() && watch.approvals.iter().any(|x| x.item_id == a.item_id) {
-                    continue;
-                }
-                record(self.store, &a);
-                watch.approvals.push(a);
-            }
-            Ok(result_turn(h.clone(), watch.turn_id.clone(), r))
+            Ok(r.turn(h.clone(), watch.turn_id.clone()))
         };
         let res = observe(deadline, work).await;
         settle(
@@ -371,12 +564,6 @@ impl Agent for Claude<'_> {
         limit: u32,
         cursor: Option<&str>,
     ) -> Result<Page<Session>> {
-        struct Row {
-            id: String,
-            agent: Option<AgentEntry>,
-            file: Option<PathBuf>,
-            recency_ms: i64,
-        }
         let (agents, agents_ok) = match agents().await {
             Ok(a) => (a, true),
             Err(e) => {
@@ -384,155 +571,13 @@ impl Agent for Claude<'_> {
                 (Vec::new(), false)
             }
         };
-        let want_slug = filter.cwd.map(slug);
-        let mut rows: HashMap<String, Row> = HashMap::new();
-        for dir in std::fs::read_dir(&self.projects)
+        let mut rows = self.transcripts(filter.cwd);
+        add_agents(&mut rows, agents, filter.cwd);
+        let (rows, next_cursor) = page(rows.into_values().collect(), limit, cursor)?;
+        let items = rows
             .into_iter()
-            .flatten()
-            .flatten()
-        {
-            if let Some(s) = &want_slug
-                && dir.file_name().to_string_lossy() != s.as_str()
-            {
-                continue;
-            }
-            for f in std::fs::read_dir(dir.path())
-                .into_iter()
-                .flatten()
-                .flatten()
-            {
-                let path = f.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                    continue;
-                }
-                let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
-                    continue;
-                };
-                if uuid::Uuid::parse_str(id).is_err() {
-                    continue;
-                }
-                let mtime = f
-                    .metadata()
-                    .and_then(|m| m.modified())
-                    .ok()
-                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                    .map(|d| d.as_millis() as i64)
-                    .unwrap_or(0);
-                rows.insert(
-                    id.to_string(),
-                    Row {
-                        id: id.to_string(),
-                        agent: None,
-                        file: Some(path),
-                        recency_ms: mtime,
-                    },
-                );
-            }
-        }
-        for a in agents {
-            let Some(id) = a.session_id.clone() else {
-                continue;
-            };
-            let started = a.started_at.unwrap_or(0);
-            match rows.get_mut(&id) {
-                Some(row) => {
-                    row.recency_ms = row.recency_ms.max(started);
-                    row.agent = Some(a);
-                }
-                None => {
-                    if filter.cwd.is_some() && a.cwd.as_deref() != filter.cwd {
-                        continue;
-                    }
-                    rows.insert(
-                        id.clone(),
-                        Row {
-                            id,
-                            agent: Some(a),
-                            file: None,
-                            recency_ms: started,
-                        },
-                    );
-                }
-            }
-        }
-        let mut rows: Vec<Row> = rows.into_values().collect();
-        rows.sort_by(|a, b| b.recency_ms.cmp(&a.recency_ms).then(a.id.cmp(&b.id)));
-        let offset: usize = match cursor {
-            Some(c) => c
-                .parse()
-                .map_err(|_| Error::new(ErrorCode::Precondition, format!("invalid cursor {c}")))?,
-            None => 0,
-        };
-        let end = (offset + limit as usize).min(rows.len());
-        let next_cursor = (end < rows.len()).then(|| end.to_string());
-        let mut items = Vec::new();
-        for row in rows.into_iter().skip(offset).take(limit as usize) {
-            let h = handle(&row.id);
-            let owned = self.store.is_owned(&h)?;
-            let (t_cwd, name, preview, entrypoint) = match &row.file {
-                Some(p) => head(p),
-                None => (None, None, None, None),
-            };
-            let agent = row.agent.as_ref();
-            let live_pid = agent
-                .and_then(|a| a.pid)
-                .and_then(|p| u32::try_from(p).ok());
-            let procs = self.store.processes(&h)?;
-            let own_pid = self.own_run(&procs);
-            let ours = live_pid.is_some_and(|l| procs.iter().any(|(_, p)| *p == l));
-            let origin = if owned || ours {
-                "agent-talk".to_string()
-            } else {
-                match agent.and_then(|a| a.kind.as_deref()) {
-                    // `interactive` covers TUI sessions and running claude -p processes alike.
-                    Some(k) => format!("claude-{k}"),
-                    None => match entrypoint.as_deref() {
-                        Some(e) => format!("claude-{e}"),
-                        None => "claude".into(),
-                    },
-                }
-            };
-            let status = agent.and_then(|a| a.status.as_deref().or(a.state.as_deref()));
-            let state = if own_pid.is_some() {
-                SessionState::Running
-            } else if live_pid.is_some() {
-                match status {
-                    Some("busy" | "running") => SessionState::Running,
-                    Some("idle") => SessionState::Idle,
-                    Some(s) if s.contains("wait") || s.contains("permission") => {
-                        SessionState::Waiting
-                    }
-                    _ => SessionState::Unknown,
-                }
-            } else {
-                SessionState::Unknown
-            };
-            items.push(Session {
-                handle: h,
-                agent: "claude",
-                cwd: agent.and_then(|a| a.cwd.clone()).or(t_cwd),
-                name: agent.and_then(|a| a.name.clone()).or(name),
-                preview,
-                observations: Observations {
-                    history: if row.file.is_some() {
-                        History::Visible
-                    } else {
-                        History::Absent
-                    },
-                    loaded: if live_pid.is_some() || own_pid.is_some() {
-                        Loaded::Yes
-                    } else if agents_ok {
-                        Loaded::No
-                    } else {
-                        Loaded::Unknown
-                    },
-                    origin,
-                },
-                state,
-                owned,
-                id: row.id,
-            });
-        }
+            .map(|row| self.session(row, agents_ok))
+            .collect::<Result<_>>()?;
         Ok(Page { items, next_cursor })
     }
 
@@ -541,33 +586,16 @@ impl Agent for Claude<'_> {
         let h = handle(&id);
         let _lock = lock(&h, SECOND_WRITER)?;
         self.store.insert_owned(&h, req.cwd, req.settings)?;
-        let receipt_id = uuid::Uuid::new_v4().to_string();
-        // The input line's uuid: becomes the transcript user.uuid, i.e. the turn id.
-        let client_msg_id = uuid::Uuid::new_v4().to_string();
-        self.store.insert_intent(&NewIntent {
-            receipt_id: &receipt_id,
-            handle: &h,
-            client_msg_id: &client_msg_id,
-            message: &req.message,
-        })?;
-        let mut args = process::args(
-            ["--session-id", &id],
-            req.settings.model.as_deref(),
-            req.settings.effort.as_deref(),
-            ApprovalPolicy::Deny,
-            req.settings.full_access,
-        );
-        if let Some(n) = req.name {
-            args.extend(["--name".into(), n.into()]);
-        }
-        let watch = RunWatch {
-            id,
-            receipt_id,
-            turn_id: client_msg_id,
-            run: Run::default(),
-            approvals: Vec::new(),
-        };
-        self.execute(req.cwd, &args, watch, req.message.delivered, deadline)
+        let watch = self.intent(&id, &req.message)?;
+        let cmd = process::command(&TurnArgs {
+            session: ["--session-id", &id],
+            name: req.name,
+            model: req.settings.model.as_deref(),
+            effort: req.settings.effort.as_deref(),
+            full_access: req.settings.full_access,
+            policy: ApprovalPolicy::Deny,
+        });
+        self.execute(req.cwd, cmd, watch, req.message.delivered, deadline)
             .await
     }
 
@@ -593,7 +621,7 @@ impl Agent for Claude<'_> {
         // (observed on claude 2.1.288). Never pick one silently.
         let cwd = match self.store.owned_cwd(&h)? {
             Some(c) => c,
-            None => match head(&path).0 {
+            None => match head(&path).cwd {
                 Some(c) if Path::new(&c).is_dir() => c,
                 Some(c) => {
                     return Err(Error::new(
@@ -611,33 +639,25 @@ impl Agent for Claude<'_> {
                 }
             },
         };
-        let receipt_id = uuid::Uuid::new_v4().to_string();
-        let client_msg_id = uuid::Uuid::new_v4().to_string();
-        self.store.insert_intent(&NewIntent {
-            receipt_id: &receipt_id,
-            handle: &h,
-            client_msg_id: &client_msg_id,
-            message: &req.message,
-        })?;
+        let watch = self.intent(id, &req.message)?;
         // Claude restores the model from the transcript, so only a change passes it; effort
-        // and permission mode are per process and come from the session's settings.
+        // and permission mode are per process and come from the session's settings. Only a
+        // session agent-talk started has settings, and agent-talk denies its approvals.
         let unset = Settings::default();
         let settings = req.settings.unwrap_or(&unset);
-        let args = process::args(
-            ["--resume", id],
-            req.change.model.as_deref(),
-            settings.effort.as_deref(),
-            approval_policy(self.store, &h)?,
-            settings.full_access,
-        );
-        let watch = RunWatch {
-            id: id.to_string(),
-            receipt_id,
-            turn_id: client_msg_id,
-            run: Run::default(),
-            approvals: Vec::new(),
-        };
-        self.execute(&cwd, &args, watch, req.message.delivered, deadline)
+        let cmd = process::command(&TurnArgs {
+            session: ["--resume", id],
+            name: None,
+            model: req.change.model.as_deref(),
+            effort: settings.effort.as_deref(),
+            full_access: settings.full_access,
+            policy: if req.settings.is_some() {
+                ApprovalPolicy::Deny
+            } else {
+                ApprovalPolicy::Observe
+            },
+        });
+        self.execute(&cwd, cmd, watch, req.message.delivered, deadline)
             .await
     }
 
@@ -670,13 +690,8 @@ impl Agent for Claude<'_> {
             WaitTarget::Turn(t) => (t.clone(), self.store.receipt_by_turn(&h, t)?),
             WaitTarget::Receipt(r) => {
                 let rec = wait_receipt(self.store, &h, r)?;
-                // The input uuid is the turn id, recorded when the intent was written.
-                (
-                    rec.turn_id
-                        .clone()
-                        .unwrap_or_else(|| rec.client_msg_id.clone()),
-                    Some(rec),
-                )
+                // The input line's uuid is the turn id (DESIGN.md §6.2).
+                (rec.client_msg_id.clone(), Some(rec))
             }
         };
         let path = self.require_transcript(id)?;
@@ -692,13 +707,13 @@ impl Agent for Claude<'_> {
                 // 1. Own run: its result event is authoritative.
                 if let Some(r) = &receipt {
                     let run = Run::from_log(&self.runs.log(&r.receipt_id));
-                    if unaccepted && (run.init || run.result.is_some()) {
+                    if unaccepted && run.started() {
                         self.store
                             .accept(&r.receipt_id, None, Some(&turn_id), Some(&turn_id))?;
                         unaccepted = false;
                     }
                     if let Some(result) = &run.result {
-                        return Ok(result_turn(h.clone(), turn_id.clone(), result));
+                        return Ok(result.turn(h.clone(), turn_id.clone()));
                     }
                 }
                 let entries = load(&path)?;

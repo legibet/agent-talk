@@ -7,57 +7,56 @@ use serde::Deserialize;
 use std::process::Stdio;
 use tokio::process::Command;
 
-/// `claude -p` arguments for one turn; `session` is `--session-id <id>` or
-/// `--resume <id>`. `--resume` restores the model from the transcript but neither the effort
-/// nor the permission mode (DESIGN.md §6.2), so those pass again on every turn.
-pub fn args(
-    session: [&str; 2],
-    model: Option<&str>,
-    effort: Option<&str>,
-    policy: ApprovalPolicy,
-    full_access: bool,
-) -> Vec<String> {
-    let mut args: Vec<String> = [
+/// What one `claude -p` turn runs with.
+pub struct TurnArgs<'a> {
+    /// `--session-id <id>` (a new session) or `--resume <id>`.
+    pub session: [&'a str; 2],
+    /// `--name`, on a new session.
+    pub name: Option<&'a str>,
+    pub model: Option<&'a str>,
+    pub effort: Option<&'a str>,
+    pub full_access: bool,
+    pub policy: ApprovalPolicy,
+}
+
+/// `claude -p` for one turn. `--resume` restores the model from the transcript but neither the
+/// effort nor the permission mode (DESIGN.md §6.2), so those pass again on every turn.
+pub fn command(a: &TurnArgs) -> Command {
+    // A nested `claude -p` with the inherited CLAUDECODE=1 runs normally (observed on
+    // claude 2.1.288).
+    let mut cmd = agent_cmd("claude");
+    cmd.args([
         "-p",
         "--verbose",
         "--input-format",
         "stream-json",
         "--output-format",
         "stream-json",
-        session[0],
-        session[1],
-    ]
-    .map(String::from)
-    .to_vec();
-    if let Some(m) = model {
-        args.extend(["--model".into(), m.into()]);
+    ])
+    .args(a.session);
+    if let Some(m) = a.model {
+        cmd.args(["--model", m]);
     }
-    if let Some(e) = effort {
-        args.extend(["--effort".into(), e.into()]);
+    if let Some(e) = a.effort {
+        // CLAUDE_CODE_EFFORT_LEVEL silently overrides --effort (claude 2.1.291, DESIGN.md §6.2).
+        cmd.args(["--effort", e])
+            .env_remove("CLAUDE_CODE_EFFORT_LEVEL");
     }
-    if full_access {
-        args.extend(["--permission-mode".into(), "bypassPermissions".into()]);
+    if a.full_access {
+        cmd.args(["--permission-mode", "bypassPermissions"]);
     }
-    match policy {
+    match a.policy {
         // Claude's default: it denies whatever would prompt, tells the model, and
         // reports system/permission_denied and result.permission_denials.
         ApprovalPolicy::Observe => {}
         // Also tells the model not to retry anything that needs approval.
-        ApprovalPolicy::Deny => args.extend(["--permission-prompts".into(), "none".into()]),
+        ApprovalPolicy::Deny => {
+            cmd.args(["--permission-prompts", "none"]);
+        }
     }
-    args
-}
-
-/// `claude` with `args`.
-pub fn command(args: &[String]) -> Command {
-    let mut cmd = agent_cmd("claude");
-    // CLAUDE_CODE_EFFORT_LEVEL silently overrides --effort (claude 2.1.291, DESIGN.md §6.2).
-    if args.iter().any(|a| a == "--effort") {
-        cmd.env_remove("CLAUDE_CODE_EFFORT_LEVEL");
+    if let Some(n) = a.name {
+        cmd.args(["--name", n]);
     }
-    // A nested `claude -p` with the inherited CLAUDECODE=1 runs normally (observed on
-    // claude 2.1.288).
-    cmd.args(args);
     cmd
 }
 
@@ -67,23 +66,15 @@ pub fn command(args: &[String]) -> Command {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentEntry {
-    #[serde(default)]
     pub session_id: Option<String>,
-    #[serde(default)]
     pub cwd: Option<String>,
-    #[serde(default)]
     pub kind: Option<String>,
     /// Background sessions: running, failed, …
-    #[serde(default)]
     pub state: Option<String>,
     /// Live processes: busy | idle
-    #[serde(default)]
     pub status: Option<String>,
-    #[serde(default)]
-    pub pid: Option<i64>,
-    #[serde(default)]
+    pub pid: Option<u32>,
     pub name: Option<String>,
-    #[serde(default)]
     pub started_at: Option<i64>,
 }
 
