@@ -233,11 +233,13 @@ server speaks both the stateless 2026-07-28 protocol (Claude Code, Antigravity) 
 
 `new` and `send` with `wait=false` return once the agent accepted the message, as the CLI does
 without `--wait`. A Grok turn needs agent-talk's connection until it ends (§6.4), so the server
-keeps it: the call returns the receipt at acceptance, and the server goes on observing the turn,
-declining its permission requests on sessions agent-talk started, until it ends. A client's
-cancellation or tool timeout ends only the client's wait: the call runs on to its own end and
-never interrupts a turn. When the client closes stdin, the server exits once the calls it runs and
-the turns it keeps have ended.
+keeps the turn a prompt starts: the call returns the receipt at acceptance, and the server goes on
+observing the turn, declining its permission requests on sessions agent-talk started, until it
+ends. A steer message joins a turn that a prompt started and is observed only until it joined. A
+client's cancellation or tool timeout ends only the client's wait: the call runs on to its own end
+and never interrupts a turn. When the client closes stdin, the server exits once the calls it runs
+and the turns it keeps have ended, however long that takes (a turn on the user's session may wait
+for the user's answer to an approval).
 
 Only the CLI ends observation on Ctrl-C or SIGTERM. Once tokio listens for a signal, its default
 action never returns for the life of the process, so the server keeps the default actions: a
@@ -760,7 +762,8 @@ with `--caller`.
   artifact per platform matter.
 - **No agent-talk daemon.** The agents already run the shared processes; another daemon would add
   install, pid and version-skew problems for state that fits in SQLite. Long-lived state goes into
-  the per-session `agent-talk mcp` process, which keeps Grok turns after their call returned (§4).
+  the `agent-talk mcp` process the agent runs, which keeps Grok turns after their call returned
+  (§4).
 - **The user configures the MCP server globally.** agent-talk never injects itself into a session
   or edits agent configuration, even where the agent's API allows per-thread servers.
 - **Never approve.** Decline or reject is the strongest answer; `once`, `always` and `accept` are

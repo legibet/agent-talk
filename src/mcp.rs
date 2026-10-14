@@ -271,10 +271,18 @@ impl Server {
     ) -> CallToolResult {
         let task = self.spawn(op);
         match kept.await {
-            Ok(o) => tool_result(Ok(Ok(Outcome {
-                from: Some(from),
-                ..o
-            }))),
+            Ok(o) => {
+                // The result is answered; what goes wrong later is only logged.
+                self.tasks.spawn(async move {
+                    if let Ok(Err(e)) = task.await {
+                        tracing::warn!("kept turn: {e}");
+                    }
+                });
+                tool_result(Ok(Ok(Outcome {
+                    from: Some(from),
+                    ..o
+                })))
+            }
             Err(_) => tool_result(task.await),
         }
     }
