@@ -27,7 +27,7 @@ use crate::agents::lifecycle::{
 };
 use crate::agents::{
     Agent, AgentStatus, Check, ListFilter, Operation, Outgoing, SendRequest, Settings,
-    StartRequest, WaitTarget,
+    StartRequest, Wait, WaitTarget,
 };
 use crate::model::{
     self, Approval, ApprovalOutcome, Error, ErrorCode, History, Loaded, Model, Observations,
@@ -665,7 +665,8 @@ impl Agent for Claude<'_> {
         Ok(Page { items, next_cursor })
     }
 
-    async fn start(&self, req: &StartRequest<'_>, deadline: Option<Instant>) -> Result<Outcome> {
+    async fn start(&self, req: &StartRequest<'_>, wait: Wait) -> Result<Outcome> {
+        let deadline = wait.deadline();
         let id = uuid::Uuid::new_v4().to_string();
         let h = handle(&id);
         let _lock = lock(&h, SECOND_WRITER)?;
@@ -683,12 +684,8 @@ impl Agent for Claude<'_> {
             .await
     }
 
-    async fn send(
-        &self,
-        id: &str,
-        req: &SendRequest<'_>,
-        deadline: Option<Instant>,
-    ) -> Result<Outcome> {
+    async fn send(&self, id: &str, req: &SendRequest<'_>, wait: Wait) -> Result<Outcome> {
+        let deadline = wait.deadline();
         check_id(id)?;
         if req.steer {
             return Err(Error::new(

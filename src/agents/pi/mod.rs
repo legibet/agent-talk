@@ -22,7 +22,7 @@ use crate::agents::child::{Runs, agent_cmd, cli_version, lock, pid_alive, tail};
 use crate::agents::history::{ReadPage, ReadQuery, cut};
 use crate::agents::lifecycle::{bounded, note_waiting, reject_unstarted, settle, wait_receipt};
 use crate::agents::{
-    Agent, AgentStatus, Check, ListFilter, Operation, Outgoing, SendRequest, StartRequest,
+    Agent, AgentStatus, Check, ListFilter, Operation, Outgoing, SendRequest, StartRequest, Wait,
     WaitTarget,
 };
 use crate::model::{
@@ -455,7 +455,8 @@ impl Agent for Pi<'_> {
         Ok(Page { items, next_cursor })
     }
 
-    async fn start(&self, req: &StartRequest<'_>, deadline: Option<Instant>) -> Result<Outcome> {
+    async fn start(&self, req: &StartRequest<'_>, wait: Wait) -> Result<Outcome> {
+        let deadline = wait.deadline();
         self.check_layout()?;
         let id = uuid::Uuid::new_v4().to_string();
         let h = handle(&id);
@@ -472,12 +473,8 @@ impl Agent for Pi<'_> {
             .await
     }
 
-    async fn send(
-        &self,
-        id: &str,
-        req: &SendRequest<'_>,
-        deadline: Option<Instant>,
-    ) -> Result<Outcome> {
+    async fn send(&self, id: &str, req: &SendRequest<'_>, wait: Wait) -> Result<Outcome> {
+        let deadline = wait.deadline();
         check_id(id)?;
         self.check_layout()?;
         if req.steer {

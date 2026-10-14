@@ -30,7 +30,7 @@ use crate::agents::lifecycle::{
     bounded, note_waiting, record, reject_unstarted, settle, wait_receipt,
 };
 use crate::agents::{
-    Agent, AgentStatus, Check, ListFilter, Operation, SendRequest, Settings, StartRequest,
+    Agent, AgentStatus, Check, ListFilter, Operation, SendRequest, Settings, StartRequest, Wait,
     WaitTarget,
 };
 use crate::model::{
@@ -674,7 +674,8 @@ impl Agent for Antigravity<'_> {
         Ok(Page { items, next_cursor })
     }
 
-    async fn start(&self, req: &StartRequest<'_>, deadline: Option<Instant>) -> Result<Outcome> {
+    async fn start(&self, req: &StartRequest<'_>, wait: Wait) -> Result<Outcome> {
+        let deadline = wait.deadline();
         if req.name.is_some() {
             return Err(Error::new(
                 ErrorCode::Unsupported,
@@ -724,12 +725,8 @@ impl Agent for Antigravity<'_> {
             .await
     }
 
-    async fn send(
-        &self,
-        id: &str,
-        req: &SendRequest<'_>,
-        deadline: Option<Instant>,
-    ) -> Result<Outcome> {
+    async fn send(&self, id: &str, req: &SendRequest<'_>, wait: Wait) -> Result<Outcome> {
+        let deadline = wait.deadline();
         check_id(id)?;
         if req.steer {
             return Err(Error::new(

@@ -448,7 +448,8 @@ def recover(a: Agent):
 
 def detach(a: Agent):
     """send over MCP with wait=false returns the receipt once the message is accepted, while the
-    turn goes on (an agent-talk child holds the session meanwhile); wait finds the turn."""
+    turn goes on (an agent-talk child holds the session meanwhile, on Grok kept by the server);
+    wait finds the turn."""
     h = need(a.name)
     with Mcp(a.env) as m:
         is_err, out = m.call("send", {"handle": h, "text": a.slow})
@@ -456,7 +457,7 @@ def detach(a: Agent):
         r = out["receipt"]
         receipts.setdefault(a.name, []).append(r["receipt_id"])
         expect(r["state"] == "accepted" and not out.get("turn"), "the receipt accepted, no turn")
-        if a.held_by_child:
+        if a.held_by_child or a.name == "grok":
             out = cli("send", h, "x", env=a.env, expect_exit=(0, 2))
             if not err(out):
                 raise Inconclusive("the turn ended before the second send")
@@ -981,7 +982,24 @@ def grok_tier():
         out = cli("send", h, "reply with the single word four", "--wait", env=a.env)
         expect(out["turn"]["status"] == "completed", "a row with a dead pid: completed")
 
-    for name, fn in (("settings", settings), ("foreign-tui", foreign_tui)):
+    def kept():
+        # The server keeps a turn past its call; on stdin close it exits once the turn ended.
+        h = need("grok")
+        m = Mcp(a.env)
+        is_err, out = m.call("send", {"handle": h, "text": COUNT})
+        expect(not is_err and not out.get("turn"), "send returns at acceptance, no turn")
+        r = out["receipt"]
+        receipts.setdefault("grok", []).append(r["receipt_id"])
+        m.p.stdin.close()
+        try:
+            m.p.wait(timeout=300)
+        except subprocess.TimeoutExpired:
+            m.p.kill()
+            raise Fail("the server did not exit within 300 s of stdin closing") from None
+        out = cli("wait", h, "--receipt", r["receipt_id"], "--timeout", "10", env=a.env)
+        expect(out["turn"]["status"] == "completed", f"completed, got {out['turn']['status']}")
+
+    for name, fn in (("settings", settings), ("foreign-tui", foreign_tui), ("kept", kept)):
         check("grok", name, fn)
 
 

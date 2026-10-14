@@ -28,7 +28,7 @@ use crate::agents::lifecycle::{
     ApprovalPolicy, approval_policy, bounded, note_waiting, reject, settle, wait_receipt,
 };
 use crate::agents::{
-    Agent, AgentStatus, Check, ListFilter, Operation, SendRequest, StartRequest, WaitTarget,
+    Agent, AgentStatus, Check, ListFilter, Operation, SendRequest, StartRequest, Wait, WaitTarget,
     strip_provenance,
 };
 use crate::model::{
@@ -358,15 +358,16 @@ impl<'a> Grok<'a> {
     }
 
     /// Record the intent, submit its text as a prompt on the loaded session and observe
-    /// it (until the deadline, or to the end of the turn without one), then settle the
-    /// receipt. The caller closes `conn`.
+    /// it until it ends or `wait`'s deadline passes, then settle the receipt. Without a
+    /// deadline the outcome goes to `wait`'s keeper, if any, once the prompt is accepted.
+    /// The caller closes `conn`.
     async fn run(
         &self,
         conn: &mut Conn,
         id: &str,
         intent: &NewIntent<'_>,
         policy: ApprovalPolicy,
-        deadline: Option<Instant>,
+        wait: Wait,
         route: &Route,
     ) -> Result<Outcome> {
         self.store.insert_intent(intent)?;
@@ -399,9 +400,32 @@ impl<'a> Grok<'a> {
             policy,
             shared,
         );
-        // Without --wait there is no deadline: the command still observes to the end of
-        // the turn (DESIGN.md §5) and reports no turn. Only a signal ends it early.
-        let mut res = bounded(deadline, w.finish(conn)).await;
+        // The turn needs this connection until it ends (DESIGN.md §6.4), so without a
+        // deadline it is still observed to its end, and no turn is reported; only a signal
+        // ends it early. A keeper (the MCP server) gets the outcome at acceptance.
+        let deadline = wait.deadline();
+        let observe = async {
+            if let Wait::Accepted(Some(keeper)) = wait {
+                if let Some(end) = w.until_accepted(conn).await? {
+                    return Ok(end);
+                }
+                match settle(
+                    self.store,
+                    handle(id),
+                    Ok(None),
+                    Some(intent.receipt_id),
+                    w.approvals.clone(),
+                    w.progress(),
+                ) {
+                    Ok(o) => {
+                        let _ = keeper.send(o);
+                    }
+                    Err(e) => tracing::warn!("{e}"),
+                }
+            }
+            w.finish(conn).await
+        };
+        let mut res = bounded(deadline, observe).await;
         let stopped = |e: &Error| matches!(e.code, ErrorCode::Timeout | ErrorCode::Interrupted);
         let note = match route {
             Route::Leader(leader) => {
@@ -758,7 +782,7 @@ impl Agent for Grok<'_> {
         Ok(Page { items, next_cursor })
     }
 
-    async fn start(&self, req: &StartRequest<'_>, deadline: Option<Instant>) -> Result<Outcome> {
+    async fn start(&self, req: &StartRequest<'_>, wait: Wait) -> Result<Outcome> {
         let leader = self.leader()?;
         let mut conn = self
             .connect(
@@ -819,7 +843,7 @@ impl Agent for Grok<'_> {
                 id,
                 &intent,
                 ApprovalPolicy::Deny,
-                deadline,
+                wait,
                 &route,
             )
             .await
@@ -829,19 +853,14 @@ impl Agent for Grok<'_> {
         res
     }
 
-    async fn send(
-        &self,
-        id: &str,
-        req: &SendRequest<'_>,
-        deadline: Option<Instant>,
-    ) -> Result<Outcome> {
+    async fn send(&self, id: &str, req: &SendRequest<'_>, wait: Wait) -> Result<Outcome> {
         check_id(id)?;
         let h = handle(id);
         let dir = sessions::require(&self.home, id)?;
         let cwd = self.session_cwd(&dir)?;
         let policy = approval_policy(self.store, &h)?;
         if req.steer {
-            return self.steer(id, &cwd, req, policy, deadline).await;
+            return self.steer(id, &cwd, req, policy, wait.deadline()).await;
         }
         let (route, mut conn) = self.route(id, &dir, Path::new(&cwd)).await?;
         let res = async {
@@ -878,7 +897,7 @@ impl Agent for Grok<'_> {
                 client_msg_id: &prompt_id,
                 message: &req.message,
             };
-            self.run(&mut conn, id, &intent, policy, deadline, &route)
+            self.run(&mut conn, id, &intent, policy, wait, &route)
                 .await
         }
         .await;

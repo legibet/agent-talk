@@ -17,7 +17,7 @@ use crate::agents::lifecycle::{
     ApprovalPolicy, approval_policy, bounded, record, reject, resolve, settle, wait_receipt,
 };
 use crate::agents::{
-    Agent, AgentStatus, Check, ListFilter, Operation, SendRequest, Settings, StartRequest,
+    Agent, AgentStatus, Check, ListFilter, Operation, SendRequest, Settings, StartRequest, Wait,
     WaitTarget, strip_provenance,
 };
 use crate::model::{
@@ -744,7 +744,8 @@ impl Agent for Codex<'_> {
         })
     }
 
-    async fn start(&self, req: &StartRequest<'_>, deadline: Option<Instant>) -> Result<Outcome> {
+    async fn start(&self, req: &StartRequest<'_>, wait: Wait) -> Result<Outcome> {
+        let deadline = wait.deadline();
         let mut conn = self.connect().await?;
         // Nobody answers approvals on a thread agent-talk started: what needs one fails
         // and the model is told. The sandbox and model fall back to the daemon's defaults.
@@ -803,12 +804,8 @@ impl Agent for Codex<'_> {
         self.finish(conn, res, Some(&receipt_id), w, progress).await
     }
 
-    async fn send(
-        &self,
-        thread_id: &str,
-        req: &SendRequest<'_>,
-        deadline: Option<Instant>,
-    ) -> Result<Outcome> {
+    async fn send(&self, thread_id: &str, req: &SendRequest<'_>, wait: Wait) -> Result<Outcome> {
+        let deadline = wait.deadline();
         let handle = handle(thread_id);
         let receipt_id = uuid::Uuid::new_v4().to_string();
         let client_msg_id = uuid::Uuid::new_v4().to_string();

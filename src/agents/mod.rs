@@ -13,6 +13,7 @@ use self::history::{ReadPage, ReadQuery};
 use crate::model::{Caller, CallerKind, Error, ErrorCode, Model, Outcome, Page, Result, Session};
 use crate::store::Store;
 use serde::{Deserialize, Serialize};
+use tokio::sync::oneshot;
 use tokio::time::Instant;
 
 /// The text delivered for `text` from `from`: agent senders get a one-line provenance
@@ -131,30 +132,25 @@ impl Agent for Adapter<'_> {
         }
     }
 
-    async fn start(&self, req: &StartRequest<'_>, deadline: Option<Instant>) -> Result<Outcome> {
+    async fn start(&self, req: &StartRequest<'_>, wait: Wait) -> Result<Outcome> {
         match self {
-            Adapter::Codex(p) => p.start(req, deadline).await,
-            Adapter::Claude(p) => p.start(req, deadline).await,
-            Adapter::OpenCode(p) => p.start(req, deadline).await,
-            Adapter::Grok(p) => p.start(req, deadline).await,
-            Adapter::Antigravity(p) => p.start(req, deadline).await,
-            Adapter::Pi(p) => p.start(req, deadline).await,
+            Adapter::Codex(p) => p.start(req, wait).await,
+            Adapter::Claude(p) => p.start(req, wait).await,
+            Adapter::OpenCode(p) => p.start(req, wait).await,
+            Adapter::Grok(p) => p.start(req, wait).await,
+            Adapter::Antigravity(p) => p.start(req, wait).await,
+            Adapter::Pi(p) => p.start(req, wait).await,
         }
     }
 
-    async fn send(
-        &self,
-        id: &str,
-        req: &SendRequest<'_>,
-        deadline: Option<Instant>,
-    ) -> Result<Outcome> {
+    async fn send(&self, id: &str, req: &SendRequest<'_>, wait: Wait) -> Result<Outcome> {
         match self {
-            Adapter::Codex(p) => p.send(id, req, deadline).await,
-            Adapter::Claude(p) => p.send(id, req, deadline).await,
-            Adapter::OpenCode(p) => p.send(id, req, deadline).await,
-            Adapter::Grok(p) => p.send(id, req, deadline).await,
-            Adapter::Antigravity(p) => p.send(id, req, deadline).await,
-            Adapter::Pi(p) => p.send(id, req, deadline).await,
+            Adapter::Codex(p) => p.send(id, req, wait).await,
+            Adapter::Claude(p) => p.send(id, req, wait).await,
+            Adapter::OpenCode(p) => p.send(id, req, wait).await,
+            Adapter::Grok(p) => p.send(id, req, wait).await,
+            Adapter::Antigravity(p) => p.send(id, req, wait).await,
+            Adapter::Pi(p) => p.send(id, req, wait).await,
         }
     }
 
@@ -177,6 +173,26 @@ impl Agent for Adapter<'_> {
             Adapter::Grok(p) => p.wait(id, target, deadline).await,
             Adapter::Antigravity(p) => p.wait(id, target, deadline).await,
             Adapter::Pi(p) => p.wait(id, target, deadline).await,
+        }
+    }
+}
+
+/// What `new` and `send` wait for before they return.
+pub enum Wait {
+    /// The end of the turn, until the deadline passes.
+    Turn(Instant),
+    /// The agent's acceptance of the message. A Grok turn needs agent-talk until it ends
+    /// (DESIGN.md §6.4), so the command observes it to its end all the same; given a keeper
+    /// (the MCP server, DESIGN.md §4), the Grok adapter sends it the outcome once the message
+    /// is accepted and goes on observing in the background.
+    Accepted(Option<oneshot::Sender<Outcome>>),
+}
+
+impl Wait {
+    pub fn deadline(&self) -> Option<Instant> {
+        match self {
+            Wait::Turn(d) => Some(*d),
+            Wait::Accepted(_) => None,
         }
     }
 }
@@ -304,8 +320,8 @@ impl Operation {
 }
 
 /// One adapter per agent. Mutations persist their intent before submitting and
-/// return a receipt; a `deadline` makes them observe the resulting turn on the
-/// same connection.
+/// return a receipt; `Wait::Turn` makes them observe the resulting turn on the same
+/// connection.
 pub trait Agent {
     async fn status(&self) -> AgentStatus;
     /// Every model `new --model` takes, in any order.
@@ -316,13 +332,8 @@ pub trait Agent {
         limit: u32,
         cursor: Option<&str>,
     ) -> Result<Page<Session>>;
-    async fn start(&self, req: &StartRequest<'_>, deadline: Option<Instant>) -> Result<Outcome>;
-    async fn send(
-        &self,
-        id: &str,
-        req: &SendRequest<'_>,
-        deadline: Option<Instant>,
-    ) -> Result<Outcome>;
+    async fn start(&self, req: &StartRequest<'_>, wait: Wait) -> Result<Outcome>;
+    async fn send(&self, id: &str, req: &SendRequest<'_>, wait: Wait) -> Result<Outcome>;
     async fn read(&self, id: &str, q: &ReadQuery) -> Result<ReadPage>;
     async fn wait(&self, id: &str, target: &WaitTarget, deadline: Instant) -> Result<Outcome>;
 }

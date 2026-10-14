@@ -192,6 +192,16 @@ impl<'s> Watch<'s> {
         }
     }
 
+    /// Events until the prompt is accepted; the end of the turn when it came first.
+    pub async fn until_accepted(&mut self, conn: &mut Conn) -> Result<Option<End>> {
+        while !self.accepted() {
+            if let Some(end) = self.step(conn).await? {
+                return Ok(Some(end));
+            }
+        }
+        Ok(None)
+    }
+
     /// Events until the prompt runs; whether the turn ended first.
     pub async fn until_running(&mut self, conn: &mut Conn) -> Result<bool> {
         while !self.running() {

@@ -5,7 +5,7 @@ mod ops;
 mod store;
 
 use agents::history::ReadQuery;
-use agents::{Settings, WaitTarget};
+use agents::{Settings, Wait, WaitTarget};
 use clap::{Args, Parser, Subcommand};
 use model::{Approval, Caller, CallerKind, Outcome, Receipt, Role, Turn};
 use ops::{
@@ -18,6 +18,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 use store::Store;
+use tokio::time::Instant;
 
 #[derive(Parser)]
 #[command(
@@ -72,8 +73,8 @@ impl SettingsOpts {
 struct WaitOpts {
     /// Wait for the reply and print the finished turn; the reply is its final_text (on
     /// OpenCode the reply of the run that took the message, which may also cover other
-    /// queued messages; read shows them). Claude, Grok and Antigravity run the whole turn
-    /// before returning either way.
+    /// queued messages; read shows them). Without it the command returns once the agent
+    /// took the message, except on Grok, which runs the whole turn either way.
     #[arg(long)]
     wait: bool,
     /// Seconds to wait with --wait.
@@ -82,8 +83,12 @@ struct WaitOpts {
 }
 
 impl WaitOpts {
-    fn duration(&self) -> Option<Duration> {
-        self.wait.then(|| Duration::from_secs(self.timeout))
+    fn wait(&self) -> Wait {
+        if self.wait {
+            Wait::Turn(Instant::now() + Duration::from_secs(self.timeout))
+        } else {
+            Wait::Accepted(None)
+        }
     }
 }
 
@@ -334,7 +339,7 @@ async fn run(store: &Store, cmd: Cmd, json: bool) -> model::Result<()> {
                 prompt,
                 name,
                 settings: settings.settings(),
-                wait: wait.duration(),
+                wait: wait.wait(),
                 from: cli_caller(sender.from.as_deref())?,
             };
             print(json, &ops::new(store, args).await?, print_outcome);
@@ -352,7 +357,7 @@ async fn run(store: &Store, cmd: Cmd, json: bool) -> model::Result<()> {
                 text,
                 steer,
                 settings: settings.settings(),
-                wait: wait.duration(),
+                wait: wait.wait(),
                 from: cli_caller(sender.from.as_deref())?,
             };
             print(json, &ops::send(store, args).await?, print_outcome);

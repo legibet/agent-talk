@@ -50,8 +50,8 @@ State lives where the agent already keeps it:
 
 "Owned" means agent-talk started the session; it records creation, not current exclusivity. Each CLI
 command holds its connection, subscription and correlation state only while it runs. `agent-talk
-mcp` is the one long-lived process, started and stopped by the agent like any MCP server; state that
-must outlive a command would belong there, not in a system daemon (§7).
+mcp` is the one long-lived process, started and stopped by the agent like any MCP server; the Grok
+turns it keeps after their call returned (§4) live there, not in a system daemon (§7).
 
 ### Local state (`~/.agent-talk/`)
 
@@ -231,9 +231,18 @@ CLI's types and returns `structuredContent` as well as text, with behaviour anno
 server speaks both the stateless 2026-07-28 protocol (Claude Code, Antigravity) and the
 `initialize` handshake of earlier versions (Codex, Grok). Logging is stderr only.
 
+`new` and `send` with `wait=false` return once the agent accepted the message, as the CLI does
+without `--wait`. A Grok turn needs agent-talk's connection until it ends (§6.4), so the server
+keeps it: the call returns the receipt at acceptance, and the server goes on observing the turn,
+declining its permission requests on sessions agent-talk started, until it ends. A client's
+cancellation or tool timeout ends only the client's wait: the call runs on to its own end and
+never interrupts a turn. When the client closes stdin, the server exits once the calls it runs and
+the turns it keeps have ended.
+
 Only the CLI ends observation on Ctrl-C or SIGTERM. Once tokio listens for a signal, its default
 action never returns for the life of the process, so the server keeps the default actions: a
-signal stops the server and the requests it is running.
+signal stops the server, the requests it is running and the turns it keeps; a direct-mode Grok turn
+ends with it.
 
 ## 5. CLI
 
@@ -256,7 +265,8 @@ agent-talk mcp [--caller H]
 - `new` and `send` without `--wait` return once the agent accepted the message. The turn goes on
   in the agent's shared process or, on Claude, Antigravity and pi, in the child, whose run log
   `wait` reads. A Grok turn needs agent-talk's connection until it ends (§6.4), so on Grok the
-  command still observes to the end of the turn.
+  command still observes to the end of the turn; `agent-talk mcp` returns at acceptance and keeps
+  the turn (§4).
 - On agents with an event stream (Codex, OpenCode, Grok), a command that observes the turn
   subscribes before it submits, so no event of the turn is missed.
 - `wait` first checks what is persisted (history, or the run log of an agent-talk child), since the
@@ -587,9 +597,10 @@ takes its own lock only in direct mode, since clients of one leader do not exclu
   Grok starts a fallback turn that the receipt then names.
 - In direct mode the turn dies with the child (closing stdin ends it within about two seconds,
   with no `turn_completed`), and a `session/cancel` sent before the prompt is running is ignored.
-  So the command runs until the turn ends even without `--wait`; when a deadline or signal ends
-  it, agent-talk waits briefly for the prompt to run, cancels it and waits for the `cancelled`
-  response. Through a leader the turn continues after the command.
+  So agent-talk observes the turn to its end even without `--wait`, in the command or, over MCP,
+  in the server (§4); when a deadline or signal ends observation, agent-talk waits briefly for the
+  prompt to run, cancels it and waits for the `cancelled` response. Through a leader the turn
+  continues after the command.
 - `wait` on a turn agent-talk is not observing polls `updates.jsonl` for its `turn_completed`; a
   direct child that exited without one leaves the turn `interrupted` or `unknown`.
 
@@ -748,8 +759,8 @@ with `--caller`.
 - **Rust, single binary.** Agents call the CLI many times per session; startup time and one
   artifact per platform matter.
 - **No agent-talk daemon.** The agents already run the shared processes; another daemon would add
-  install, pid and version-skew problems for state that fits in SQLite. Long-lived state, if ever
-  needed, goes into the per-session `agent-talk mcp` process.
+  install, pid and version-skew problems for state that fits in SQLite. Long-lived state goes into
+  the per-session `agent-talk mcp` process, which keeps Grok turns after their call returned (§4).
 - **The user configures the MCP server globally.** agent-talk never injects itself into a session
   or edits agent configuration, even where the agent's API allows per-thread servers.
 - **Never approve.** Decline or reject is the strongest answer; `once`, `always` and `accept` are
@@ -803,13 +814,6 @@ with `--caller`.
 
 - Connection loss mid-`wait` ends with `E_TRANSPORT` (OpenCode re-reads history once on a clean
   stream end, Codex does not); recovery is `wait --receipt`.
-- MCP clients have their own tool timeout (Codex documents a 60 s default for
-  [`tool_timeout_sec`](https://learn.chatgpt.com/docs/config-file/config-reference)). Grok
-  `new` and `send` wait for the turn even with `wait=false`, so the client can time out before
-  it receives the handle and receipt; `ls` recovers the handle, not the receipt. The server
-  does not forward a client's cancellation, so the operation may go on after the client stopped
-  waiting. Neither tells whether the turn completed. Client timeout and server
-  shutdown behaviour are untested.
 - Sender attribution cannot detect a daemon or service started from another agent's shell; the
   message is then attributed to that agent's session, and its hop depth counted from there.
 - OpenCode and Grok apply a settings change before the message is submitted; when the message

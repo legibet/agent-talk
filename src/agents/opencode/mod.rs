@@ -19,7 +19,7 @@ use crate::agents::lifecycle::{
     ApprovalPolicy, approval_policy, bounded, record, reject, resolve, settle, wait_receipt,
 };
 use crate::agents::{
-    Agent, AgentStatus, Check, ListFilter, Operation, Outgoing, SendRequest, StartRequest,
+    Agent, AgentStatus, Check, ListFilter, Operation, Outgoing, SendRequest, StartRequest, Wait,
     WaitTarget,
 };
 use crate::model::{
@@ -492,7 +492,8 @@ impl Agent for OpenCode<'_> {
         Ok(Page { items, next_cursor })
     }
 
-    async fn start(&self, req: &StartRequest<'_>, deadline: Option<Instant>) -> Result<Outcome> {
+    async fn start(&self, req: &StartRequest<'_>, wait: Wait) -> Result<Outcome> {
+        let deadline = wait.deadline();
         let svc = self.connect().await?;
         // The service answers a location's first requests before its configuration is
         // applied: no default model, agents without the user's rules (opencode 2.0.23).
@@ -542,12 +543,8 @@ impl Agent for OpenCode<'_> {
             .await
     }
 
-    async fn send(
-        &self,
-        session_id: &str,
-        req: &SendRequest<'_>,
-        deadline: Option<Instant>,
-    ) -> Result<Outcome> {
+    async fn send(&self, session_id: &str, req: &SendRequest<'_>, wait: Wait) -> Result<Outcome> {
+        let deadline = wait.deadline();
         let svc = self.connect().await?;
         // The session stores its model, variant and rules, and the service applies a change
         // from the next step on, so only the change is sent, before the message is recorded:

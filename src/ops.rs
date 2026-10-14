@@ -3,7 +3,7 @@
 
 use crate::agents::history::ReadQuery;
 use crate::agents::{
-    Adapter, Agent, AgentStatus, ListFilter, Outgoing, SendRequest, Settings, StartRequest,
+    Adapter, Agent, AgentStatus, ListFilter, Outgoing, SendRequest, Settings, StartRequest, Wait,
     WaitTarget, delivered,
 };
 use crate::model::{
@@ -53,8 +53,7 @@ pub struct NewArgs {
     /// Title the agent stores for the new session.
     pub name: Option<String>,
     pub settings: Settings,
-    /// Observe the first turn for this long; `None` returns once the agent accepted it.
-    pub wait: Option<Duration>,
+    pub wait: Wait,
     pub from: Caller,
 }
 
@@ -66,8 +65,7 @@ pub struct SendArgs {
     /// Settings wanted before the message; only on a session agent-talk started, where the
     /// values that differ from the session's are changed.
     pub settings: Settings,
-    /// Observe the turn for this long; `None` returns once the agent accepted the message.
-    pub wait: Option<Duration>,
+    pub wait: Wait,
     pub from: Caller,
 }
 
@@ -202,7 +200,7 @@ pub async fn new(store: &Store, a: NewArgs) -> Result<Outcome> {
         name: a.name.as_deref(),
         settings: &a.settings,
     };
-    let mut o = agent.start(&req, a.wait.map(deadline)).await?;
+    let mut o = agent.start(&req, a.wait).await?;
     o.from = Some(a.from);
     Ok(o)
 }
@@ -248,7 +246,7 @@ pub async fn send(store: &Store, a: SendArgs) -> Result<Outcome> {
         change: &change,
         settings: settings.as_ref(),
     };
-    let res = agent.send(id, &req, a.wait.map(deadline)).await;
+    let res = agent.send(id, &req, a.wait).await;
     if let (Err(e), Some(c)) = (&res, &current)
         && !change.is_empty()
         && e.receipt

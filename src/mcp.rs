@@ -5,7 +5,7 @@
 //! object returned as a tool error (`isError: true`), not a protocol error.
 
 use crate::agents::history::ReadQuery;
-use crate::agents::{Settings, WaitTarget};
+use crate::agents::{Settings, Wait, WaitTarget};
 use crate::model::{self, Caller, Error, ErrorCode, Outcome};
 use crate::ops::{
     self, DEFAULT_TIMEOUT, LS_LIMIT, LsArgs, MODELS_LIMIT, Models, ModelsArgs, NewArgs, READ_LIMIT,
@@ -24,6 +24,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::path::PathBuf;
 use std::time::Duration;
+use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
+use tokio::time::Instant;
+use tokio_util::task::TaskTracker;
 
 const INSTRUCTIONS: &str = "Tools for sending messages to sessions of other agents on this \
 machine and reading their replies. The agents are codex (Codex), claude (Claude Code), opencode \
@@ -45,6 +49,9 @@ pub struct Server {
     /// `_meta` (DESIGN.md §4). Grok's goes first because Claude's is also inherited by
     /// every shell command.
     env: Option<Caller>,
+    /// The operations running, including the Grok turns kept after their call returned;
+    /// the server exits once they have ended (DESIGN.md §4).
+    tasks: TaskTracker,
     tool_router: ToolRouter<Self>,
 }
 
@@ -94,9 +101,19 @@ struct NewParams {
     timeout_s: Option<u64>,
 }
 
-fn wait_for(wait: Option<bool>, timeout_s: Option<u64>) -> Option<Duration> {
-    wait.unwrap_or(false)
-        .then(|| timeout_s.map_or(DEFAULT_TIMEOUT, Duration::from_secs))
+/// What `new` and `send` wait for: with wait=true the end of the turn, until the timeout;
+/// otherwise the acceptance of the message, with a keeper for a turn that needs agent-talk
+/// until it ends (Grok): its outcome arrives on the receiver at acceptance, and the turn goes
+/// on in the server (DESIGN.md §4).
+fn wait_for(wait: Option<bool>, timeout_s: Option<u64>) -> (Wait, oneshot::Receiver<Outcome>) {
+    let (keeper, kept) = oneshot::channel();
+    let wait = if wait.unwrap_or(false) {
+        let timeout = timeout_s.map_or(DEFAULT_TIMEOUT, Duration::from_secs);
+        Wait::Turn(Instant::now() + timeout)
+    } else {
+        Wait::Accepted(Some(keeper))
+    };
+    (wait, kept)
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -151,11 +168,22 @@ fn tool_error(e: Error) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(json!({ "error": e }).to_string())])
 }
 
+fn tool_result<T: Serialize>(
+    res: Result<model::Result<T>, tokio::task::JoinError>,
+) -> CallToolResult {
+    match res {
+        Ok(Ok(out)) => CallToolResult::structured(serde_json::to_value(&out).unwrap()),
+        Ok(Err(e)) => tool_error(e),
+        Err(e) => tool_error(Error::transport("command failed", e)),
+    }
+}
+
 impl Server {
     fn new(pinned: Option<Caller>, env: Option<Caller>) -> Self {
         Server {
             pinned,
             env,
+            tasks: TaskTracker::new(),
             tool_router: Self::tool_router(),
         }
     }
@@ -209,25 +237,45 @@ impl Server {
         }
     }
 
-    /// Run one operation and return what `--json` would print.
-    async fn exec<T: Serialize + Send + 'static>(
+    /// Start one operation.
+    fn spawn<T: Send + 'static>(
         &self,
         op: impl AsyncFnOnce(&Store) -> model::Result<T> + Send + 'static,
-    ) -> CallToolResult {
+    ) -> JoinHandle<model::Result<T>> {
         // Agent futures hold the store's rusqlite connection (Send, not Sync), so they
         // are not Send; run each operation on a blocking thread of the same runtime.
         let rt = tokio::runtime::Handle::current();
-        let res = tokio::task::spawn_blocking(move || {
+        self.tasks.spawn_blocking(move || {
             rt.block_on(async {
                 let store = Store::open()?;
                 op(&store).await
             })
         })
-        .await;
-        match res {
-            Ok(Ok(out)) => CallToolResult::structured(serde_json::to_value(&out).unwrap()),
-            Ok(Err(e)) => tool_error(e),
-            Err(e) => tool_error(Error::transport("command failed", e)),
+    }
+
+    /// Run one operation and return what `--json` would print.
+    async fn exec<T: Serialize + Send + 'static>(
+        &self,
+        op: impl AsyncFnOnce(&Store) -> model::Result<T> + Send + 'static,
+    ) -> CallToolResult {
+        tool_result(self.spawn(op).await)
+    }
+
+    /// Run `new` or `send`: the outcome a kept turn hands over at acceptance, while the
+    /// operation goes on, else the operation's own (`from` is what `ops` would set).
+    async fn mutate(
+        &self,
+        kept: oneshot::Receiver<Outcome>,
+        from: Caller,
+        op: impl AsyncFnOnce(&Store) -> model::Result<Outcome> + Send + 'static,
+    ) -> CallToolResult {
+        let task = self.spawn(op);
+        match kept.await {
+            Ok(o) => tool_result(Ok(Ok(Outcome {
+                from: Some(from),
+                ..o
+            }))),
+            Err(_) => tool_result(task.await),
         }
     }
 }
@@ -274,13 +322,15 @@ impl Server {
         title = "New session",
         output_schema = schema_for_type::<Outcome>(),
         annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = false),
-        description = "Start an agent session in cwd and send its first message. The session does not inherit the caller's conversation history. Returns a handle and a receipt. With wait=true, waits for the first turn to end and includes its result, with the reply in turn.final_text. With wait=false, returns once the agent accepts the message; Grok still waits for the turn to end."
+        description = "Start an agent session in cwd and send its first message. The session does not inherit the caller's conversation history. Returns a handle and a receipt. With wait=true, waits for the first turn to end and includes its result, with the reply in turn.final_text. With wait=false, returns once the agent accepts the message; wait with the receipt returns the result."
     )]
     async fn new_session(
         &self,
         meta: RequestMetaObject,
         Parameters(p): Parameters<NewParams>,
     ) -> CallToolResult {
+        let (wait, kept) = wait_for(p.wait, p.timeout_s);
+        let from = self.sender(&meta);
         let args = NewArgs {
             agent: p.agent,
             cwd: PathBuf::from(p.cwd),
@@ -291,10 +341,10 @@ impl Server {
                 effort: p.effort,
                 full_access: p.full_access.unwrap_or(false),
             },
-            wait: wait_for(p.wait, p.timeout_s),
-            from: self.sender(&meta),
+            wait,
+            from: from.clone(),
         };
-        self.exec(async move |store| ops::new(store, args).await)
+        self.mutate(kept, from, async move |store| ops::new(store, args).await)
             .await
     }
 
@@ -302,13 +352,15 @@ impl Server {
         title = "Send message",
         output_schema = schema_for_type::<Outcome>(),
         annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = false),
-        description = "Continue an existing session by sending a message. On Codex, OpenCode and Grok through a live leader, a message sent during a turn is queued by default. model, effort and full_access change the session's settings first; they work only on sessions created by agent-talk and not with steer. Returns a receipt. With wait=true, waits for the turn to end and includes its result, with the reply in turn.final_text. With wait=false, returns once the agent accepts the message; Grok still waits for the turn to end. One OpenCode reply can cover several queued messages. Use read to see them in the conversation."
+        description = "Continue an existing session by sending a message. On Codex, OpenCode and Grok through a live leader, a message sent during a turn is queued by default. model, effort and full_access change the session's settings first; they work only on sessions created by agent-talk and not with steer. Returns a receipt. With wait=true, waits for the turn to end and includes its result, with the reply in turn.final_text. With wait=false, returns once the agent accepts the message; wait with the receipt returns the result. One OpenCode reply can cover several queued messages. Use read to see them in the conversation."
     )]
     async fn send(
         &self,
         meta: RequestMetaObject,
         Parameters(p): Parameters<SendParams>,
     ) -> CallToolResult {
+        let (wait, kept) = wait_for(p.wait, p.timeout_s);
+        let from = self.sender(&meta);
         let args = SendArgs {
             handle: p.handle,
             text: p.text,
@@ -318,10 +370,10 @@ impl Server {
                 effort: p.effort,
                 full_access: p.full_access.unwrap_or(false),
             },
-            wait: wait_for(p.wait, p.timeout_s),
-            from: self.sender(&meta),
+            wait,
+            from: from.clone(),
         };
-        self.exec(async move |store| ops::send(store, args).await)
+        self.mutate(kept, from, async move |store| ops::send(store, args).await)
             .await
     }
 
@@ -376,7 +428,8 @@ impl ServerHandler for Server {
     }
 }
 
-/// Serve until the client closes stdin.
+/// Serve until the client closes stdin, then exit once the operations still running,
+/// kept turns included, have ended (DESIGN.md §4).
 pub async fn serve(caller_arg: Option<String>) -> model::Result<()> {
     // Reject a malformed handle before accepting requests.
     let pinned = caller_arg
@@ -392,6 +445,7 @@ pub async fn serve(caller_arg: Option<String>) -> model::Result<()> {
     .find_map(|(var, agent)| env_var(var).map(|s| Caller::agent(&format!("{agent}:{s}"))));
     tracing::info!("agent-talk mcp: pinned {pinned:?}, env {env:?}");
     let server = Server::new(pinned, env);
+    let tasks = server.tasks.clone();
     let running = server
         .serve(rmcp::transport::stdio())
         .await
@@ -400,6 +454,8 @@ pub async fn serve(caller_arg: Option<String>) -> model::Result<()> {
         .waiting()
         .await
         .map_err(|e| Error::transport("mcp", e))?;
+    tasks.close();
+    tasks.wait().await;
     Ok(())
 }
 
