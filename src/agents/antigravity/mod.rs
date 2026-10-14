@@ -24,7 +24,7 @@ use self::run::{Event, Run, agent_error, args, decode, wait_init};
 use self::transcript::{
     ends_with_reply, load, messages, preview, span_reply, turn_span, user_input,
 };
-use crate::agents::child::{Runs, agent_cmd, cli_version, lock, observe, pid_alive, tail};
+use crate::agents::child::{Runs, agent_cmd, cli_version, lock, pid_alive, tail};
 use crate::agents::history::{ReadPage, ReadQuery, cut};
 use crate::agents::lifecycle::{
     bounded, note_waiting, record, reject_unstarted, settle, wait_receipt,
@@ -85,13 +85,13 @@ struct RunWatch {
 
 impl RunWatch {
     /// Apply one run-log line: refuse a run in another conversation, accept the receipt
-    /// on the user step.
-    fn on_event(&mut self, store: &Store, line: &str) -> Result<()> {
+    /// on the user step. Whether agy has taken the message.
+    fn on_event(&mut self, store: &Store, line: &str) -> Result<bool> {
         let Some(ev) = decode(line) else {
             if serde_json::from_str::<Value>(line).is_err() {
                 tracing::warn!("non-JSON line from agy: {line}");
             }
-            return Ok(());
+            return Ok(self.run.turn_id().is_some());
         };
         // agy starts a new conversation, with a warning only, when it does not find the id
         // (DESIGN.md §6.5).
@@ -113,7 +113,7 @@ impl RunWatch {
         if !accepted && let Some(t) = self.run.turn_id() {
             store.accept(&self.receipt_id, None, Some(&t), None)?;
         }
-        Ok(())
+        Ok(self.run.turn_id().is_some())
     }
 }
 
@@ -371,9 +371,10 @@ impl<'a> Antigravity<'a> {
         Ok((turn, approvals))
     }
 
-    /// Write the message, close stdin, and observe the run to its `result` (or until
-    /// `deadline` / Ctrl-C, after which the process keeps running and is tracked by its
-    /// pid); then settle the receipt. The caller holds the conversation lock.
+    /// Write the message, close stdin, and observe the run to its `result`, until `deadline`
+    /// or Ctrl-C, or without a deadline until agy took the message; the process keeps
+    /// running after that, tracked by its pid. Then settle the receipt. The caller holds the
+    /// conversation lock.
     async fn execute(
         &self,
         mut child: Child,
@@ -392,12 +393,18 @@ impl<'a> Antigravity<'a> {
             self.runs
                 .deliver(&mut child, format!("{line}\n").as_bytes())
                 .await?;
-            let status = tail(&mut child, &log, |l| watch.on_event(self.store, l)).await?;
+            let Some(status) = tail(&mut child, &log, deadline.is_none(), |l| {
+                watch.on_event(self.store, l)
+            })
+            .await?
+            else {
+                return Ok(None);
+            };
             let (turn, denied) = self.finished(&h, &watch.receipt_id, &watch.run, Some(status))?;
             approvals = denied;
-            Ok(turn)
+            Ok(Some(turn))
         };
-        let res = observe(deadline, work).await;
+        let res = bounded(deadline, work).await;
         settle(
             self.store,
             h,

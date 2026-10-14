@@ -446,8 +446,28 @@ def recover(a: Agent):
     expect(n == 1, f"the message was delivered once, found {n}")
 
 
+def detach(a: Agent):
+    """send over MCP with wait=false returns the receipt once the message is accepted, while the
+    turn goes on (an agent-talk child holds the session meanwhile); wait finds the turn."""
+    h = need(a.name)
+    with Mcp(a.env) as m:
+        is_err, out = m.call("send", {"handle": h, "text": a.slow})
+        expect(not is_err, "send returns")
+        r = out["receipt"]
+        receipts.setdefault(a.name, []).append(r["receipt_id"])
+        expect(r["state"] == "accepted" and not out.get("turn"), "the receipt accepted, no turn")
+        if a.held_by_child:
+            out = cli("send", h, "x", env=a.env, expect_exit=(0, 2))
+            if not err(out):
+                raise Inconclusive("the turn ended before the second send")
+            expect(code(out) == "E_LOCKED", "E_LOCKED while the turn runs")
+        is_err, out = m.call("wait", {"handle": h, "receipt": r["receipt_id"], "timeout_s": 300})
+    expect(not is_err and out["turn"]["status"] == "completed", "wait: completed")
+    expect(out["turn"]["turn_id"] == out["receipt"]["turn_id"], "wait: the turn the receipt names")
+
+
 def shared(a: Agent):
-    for name, fn in (("start", start), ("converse", converse), ("recover", recover)):
+    for name, fn in (("start", start), ("converse", converse), ("recover", recover), ("detach", detach)):
         check(a.name, name, lambda fn=fn: fn(a))
 
 
@@ -1012,7 +1032,11 @@ def antigravity_tier():
         # agent-talk's child dies mid-turn: the turn is not reported completed.
         h = need("antigravity")
         p = subprocess.Popen(
-            [B, "send", h, COUNT, "--json"], env=BASE_ENV, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True
+            [B, "send", h, COUNT, "--wait", "--json"],
+            env=BASE_ENV,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
         )
         runs = Path.home() / ".agent-talk/antigravity-runs"
         t0, child = time.time(), []

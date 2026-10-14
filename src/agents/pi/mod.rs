@@ -3,11 +3,11 @@
 //! Each mutation runs one `pi --mode json` process (`new` with `--session-id`, `send` with
 //! `--session <file>`), writes the prompt to its stdin and closes it. The process's stdout
 //! goes to a run log, `~/.agent-talk/pi-runs/<receipt>.ndjson`, which this command tails;
-//! the process keeps running if the command stops observing (deadline, Ctrl-C), and its
-//! pid is recorded so later commands know the run is still alive. The turn id is the id of
-//! the user message's entry in the session file, learned when pi reports the message
-//! taken. History, turn boundaries and listings come from the session files under pi's
-//! agent dir.
+//! the process keeps running when the command stops observing (deadline, Ctrl-C, or the
+//! message taken without one), and its pid is recorded so later commands know the run is
+//! still alive. The turn id is the id of the user message's entry in the session file,
+//! learned when pi reports the message taken. History, turn boundaries and listings come
+//! from the session files under pi's agent dir.
 //!
 //! pi has no permission prompts (tools run with the process's rights) and no marker of a
 //! live process, so there are no approvals to record and a session open in a TUI cannot be
@@ -18,7 +18,7 @@ mod session;
 
 use self::run::Run;
 use self::session::{Entry, check_id, live_branch, load, transcript_turn, turn_end};
-use crate::agents::child::{Runs, agent_cmd, cli_version, lock, observe, pid_alive, tail};
+use crate::agents::child::{Runs, agent_cmd, cli_version, lock, pid_alive, tail};
 use crate::agents::history::{ReadPage, ReadQuery, cut};
 use crate::agents::lifecycle::{bounded, note_waiting, reject_unstarted, settle, wait_receipt};
 use crate::agents::{
@@ -69,8 +69,8 @@ struct RunWatch {
 
 impl RunWatch {
     /// Apply one run-log line: accept the receipt when pi reports the user message taken,
-    /// with the entry id the session file gives it.
-    fn on_line(&mut self, store: &Store, sessions: &Path, line: &str) -> Result<()> {
+    /// with the entry id the session file gives it. Whether pi has taken the message.
+    fn on_line(&mut self, store: &Store, sessions: &Path, line: &str) -> Result<bool> {
         let unaccepted = self.run.user.is_none();
         self.run.apply(line);
         if unaccepted && self.run.user.is_some() {
@@ -90,7 +90,7 @@ impl RunWatch {
             let t = self.turn_id.as_deref();
             store.accept(&self.receipt_id, None, t, t)?;
         }
-        Ok(())
+        Ok(self.run.user.is_some())
     }
 }
 
@@ -194,10 +194,11 @@ impl<'a> Pi<'a> {
         session::find(&self.sessions, id)?.ok_or_else(|| self.missing_file(id))
     }
 
-    /// Record the intent, then run one `pi --mode json` turn of session `id` to completion
-    /// (or until `deadline` / Ctrl-C, after which the process keeps running and is tracked
-    /// by its pid), and settle the receipt. `file` is the session file, `None` for a new
-    /// session. The caller holds the session lock.
+    /// Record the intent, run one `pi --mode json` turn of session `id` and observe it to
+    /// its end, until `deadline` or Ctrl-C, or without a deadline until pi took the message;
+    /// the process keeps running after that, tracked by its pid. Then settle the receipt.
+    /// `file` is the session file, `None` for a new session. The caller holds the session
+    /// lock.
     async fn execute(
         &self,
         id: String,
@@ -236,20 +237,23 @@ impl<'a> Pi<'a> {
             self.runs
                 .deliver(&mut child, message.delivered.as_bytes())
                 .await?;
-            let status = tail(&mut child, &log, |l| {
+            let Some(status) = tail(&mut child, &log, deadline.is_none(), |l| {
                 watch.on_line(self.store, &self.sessions, l)
             })
-            .await?;
+            .await?
+            else {
+                return Ok(None);
+            };
             if watch.run.user.is_none() {
                 return Err(self.reject_startup(&watch.receipt_id, Some(status)));
             }
             let turn_id = watch.turn_id.clone().unwrap_or_default();
             if !watch.run.settled {
-                return Ok(run::exited(h.clone(), turn_id, Some(status)));
+                return Ok(Some(run::exited(h.clone(), turn_id, Some(status))));
             }
-            Ok(watch.run.turn(h.clone(), turn_id))
+            Ok(Some(watch.run.turn(h.clone(), turn_id)))
         };
-        let res = observe(deadline, work).await;
+        let res = bounded(deadline, work).await;
         settle(
             self.store,
             h,

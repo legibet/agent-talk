@@ -253,9 +253,10 @@ agent-talk mcp [--caller H]
 - `--json` on every command; default output is for humans. Exit codes: 0 ok, 2 refused with a
   stable error code, 3 deadline or Ctrl-C/SIGTERM ended the command (outcome unknown), 4
   transport failure.
-- `send` without `--wait` promises only that the agent accepted the message. On Claude, Grok,
-  Antigravity and pi the command still runs to the end of the turn, because the turn lives in the
-  child (and, for Grok, because a direct-mode turn dies with it).
+- `new` and `send` without `--wait` return once the agent accepted the message. The turn goes on
+  in the agent's shared process or, on Claude, Antigravity and pi, in the child, whose run log
+  `wait` reads. A Grok turn needs agent-talk's connection until it ends (§6.4), so on Grok the
+  command still observes to the end of the turn.
 - On agents with an event stream (Codex, OpenCode, Grok), a command that observes the turn
   subscribes before it submits, so no event of the turn is missed.
 - `wait` first checks what is persisted (history, or the run log of an agent-talk child), since the
@@ -803,11 +804,11 @@ with `--caller`.
 - Connection loss mid-`wait` ends with `E_TRANSPORT` (OpenCode re-reads history once on a clean
   stream end, Codex does not); recovery is `wait --receipt`.
 - MCP clients have their own tool timeout (Codex documents a 60 s default for
-  [`tool_timeout_sec`](https://learn.chatgpt.com/docs/config-file/config-reference)). Claude
-  Code, Grok and Antigravity `new` and `send` wait for the turn even with `wait=false`, so the
-  client can time out before it receives the handle and receipt; `ls` recovers the handle, not the
-  receipt. The server does not forward a client's cancellation, so the operation may go on after
-  the client stopped waiting. Neither tells whether the turn completed. Client timeout and server
+  [`tool_timeout_sec`](https://learn.chatgpt.com/docs/config-file/config-reference)). Grok
+  `new` and `send` wait for the turn even with `wait=false`, so the client can time out before
+  it receives the handle and receipt; `ls` recovers the handle, not the receipt. The server
+  does not forward a client's cancellation, so the operation may go on after the client stopped
+  waiting. Neither tells whether the turn completed. Client timeout and server
   shutdown behaviour are untested.
 - Sender attribution cannot detect a daemon or service started from another agent's shell; the
   message is then attributed to that agent's session, and its hop depth counted from there.

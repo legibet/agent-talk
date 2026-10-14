@@ -4,10 +4,10 @@
 //! `--session-id`, `send` with `--resume`) and writes one user line carrying the
 //! agent-talk's uuid, which becomes the transcript `user.uuid` and so the turn id. The
 //! process's stdout goes to a run log, `~/.agent-talk/claude-runs/<receipt>.ndjson`,
-//! which this command tails; the process keeps running if the command stops observing
-//! (deadline, Ctrl-C), and its pid is recorded so later commands know the run is
-//! still alive. History, turn boundaries and listings come from the transcripts under
-//! `~/.claude/projects` and from `claude agents --json --all`.
+//! which this command tails; the process keeps running when the command stops observing
+//! (deadline, Ctrl-C, or the message taken without one), and its pid is recorded so later
+//! commands know the run is still alive. History, turn boundaries and listings come from
+//! the transcripts under `~/.claude/projects` and from `claude agents --json --all`.
 //!
 //! Approvals: agent-talk never passes `--permission-prompt-tool stdio`, so claude never
 //! asks the host (`control_request`); it denies on its own and the denials are surfaced.
@@ -20,7 +20,7 @@ mod transcript;
 use self::process::{AgentEntry, TurnArgs, agents};
 use self::stream::{Run, StreamEvent, System};
 use self::transcript::{TurnEnd, head, live_branch, load, slug, transcript_turn, turn_end};
-use crate::agents::child::{Runs, cli_version, lock, observe, pid_alive, tail};
+use crate::agents::child::{Runs, cli_version, lock, pid_alive, tail};
 use crate::agents::history::{ReadPage, ReadQuery, cut, first_line};
 use crate::agents::lifecycle::{
     ApprovalPolicy, bounded, note_waiting, record, reject_unstarted, settle, wait_receipt,
@@ -152,13 +152,13 @@ struct RunWatch {
 
 impl RunWatch {
     /// Apply one run-log line: accept the receipt when the run starts and record the
-    /// agent's permission denials.
-    fn on_event(&mut self, store: &Store, line: &str) -> Result<()> {
+    /// agent's permission denials. Whether claude has taken the message.
+    fn on_event(&mut self, store: &Store, line: &str) -> Result<bool> {
         let ev = match stream::decode(line) {
             Ok(ev) => ev,
             Err(e) => {
                 tracing::warn!("undecodable line from claude ({e}): {line}");
-                return Ok(());
+                return Ok(self.run.started());
             }
         };
         let started = self.run.started();
@@ -219,7 +219,7 @@ impl RunWatch {
                 Some(&self.turn_id),
             )?;
         }
-        Ok(())
+        Ok(self.run.started())
     }
 }
 
@@ -444,9 +444,9 @@ impl<'a> Claude<'a> {
         })
     }
 
-    /// Run one `claude -p` turn to completion (or until `deadline` / Ctrl-C, after
-    /// which the process keeps running and is tracked by its pid), then settle the receipt.
-    /// The caller holds the session lock.
+    /// Run one `claude -p` turn and observe it to its end, until `deadline` or Ctrl-C, or
+    /// without a deadline until claude took the message; the process keeps running after
+    /// that, tracked by its pid. Then settle the receipt. The caller holds the session lock.
     async fn execute(
         &self,
         cwd: &str,
@@ -476,7 +476,13 @@ impl<'a> Claude<'a> {
             self.runs
                 .deliver(&mut child, format!("{line}\n").as_bytes())
                 .await?;
-            let status = tail(&mut child, &log, |l| watch.on_event(self.store, l)).await?;
+            let Some(status) = tail(&mut child, &log, deadline.is_none(), |l| {
+                watch.on_event(self.store, l)
+            })
+            .await?
+            else {
+                return Ok(None);
+            };
             self.finished(
                 &watch.id,
                 &watch.receipt_id,
@@ -484,8 +490,9 @@ impl<'a> Claude<'a> {
                 &watch.run,
                 Some(status),
             )
+            .map(Some)
         };
-        let res = observe(deadline, work).await;
+        let res = bounded(deadline, work).await;
         settle(
             self.store,
             h,

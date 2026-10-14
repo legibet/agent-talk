@@ -1,15 +1,13 @@
 //! Agent CLIs as children of agent-talk, and the local files around them: the session
 //! lock and the run log a child writes.
 
-use crate::agents::lifecycle::bounded;
-use crate::model::{AgentError, Error, ErrorCode, Result, Turn};
+use crate::model::{AgentError, Error, ErrorCode, Result};
 use std::fs::{File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
-use tokio::time::Instant;
 
 /// The environment variables naming the session an agent-talk command runs in, with
 /// the agent each one belongs to, in the order the CLI derives its sender from them (DESIGN.md §4).
@@ -181,25 +179,17 @@ impl Runs {
     }
 }
 
-/// Observe the turn of a child this command started until it ends, `deadline` passes or a
-/// signal arrives. A run is synchronous: without a deadline the turn still runs to its end,
-/// and only a signal stops observing early. But `new` and `send` without a deadline promise
-/// only acceptance, as on every agent, so then the observed turn is not reported.
-pub async fn observe(
-    deadline: Option<Instant>,
-    turn: impl Future<Output = Result<Turn>>,
-) -> Result<Option<Turn>> {
-    let turn = bounded(deadline, turn).await?;
-    Ok(deadline.is_some().then_some(turn))
-}
-
 /// Feed each line of a child's run log (its stdout, redirected to `log`) to `on_line` as it
-/// is written, until the process exits (Claude, Antigravity and pi runs).
+/// is written; `on_line` says whether the child has taken the message (Claude, Antigravity
+/// and pi runs). Returns the exit status once the process exits, or `None` as soon as the
+/// message is taken when `until_accepted`: the run then goes on without this command,
+/// tracked by its pid (DESIGN.md §3).
 pub async fn tail(
     child: &mut Child,
     log: &Path,
-    mut on_line: impl FnMut(&str) -> Result<()>,
-) -> Result<ExitStatus> {
+    until_accepted: bool,
+    mut on_line: impl FnMut(&str) -> Result<bool>,
+) -> Result<Option<ExitStatus>> {
     let file = tokio::fs::File::open(log)
         .await
         .map_err(|e| Error::transport(log.display(), e))?;
@@ -214,10 +204,11 @@ pub async fn tail(
         if n > 0 {
             // A partial line is completed by the next read, unless the process is gone.
             if buf.ends_with('\n') || exited.is_some() {
-                if !buf.trim().is_empty() {
-                    on_line(buf.trim())?;
-                }
+                let accepted = !buf.trim().is_empty() && on_line(buf.trim())?;
                 buf.clear();
+                if accepted && until_accepted {
+                    return Ok(None);
+                }
             }
             continue;
         }
@@ -226,7 +217,7 @@ pub async fn tail(
             if !buf.trim().is_empty() {
                 on_line(buf.trim())?;
             }
-            return Ok(status);
+            return Ok(Some(status));
         }
         match child
             .try_wait()

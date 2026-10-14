@@ -274,7 +274,7 @@ impl Server {
         title = "New session",
         output_schema = schema_for_type::<Outcome>(),
         annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = false),
-        description = "Start an agent session in cwd and send its first message. The session does not inherit the caller's conversation history. Returns a handle and a receipt. With wait=true, waits for the first turn to end and includes its result, with the reply in turn.final_text. With wait=false, Codex and OpenCode return after accepting the message. Claude Code, Grok and Antigravity still wait for the turn to end."
+        description = "Start an agent session in cwd and send its first message. The session does not inherit the caller's conversation history. Returns a handle and a receipt. With wait=true, waits for the first turn to end and includes its result, with the reply in turn.final_text. With wait=false, returns once the agent accepts the message; Grok still waits for the turn to end."
     )]
     async fn new_session(
         &self,
@@ -302,7 +302,7 @@ impl Server {
         title = "Send message",
         output_schema = schema_for_type::<Outcome>(),
         annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = false),
-        description = "Continue an existing session by sending a message. On Codex, OpenCode and Grok through a live leader, a message sent during a turn is queued by default. model, effort and full_access change the session's settings first; they work only on sessions created by agent-talk and not with steer. Returns a receipt. With wait=true, waits for the turn to end and includes its result, with the reply in turn.final_text. With wait=false, Codex and OpenCode return after accepting the message. Claude Code, Grok and Antigravity still wait for the turn to end. One OpenCode reply can cover several queued messages. Use read to see them in the conversation."
+        description = "Continue an existing session by sending a message. On Codex, OpenCode and Grok through a live leader, a message sent during a turn is queued by default. model, effort and full_access change the session's settings first; they work only on sessions created by agent-talk and not with steer. Returns a receipt. With wait=true, waits for the turn to end and includes its result, with the reply in turn.final_text. With wait=false, returns once the agent accepts the message; Grok still waits for the turn to end. One OpenCode reply can cover several queued messages. Use read to see them in the conversation."
     )]
     async fn send(
         &self,

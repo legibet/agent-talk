@@ -69,8 +69,8 @@ Returning to it with `/resume` overwrites messages that agent-talk added in the 
 the session handle and receipt. Turns can take minutes. Use a background job or a shell execution
 timeout longer than `--timeout <seconds>`, which defaults to 600 seconds.
 
-For parallel work, Codex and OpenCode allow `new` and `send` without `--wait`. These return once
-the message is accepted, with a handle and receipt. Use that receipt to retrieve the result:
+For parallel work, run `new` and `send` without `--wait`. These return once the message is
+accepted, with a handle and receipt. Use that receipt to retrieve the result:
 
 ```sh
 agent-talk wait <handle> --receipt <receipt-id>
@@ -79,9 +79,8 @@ agent-talk wait <handle> --receipt <receipt-id>
 If the turn has finished, `wait` returns its result immediately. Otherwise, it waits up to 600
 seconds by default; `--timeout <seconds>` sets a different limit.
 
-Claude Code, Grok, Antigravity and pi run the turn to its end even without `--wait`. For parallel
-work with these agents, run each command as a separate background job and keep `--wait` to
-include the reply in its output.
+Grok runs the turn to its end even without `--wait`. For parallel work with Grok, run each command
+as a separate background job and keep `--wait` to include the reply in its output.
 
 Exit code 0 can still accompany a failed turn. The turn status reports `completed`, `failed`,
 `interrupted` or `unknown`; a reply from an unfinished or failed turn may be partial. Each
