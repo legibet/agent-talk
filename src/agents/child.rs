@@ -214,8 +214,9 @@ pub async fn tail(
         }
         // End of what has been written so far.
         if let Some(status) = exited {
-            if !buf.trim().is_empty() {
-                on_line(buf.trim())?;
+            let accepted = !buf.trim().is_empty() && on_line(buf.trim())?;
+            if accepted && until_accepted {
+                return Ok(None);
             }
             return Ok(Some(status));
         }

@@ -460,6 +460,7 @@ def detach(a: Agent):
         if a.held_by_child or a.name == "grok":
             out = cli("send", h, "x", env=a.env, expect_exit=(0, 2))
             if not err(out):
+                cli("wait", h, "--receipt", out["receipt"]["receipt_id"], "--timeout", "300", env=a.env)
                 raise Inconclusive("the turn ended before the second send")
             expect(code(out) == "E_LOCKED", "E_LOCKED while the turn runs")
         is_err, out = m.call("wait", {"handle": h, "receipt": r["receipt_id"], "timeout_s": 300})
