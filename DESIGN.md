@@ -418,9 +418,12 @@ agent-talk did not start), in the session's cwd. agent-talk writes one user line
   effort, at a marker, a later prompt on the live branch, or once no live process holds the
   session; a foreign `-p` turn still running stays `running`.
 
-**Liveness and writers.** `claude agents --json --all` lists every live process, TUI and `-p`
-alike, with pid and a `busy`/`idle` status; exited processes disappear. agent-talk tells its own
-children by its pid records, not by the listing's `kind`. Claude has no lock between processes: a
+**Liveness and writers.** `claude agents --json --all` lists every live process, TUI, `-p` and
+background session (`claude --bg`) alike, with pid and a `busy`/`idle` status; an exited process
+disappears. `--all` also lists background sessions that ended, with a `state` (`failed`,
+`stopped`) and no pid, so only an entry with a pid counts as live (2.1.302). agent-talk tells
+its own children by its pid records, not by the listing's `kind`, which is `interactive` for a
+`-p` process too. Claude has no lock between processes: a
 concurrent `--resume` mid-turn writes a second branch, and the next `--resume` follows only the
 newest leaf, dropping the other. Hence `E_FOREIGN_LIVE` for a live pid that is not an agent-talk
 child, `E_LOCKED` for one that is, and `E_CAP_MISSING` when `claude agents` fails.

@@ -69,7 +69,8 @@ pub struct AgentEntry {
     pub session_id: Option<String>,
     pub cwd: Option<String>,
     pub kind: Option<String>,
-    /// Background sessions: running, failed, …
+    /// Background sessions, live or ended: blocked, failed, stopped, … (2.1.302). A live one
+    /// waiting for its next prompt showed `blocked` with status `idle`.
     pub state: Option<String>,
     /// Live processes: busy | idle
     pub status: Option<String>,
