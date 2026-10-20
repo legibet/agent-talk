@@ -4,6 +4,7 @@ pub mod child;
 pub mod claude;
 pub mod codex;
 pub mod decode;
+pub mod devin;
 pub mod grok;
 pub mod history;
 pub mod lifecycle;
@@ -54,10 +55,11 @@ pub enum Adapter<'a> {
     Grok(grok::Grok<'a>),
     Antigravity(antigravity::Antigravity<'a>),
     Pi(pi::Pi<'a>),
+    Devin(devin::Devin<'a>),
 }
 
 impl<'a> Adapter<'a> {
-    pub fn all(store: &'a Store) -> [Adapter<'a>; 6] {
+    pub fn all(store: &'a Store) -> [Adapter<'a>; 7] {
         [
             Adapter::Codex(codex::Codex::new(store)),
             Adapter::Claude(claude::Claude::new(store)),
@@ -65,6 +67,7 @@ impl<'a> Adapter<'a> {
             Adapter::Grok(grok::Grok::new(store)),
             Adapter::Antigravity(antigravity::Antigravity::new(store)),
             Adapter::Pi(pi::Pi::new(store)),
+            Adapter::Devin(devin::Devin::new(store)),
         ]
     }
 
@@ -76,7 +79,7 @@ impl<'a> Adapter<'a> {
                 Error::new(
                     ErrorCode::Unsupported,
                     format!(
-                        "agent {name} is not supported (codex, claude, opencode, grok, antigravity, pi)"
+                        "agent {name} is not supported (codex, claude, opencode, grok, antigravity, pi, devin)"
                     ),
                 )
             })
@@ -90,6 +93,7 @@ impl<'a> Adapter<'a> {
             Adapter::Grok(_) => "grok",
             Adapter::Antigravity(_) => "antigravity",
             Adapter::Pi(_) => "pi",
+            Adapter::Devin(_) => "devin",
         }
     }
 }
@@ -103,6 +107,7 @@ impl Agent for Adapter<'_> {
             Adapter::Grok(p) => p.status().await,
             Adapter::Antigravity(p) => p.status().await,
             Adapter::Pi(p) => p.status().await,
+            Adapter::Devin(p) => p.status().await,
         }
     }
 
@@ -114,6 +119,7 @@ impl Agent for Adapter<'_> {
             Adapter::Grok(p) => p.models().await,
             Adapter::Antigravity(p) => p.models().await,
             Adapter::Pi(p) => p.models().await,
+            Adapter::Devin(p) => p.models().await,
         }
     }
 
@@ -130,6 +136,7 @@ impl Agent for Adapter<'_> {
             Adapter::Grok(p) => p.list(filter, limit, cursor).await,
             Adapter::Antigravity(p) => p.list(filter, limit, cursor).await,
             Adapter::Pi(p) => p.list(filter, limit, cursor).await,
+            Adapter::Devin(p) => p.list(filter, limit, cursor).await,
         }
     }
 
@@ -141,6 +148,7 @@ impl Agent for Adapter<'_> {
             Adapter::Grok(p) => p.start(req, wait).await,
             Adapter::Antigravity(p) => p.start(req, wait).await,
             Adapter::Pi(p) => p.start(req, wait).await,
+            Adapter::Devin(p) => p.start(req, wait).await,
         }
     }
 
@@ -152,6 +160,7 @@ impl Agent for Adapter<'_> {
             Adapter::Grok(p) => p.send(id, req, wait).await,
             Adapter::Antigravity(p) => p.send(id, req, wait).await,
             Adapter::Pi(p) => p.send(id, req, wait).await,
+            Adapter::Devin(p) => p.send(id, req, wait).await,
         }
     }
 
@@ -163,6 +172,7 @@ impl Agent for Adapter<'_> {
             Adapter::Grok(p) => p.read(id, q).await,
             Adapter::Antigravity(p) => p.read(id, q).await,
             Adapter::Pi(p) => p.read(id, q).await,
+            Adapter::Devin(p) => p.read(id, q).await,
         }
     }
 
@@ -174,6 +184,7 @@ impl Agent for Adapter<'_> {
             Adapter::Grok(p) => p.wait(id, target, deadline).await,
             Adapter::Antigravity(p) => p.wait(id, target, deadline).await,
             Adapter::Pi(p) => p.wait(id, target, deadline).await,
+            Adapter::Devin(p) => p.wait(id, target, deadline).await,
         }
     }
 }
@@ -182,10 +193,11 @@ impl Agent for Adapter<'_> {
 pub enum Wait {
     /// The end of the turn, until the deadline passes.
     Turn(Instant),
-    /// The agent's acceptance of the message. A Grok turn needs agent-talk until it ends
-    /// (DESIGN.md §6.4), so the command observes it to its end all the same; given a keeper
-    /// (the MCP server, DESIGN.md §4), the Grok adapter sends it the outcome once the message
-    /// is accepted and goes on observing in the background.
+    /// The agent's acceptance of the message. On agents whose turn needs the command's
+    /// connection until it ends (Grok direct mode, DESIGN.md §6.4; Devin, §6.7) the command
+    /// observes it to its end all the same; given a keeper (the MCP server, DESIGN.md §4),
+    /// the adapter sends it the outcome once the message is accepted and goes on observing in
+    /// the background.
     Accepted(Option<oneshot::Sender<Outcome>>),
 }
 
@@ -268,8 +280,9 @@ pub struct StartRequest<'a> {
     /// The first prompt.
     pub message: Outgoing<'a>,
     /// Title the agent stores for the session (Codex `thread/name/set`, Claude `--name`,
-    /// OpenCode `title`, Grok `_x.ai/session/rename`, pi `--name`; Antigravity has none and
-    /// refuses it); `ls` shows it as `name`.
+    /// OpenCode `title`, Grok `_x.ai/session/rename`, pi `--name`, Devin
+    /// `_cognition.ai/session/rename`; Antigravity has none and refuses it); `ls` shows it as
+    /// `name`.
     pub name: Option<&'a str>,
     pub settings: &'a Settings,
 }

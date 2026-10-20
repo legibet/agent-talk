@@ -1,14 +1,14 @@
 ---
 name: agent-talk
-description: Message other agents (Codex, Claude Code, OpenCode, Grok, Antigravity, pi) through the agent-talk CLI. Use it to hand one a task, ask it a question or for a review, follow up in an existing session, or read what a session did.
+description: Message other agents (Codex, Claude Code, OpenCode, Grok, Antigravity, pi, Devin) through the agent-talk CLI. Use it to hand one a task, ask it a question or for a review, follow up in an existing session, or read what a session did.
 ---
 
 # agent-talk
 
 agent-talk sends messages to other agents' sessions on this machine and reads their replies.
-The agent names are `codex`, `claude`, `opencode`, `grok`, `antigravity` and `pi`. A session is
-identified by a handle, `<agent>:<id>`, returned by `new` or `ls`. Every command accepts `--json`
-for structured output.
+The agent names are `codex`, `claude`, `opencode`, `grok`, `antigravity`, `pi` and `devin`. A
+session is identified by a handle, `<agent>:<id>`, returned by `new` or `ls`. Every command accepts
+`--json` for structured output.
 
 ## Start a session
 
@@ -41,7 +41,7 @@ agent-talk send <handle> "<text>" --wait
 ```
 
 `ls` lists matching sessions with their handles, states and message previews. Omit `--agent` to list
-all six agents. `send` continues the selected session with its history, including sessions created
+all seven agents. `send` continues the selected session with its history, including sessions created
 outside agent-talk. Sessions created by agent-talk keep their model, effort and `--full-access`
 setting on later sends, and `send --model`, `--effort` and `--full-access` change them from that
 message on. These options are refused on sessions created outside agent-talk and together with
@@ -50,11 +50,13 @@ to a Grok session held by its leader.
 
 On Codex, OpenCode and Grok through a live leader, `send` queues the message after the current
 reply. `--steer` adds it to the running turn instead and is refused when the session is idle.
+Other agents refuse `--steer` with `E_NO_STEER`; Devin also refuses a send while a turn runs.
 
 A session open in another client accepts messages when that client shares it with agent-talk: a
 Codex TUI attached to the shared app-server daemon, any OpenCode client, or a Grok TUI started with
-`--leader`. Other live clients, including Claude Code and Antigravity TUIs, cause `E_FOREIGN_LIVE`
-until they release the session. A pi TUI cannot be detected, so a `send` to a session it has
+`--leader`. Other live clients, including Claude Code, Antigravity and Devin TUIs, cause `E_FOREIGN_LIVE`
+until they release the session. A Devin session in its default `normal` mode is refused with
+`E_UNSUPPORTED`; read and wait still work. A pi TUI cannot be detected, so a `send` to a session it has
 open is not refused. The TUI does not show the message, and its next message starts a branch
 beside it. Every pi run continues the newest branch, so a later `send` continues from the TUI's
 messages, without the turn sent before. In sessions created outside agent-talk, agent-talk leaves
@@ -79,8 +81,8 @@ agent-talk wait <handle> --receipt <receipt-id>
 If the turn has finished, `wait` returns its result immediately. Otherwise, it waits up to 600
 seconds by default; `--timeout <seconds>` sets a different limit.
 
-Grok runs the turn to its end even without `--wait`. For parallel work with Grok, run each command
-as a separate background job and keep `--wait` to include the reply in its output.
+Grok and Devin run the turn to its end even without `--wait`. For parallel work with them, run
+each command as a separate background job and keep `--wait` to include the reply in its output.
 
 Exit code 0 can still accompany a failed turn. The turn status reports `completed`, `failed`,
 `interrupted` or `unknown`; a reply from an unfinished or failed turn may be partial. Each
@@ -90,9 +92,9 @@ one reply can cover several queued messages; `read` shows the conversation conta
 Exit code 3 means a timeout or an interrupt (Ctrl-C, or SIGTERM when a background job is
 stopped) left the outcome unknown. Use the receipt printed with the error to check the result
 with `wait`; resending may duplicate the message. If `new` did not print a handle, `ls`
-identifies sessions it created with `origin=agent-talk`. Grok without a leader cancels its turn
-when the command times out or is interrupted; `wait` reports how that turn ended and does not
-restart it.
+identifies sessions it created with `origin=agent-talk`. Grok without a leader and Devin cancel
+the turn when the command times out or is interrupted; `wait` reports how that turn ended and does
+not restart it.
 
 Exit code 2 reports a refused request with an `E_*` code and an explanation of the cause. Exit
 code 4 reports a transport failure, which can occur before or after delivery. If the error

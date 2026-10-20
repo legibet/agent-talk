@@ -2,7 +2,8 @@
 
 agent-talk lets an agent talk with another agent. It can start a session, continue an
 existing one, wait for a reply and read a conversation. It runs as a command-line tool
-or as an MCP server, supporting Codex, Claude Code, OpenCode, Grok CLI, Antigravity CLI and pi.
+or as an MCP server, supporting Codex, Claude Code, OpenCode, Grok CLI, Antigravity CLI, pi and
+Devin CLI.
 
 agent-talk uses each agent's official interface and works on the agent's own sessions. agent-talk
 runs no daemon. Each command connects to the agent, performs one operation and exits.
@@ -31,6 +32,7 @@ cargo install agent-talk
 | Grok CLI        | ACP to `grok agent stdio`, through the shared leader when one runs | none                                                   |
 | Antigravity CLI | `agy -p`                                                           | none                                                   |
 | pi              | `pi --mode json`                                                   | none                                                   |
+| Devin CLI       | ACP to `devin acp` (local sessions)                                | none                                                   |
 
 agent-talk connects to the shared daemon, service or leader when it is running, but never starts
 one itself.
@@ -105,6 +107,10 @@ agent's own TUI or app depends on the agent.
   message or the reply, and its next message starts a branch beside them. pi always continues the
   newest branch, so a later message from agent-talk follows the TUI's messages, and the turn
   agent-talk sent before is no longer in the session's context.
+- Devin CLI: no. Devin lets one process open a session at a time, so while a TUI or another
+  client has it open, agent-talk refuses with `E_FOREIGN_LIVE`. Sessions in Devin's default
+  `normal` permission mode are read-only for agent-talk (`E_UNSUPPORTED`), because Devin's ACP
+  interface would switch them to `accept-edits`.
 
 ## Skill
 

@@ -9,10 +9,10 @@ end-to-end behaviour: receipts and their recovery, turn correlation, queue and s
 foreign holders, approvals, settings, paging, MCP. Facts about the agents themselves live in the
 findings, not here.
 
-    uv run tests/live.py (offline|codex|claude|opencode|grok|antigravity|pi ... | all) [--keep]
+    uv run tests/live.py (offline|codex|claude|opencode|grok|antigravity|pi|devin ... | all) [--keep]
 
 Models: LIVE_CODEX_MODEL, LIVE_CLAUDE_MODEL, LIVE_OPENCODE_MODEL, LIVE_GROK_MODEL,
-LIVE_ANTIGRAVITY_MODEL, LIVE_PI_MODEL override the defaults below. Exit 0 only when every
+LIVE_ANTIGRAVITY_MODEL, LIVE_PI_MODEL, LIVE_DEVIN_MODEL override the defaults below. Exit 0 only when every
 requested check ran and passed.
 """
 
@@ -48,6 +48,7 @@ OPENCODE_MODEL = os.environ.get("LIVE_OPENCODE_MODEL", "deepseek/deepseek-flash"
 GROK_MODEL = os.environ.get("LIVE_GROK_MODEL", "grok-4.7")
 ANTIGRAVITY_MODEL = os.environ.get("LIVE_ANTIGRAVITY_MODEL", "gemini-3.8-flash")
 PI_MODEL = os.environ.get("LIVE_PI_MODEL", "deepseek/deepseek-flash")
+DEVIN_MODEL = os.environ.get("LIVE_DEVIN_MODEL", "swe-2-high")
 
 SESSION_VARS = (
     "CODEX_THREAD_ID",
@@ -317,7 +318,7 @@ def run_init(agent: str, receipt_id: str) -> dict:
 class Agent:
     name: str
     model: str
-    caller_var: str  # the session variable an agent sets for its own shells
+    caller_var: str  # the session variable an agent sets for its own shells (else the pin)
     steer_code: str  # refusal of --steer on an idle session
     bogus_turn: str  # a well-formed turn id that does not exist
     slow: str = COUNT  # a prompt whose turn outlasts `slow_timeout`
@@ -367,6 +368,19 @@ AGENTS = {
         new_args=("--effort", "low"),
     ),
     "pi": Agent("pi", PI_MODEL, "PI_SESSION_ID", "E_NO_STEER", "nothere", new_args=("--effort", "low")),
+    # Devin sets no session variable, so the sender is pinned. The child dies with the command:
+    # the deadline cancels the turn.
+    "devin": Agent(
+        "devin",
+        DEVIN_MODEL,
+        "AGENT_TALK_CALLER",
+        "E_NO_STEER",
+        str(uuid.uuid4()),
+        slow_timeout="5",
+        held_by_child=False,
+        recovered=("interrupted", "completed"),
+        new_args=("--effort", "medium"),
+    ),
 }
 
 
@@ -402,7 +416,8 @@ def converse(a: Agent):
     h = need(a.name)
     caller = f"{a.name}:{uuid.uuid4()}"
     header = f"[from {caller} via agent-talk; answer in your final response]"
-    out = cli("send", h, "reply with the single word kiwi", "--wait", env={**a.env, a.caller_var: native(caller)})
+    pin = caller if a.caller_var == "AGENT_TALK_CALLER" else native(caller)
+    out = cli("send", h, "reply with the single word kiwi", "--wait", env={**a.env, a.caller_var: pin})
     expect(out["from"].get("session") == caller, f"from.session == {caller}")
     expect((out["receipt"].get("delivered_text") or "").startswith(header), "delivered_text carries the header")
     expect(out["turn"]["status"] == "completed" and "kiwi" in final(out), "completed ~ kiwi")
@@ -457,7 +472,7 @@ def detach(a: Agent):
         r = out["receipt"]
         receipts.setdefault(a.name, []).append(r["receipt_id"])
         expect(r["state"] == "accepted" and not out.get("turn"), "the receipt accepted, no turn")
-        if a.held_by_child or a.name == "grok":
+        if a.held_by_child or a.name in ("grok", "devin"):
             out = cli("send", h, "x", env=a.env, expect_exit=(0, 2))
             if not err(out):
                 cli("wait", h, "--receipt", out["receipt"]["receipt_id"], "--timeout", "300", env=a.env)
@@ -1182,6 +1197,216 @@ def pi_tier():
         check("pi", name, fn)
 
 
+# ---------------------------------------------------------------- devin
+
+DEVIN_DIR = Path(os.environ.get("DEVIN_SESSIONS_DIR") or Path.home() / ".local/share/devin/cli")
+# Devin's hooks report to herdr when these are set; the harness runs without them.
+DEVIN_ENV = {k: v for k, v in BASE_ENV.items() if not k.startswith("HERDR_")}
+
+
+def devin_row(sid: str) -> dict:
+    """The session's row in sessions.db, opened read-only."""
+    db = sqlite3.connect(f"file:{DEVIN_DIR / 'sessions.db'}?mode=ro", uri=True)
+    with contextlib.closing(db):
+        db.row_factory = sqlite3.Row
+        row = db.execute("SELECT * FROM sessions WHERE id = ?", (sid,)).fetchone()
+    return dict(row) if row else {}
+
+
+class DevinAcp:
+    """A `devin acp` child of the harness, which holds a session once it loaded it."""
+
+    def __init__(self, cwd: Path):
+        self.p = subprocess.Popen(
+            ["devin", "acp"],
+            cwd=cwd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            env=DEVIN_ENV,
+        )
+        self.next_id = 0
+        self.request("initialize", {"protocolVersion": 1, "clientCapabilities": {}})
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.p.stdin.close()
+        try:
+            self.p.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            self.p.kill()
+
+    def request(self, method: str, params: dict) -> dict:
+        self.next_id += 1
+        rid = self.next_id
+        self.p.stdin.write(json.dumps({"jsonrpc": "2.0", "id": rid, "method": method, "params": params}) + "\n")
+        self.p.stdin.flush()
+        while msg := self.p.stdout.readline():
+            msg = json.loads(msg)
+            if msg.get("id") == rid and "method" not in msg:
+                LAST.update(cmd=f"devin acp {method} {json.dumps(params)}", exit="-", out=msg)
+                return msg
+        raise Fail(f"devin acp exited while waiting for {method}")
+
+
+def devin_tier():
+    a = AGENTS["devin"]
+    shared(a)
+
+    def settings():
+        # Effort is set after the model and stored as the model variant; full access is the
+        # stored bypass mode, which later loads keep.
+        sid = native(need("devin"))
+        expect(devin_row(sid).get("model") == "swe-2-medium", f"new --effort medium: {devin_row(sid).get('model')}")
+        out = new(a, "reply with the single word one", "--wait")
+        h = st["devin_bypass"] = out["handle"]
+        out = cli("send", h, "reply with the single word two", "--effort", "high", "--full-access", "--wait")
+        expect(out["turn"]["status"] == "completed" and "two" in final(out), "completed ~ two")
+        row = devin_row(native(h))
+        expect(row.get("model") == "swe-2-high", f"send --effort high: model {row.get('model')}")
+        expect(row.get("agent_mode") == "bypass", f"send --full-access: mode {row.get('agent_mode')}")
+
+    def tools():
+        # A tool call reads as one `other` message; --raw returns the chain's records.
+        h = need("devin_bypass")
+        out = cli("send", h, "run `ls` with your shell tool, then reply with the single word done", "--wait")
+        expect(out["turn"]["status"] == "completed" and not out["approvals"], "completed, nothing asked")
+        msgs = cli("read", h, "--all", "--limit", "4")["messages"]
+        calls = [m for m in msgs if m["phase"] == "other"]
+        if not calls:
+            raise Inconclusive("the model ran no tool")
+        expect(calls[-1]["text"].startswith("[exec] completed ls"), f"the tool call, got {calls[-1]['text']!r}")
+        raw = cli("read", h, "--raw", "--limit", "4")["raw"]
+        expect(raw and all("role" in r for r in raw), "raw: the chain's chat messages")
+
+    def nowait():
+        # Without --wait the command returns with the receipt only (it still observed the
+        # turn to its end); wait --receipt reads the turn from sessions.db.
+        h = need("devin")
+        out = cli("send", h, "reply with the single word plum")
+        r = out["receipt"]
+        expect(r["state"] == "accepted" and not out.get("turn"), "the receipt accepted, no turn")
+        out = cli("wait", h, "--receipt", r["receipt_id"], "--timeout", "30")
+        expect(out["turn"]["status"] == "completed" and "plum" in final(out), "wait --receipt: completed ~ plum")
+
+    def deadline():
+        # The deadline cancels the turn during its tool call, which Devin records as canceled.
+        # The model takes several seconds to reach the call.
+        h = need("devin_bypass")
+        prompt = "run `sleep 30` with your shell tool, then reply with the single word done"
+        out = cli("send", h, prompt, "--wait", "--timeout", "10", expect_exit=(0, 3))
+        if not err(out):
+            raise Inconclusive("the turn ended before the deadline")
+        expect(code(out) == "E_TIMEOUT" and err(out)["receipt"]["state"] == "accepted", "E_TIMEOUT, accepted")
+        out = cli("wait", h, "--receipt", err(out)["receipt"]["receipt_id"], "--timeout", "30")
+        t = out["turn"]
+        expect(t["status"] == "interrupted", f"interrupted, got {t['status']}")
+        if "canceled" not in (t.get("basis") or ""):
+            raise Inconclusive(f"cancelled before the tool ran ({t.get('basis')})")
+        msgs = cli("read", h, "--all", "--limit", "3")["messages"]
+        expect(any(m["text"].startswith("[exec] cancelled sleep 30") for m in msgs), "read: the cancelled call")
+
+    def reject():
+        # accept-edits asks before a command the user has not allowed: agent-talk rejects it
+        # on its own session and the turn goes on.
+        probe = DIR / "live-devin-probe.txt"
+        probe.unlink(missing_ok=True)
+        out = new(
+            a, "run `touch live-devin-probe.txt` with your shell tool, then reply with the single word done", "--wait"
+        )
+        if not out["approvals"]:
+            raise Inconclusive("no permission request (the model ran no command, or the user allows touch)")
+        expect(out["approvals"][0]["outcome"] == "declined", "the request declined")
+        expect(out["turn"]["status"] == "completed", f"the turn went on, got {out['turn']['status']}")
+        expect(not probe.exists(), "the command did not run")
+
+    def locked():
+        # While an agent-talk child holds the session another send is E_LOCKED; SIGTERM ends
+        # the first command, which cancels its turn.
+        h = need("devin")
+        p = subprocess.Popen(
+            [B, "send", h, a.slow, "--json"],
+            env=env_with(None),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            wait_for(lambda: (ls_row("devin", h) or {}).get("state") == "running", 30, "ls shows the session running")
+            out = cli("send", h, "x", expect_exit=2)
+            expect(code(out) == "E_LOCKED", "E_LOCKED while agent-talk's child runs")
+            expect(err(out).get("agent_error"), "the agent's session_locked error is kept")
+        finally:
+            p.send_signal(signal.SIGTERM)
+            stdout, _ = p.communicate(timeout=60)
+        out = json.loads(stdout)
+        expect(code(out) == "E_INTERRUPTED", f"SIGTERM: E_INTERRUPTED, got {code(out)}")
+        out = cli("wait", h, "--receipt", err(out)["receipt"]["receipt_id"], "--timeout", "30")
+        expect(out["turn"]["status"] in ("interrupted", "completed"), f"the turn ended, got {out['turn']['status']}")
+
+    def foreign_live():
+        # A session another process holds is refused before anything is recorded.
+        h = need("devin")
+        with DevinAcp(DIR) as d:
+            resp = d.request("session/load", {"sessionId": native(h), "cwd": str(DIR), "mcpServers": []})
+            expect("error" not in resp, "the harness holds the session")
+            out = cli("send", h, "x", expect_exit=2)
+            expect(code(out) == "E_FOREIGN_LIVE", "E_FOREIGN_LIVE")
+            expect(f"pid {d.p.pid}" in err(out)["message"], "the error names the holder")
+            row = ls_row("devin", h)
+            expect(row["observations"]["loaded"] == "yes" and row["state"] == "unknown", "ls: loaded, unknown")
+        out = cli("send", h, "reply with the single word free", "--wait")
+        expect("free" in final(out), "after the holder exited: completed ~ free")
+
+    def normal_mode():
+        # A session in Devin's `normal` mode (from -p) is read and waited on, never sent to:
+        # ACP would open it in accept-edits and the prompt would store that.
+        cwd = DIR / "devin-normal"
+        cwd.mkdir(exist_ok=True)
+        p = subprocess.run(
+            ["devin", "-p", "reply with the single word ok", "--model", a.model, "--respect-workspace-trust", "false"],
+            cwd=cwd,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            env=DEVIN_ENV,
+            timeout=180,
+        )
+        listed = subprocess.run(
+            ["devin", "list", "--format", "json"], cwd=cwd, capture_output=True, text=True, env=DEVIN_ENV
+        )
+        rows = sorted(json.loads(listed.stdout or "[]"), key=lambda r: r.get("last_activity_at") or 0)
+        mine = {sid for sid, _ in created.get("devin", [])}
+        rows = [r for r in rows if r["id"] not in mine]
+        expect(p.returncode == 0 and rows, f"devin -p ran ({p.returncode}: {p.stderr[-300:]})")
+        sid = rows[-1]["id"]
+        track("devin", sid)
+        h = f"devin:{sid}"
+        expect(devin_row(sid).get("agent_mode") == "normal", "the session is stored in normal mode")
+        out = cli("send", h, "x", expect_exit=2)
+        expect(code(out) == "E_UNSUPPORTED", "send: E_UNSUPPORTED")
+        expect(devin_row(sid).get("agent_mode") == "normal", "the stored mode is unchanged")
+        msgs = cli("read", h)["messages"]
+        expect([m["phase"] for m in msgs] == ["prompt", "final"], "read: the prompt and the reply")
+        out = cli("wait", h, "--turn", msgs[0]["turn_id"], "--timeout", "30")
+        expect(out["turn"]["status"] == "completed" and "ok" in final(out), "wait --turn on a foreign turn ~ ok")
+
+    for name, fn in (
+        ("settings", settings),
+        ("tools", tools),
+        ("nowait", nowait),
+        ("deadline", deadline),
+        ("reject", reject),
+        ("locked", locked),
+        ("foreign-live", foreign_live),
+        ("normal-mode", normal_mode),
+    ):
+        check("devin", name, fn)
+
+
 # ---------------------------------------------------------------- run
 
 
@@ -1196,10 +1421,25 @@ def preconditions() -> dict[str, str | None]:
     return reasons
 
 
+RAN: set[str] = set()  # tiers this run started
+DEVIN_LOCKS: set[Path] = set()  # Devin's lock files before the run
+
+
+def pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    return True
+
+
 def cleanup():
-    """Remove what the run created, never anything else: Codex threads are archived, OpenCode
-    and Grok sessions deleted through the agent, Claude and pi session files and agent-talk's run
-    logs unlinked. agy has no delete command, so its conversations stay."""
+    """Remove what the run created, never anything else: Codex threads are archived, OpenCode,
+    Grok and Devin sessions deleted through the agent (with Devin's lock files), Claude and pi
+    session files and agent-talk's run logs unlinked. agy has no delete command, so its
+    conversations stay."""
     if ids := [sid for sid, _ in created.get("codex", [])]:
         try:
             with CodexDaemon() as d:
@@ -1222,6 +1462,19 @@ def cleanup():
             if path := find(sid):
                 path.unlink()
                 print(f"cleanup: deleted {path}")
+    locks = DEVIN_DIR / "session_locks"
+    for sid, _ in created.get("devin", []):
+        p = subprocess.run(["devin", "rm", "--force", sid], cwd=DIR, capture_output=True, text=True, env=DEVIN_ENV)
+        (locks / f"{sid}.lock").unlink(missing_ok=True)
+        print(f"cleanup: devin rm {sid}: {(p.stdout or p.stderr).strip().splitlines()[-1:]}")
+    # `models` opens a session it never prompts: a lock file without a session row. Only
+    # files that appeared during the run, whose holder is gone and that no row names.
+    new_locks = set(locks.glob("*.lock")) - DEVIN_LOCKS if "devin" in RAN else set()
+    for path in new_locks:
+        pid = path.read_text().strip()
+        if not devin_row(path.stem) and pid.isdigit() and not pid_alive(int(pid)):
+            path.unlink()
+            print(f"cleanup: deleted {path}")
     for sid, _ in created.get("antigravity", []):
         print(f"cleanup: antigravity conversation {sid} stays (agy has no delete command)")
     for agent in ("claude", "antigravity", "pi"):
@@ -1250,6 +1503,7 @@ TIERS = {
     "grok": grok_tier,
     "antigravity": antigravity_tier,
     "pi": pi_tier,
+    "devin": devin_tier,
 }
 
 
@@ -1275,6 +1529,8 @@ def main():
             RESULTS.append(("SKIP", tier))
         else:
             run.append(tier)
+    RAN.update(run)
+    DEVIN_LOCKS.update((DEVIN_DIR / "session_locks").glob("*.lock"))
     try:
         for tier in run:
             TIERS[tier]()

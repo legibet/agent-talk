@@ -74,7 +74,7 @@ struct WaitOpts {
     /// Wait for the reply and print the finished turn; the reply is its final_text (on
     /// OpenCode the reply of the run that took the message, which may also cover other
     /// queued messages; read shows them). Without it the command returns once the agent
-    /// took the message, except on Grok, which runs the whole turn either way.
+    /// took the message, except on Grok and Devin, which run the whole turn either way.
     #[arg(long)]
     wait: bool,
     /// Seconds to wait with --wait.
@@ -99,7 +99,7 @@ enum Cmd {
     /// List the models an agent can start a session on, with the effort values each
     /// takes; one page per call, sorted by id.
     Models {
-        /// codex, claude, opencode, grok, antigravity or pi.
+        /// codex, claude, opencode, grok, antigravity, pi or devin.
         agent: String,
         /// Only models whose id contains this text.
         query: Option<String>,
@@ -112,7 +112,7 @@ enum Cmd {
     },
     /// List sessions, one page per call; pass a handle to send or read.
     Ls {
-        /// Only this agent: codex, claude, opencode, grok, antigravity or pi.
+        /// Only this agent: codex, claude, opencode, grok, antigravity, pi or devin.
         #[arg(long)]
         agent: Option<String>,
         /// Only sessions in this working directory.
@@ -130,7 +130,7 @@ enum Cmd {
     },
     /// Start a session with a first message; prints its handle and a receipt.
     New {
-        /// codex, claude, opencode, grok, antigravity or pi.
+        /// codex, claude, opencode, grok, antigravity, pi or devin.
         agent: String,
         /// The first message.
         prompt: String,

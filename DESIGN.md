@@ -10,7 +10,8 @@ read in agent source or documentation.
 
 In: Codex (shared app-server daemon), Claude Code (`claude -p`), OpenCode 2.x (shared background
 service; 1.x is not supported), Grok CLI (ACP to `grok agent stdio`, through the shared leader
-when one runs), Antigravity CLI (`agy -p`), pi (`pi --mode json`); a CLI and an MCP server
+when one runs), Antigravity CLI (`agy -p`), pi (`pi --mode json`), Devin CLI (ACP to `devin
+acp`, local sessions only); a CLI and an MCP server
 exposing the same operations; sender attribution and a provenance header for agent-to-agent
 traffic; a hop limit.
 
@@ -39,19 +40,20 @@ behalf, deleting sessions.
 
 State lives where the agent already keeps it:
 
-| agent                                                | who holds the live session          | agent-talk's connection                                   |
-| ---------------------------------------------------- | ----------------------------------- | --------------------------------------------------------- |
-| Codex                                                | shared app-server daemon            | per command: connect, subscribe, act, observe, disconnect |
-| OpenCode                                             | `opencode serve --service`          | per command: HTTP, plus SSE while observing               |
-| Grok, leader live                                    | shared leader process               | per command: a `grok agent --leader stdio` child (ACP)    |
-| Claude, Grok without leader, Antigravity, pi (owned) | nobody between turns; files on disk | one agent child per mutation                              |
-| Claude, Grok, Antigravity TUI (foreign)              | the user's terminal process         | read-only                                                 |
-| pi TUI (foreign)                                     | the user's terminal process         | undetectable; a send branches the session (§6.6)          |
+| agent                                                       | who holds the live session              | agent-talk's connection                                   |
+| ----------------------------------------------------------- | --------------------------------------- | --------------------------------------------------------- |
+| Codex                                                       | shared app-server daemon                | per command: connect, subscribe, act, observe, disconnect |
+| OpenCode                                                    | `opencode serve --service`              | per command: HTTP, plus SSE while observing               |
+| Grok, leader live                                           | shared leader process                   | per command: a `grok agent --leader stdio` child (ACP)    |
+| Claude, Grok without leader, Antigravity, pi, Devin (owned) | nobody between turns; files on disk     | one agent child per mutation                              |
+| Claude, Grok, Antigravity TUI (foreign)                     | the user's terminal process             | read-only                                                 |
+| Devin TUI, `-p` or ACP client (foreign)                     | that process, under Devin's own lock    | read-only while it runs                                   |
+| pi TUI (foreign)                                            | the user's terminal process             | undetectable; a send branches the session (§6.6)          |
 
 "Owned" means agent-talk started the session; it records creation, not current exclusivity. Each CLI
 command holds its connection, subscription and correlation state only while it runs. `agent-talk
 mcp` is the one long-lived process, started and stopped by the agent like any MCP server; the Grok
-turns it keeps after their call returned (§4) live there, not in a system daemon (§7).
+and Devin turns it keeps after their call returned (§4) live there, not in a system daemon (§7).
 
 ### Local state (`~/.agent-talk/`)
 
@@ -65,6 +67,8 @@ Sessions of agents with no lock of their own between processes (Claude, Grok in 
 Antigravity, pi) are locked for the duration of a command with an OS file lock in `locks/`, so two
 agent-talk commands never write to one session at once. A lock is released by process exit and
 never inherited by an agent child; a child that outlives its command is tracked by pid instead.
+Devin enforces a lock of its own between processes, so agent-talk takes none there and maps
+Devin's refusal to its own error codes (§6.7).
 The children of Claude, Antigravity and pi write their stdout to a run log per receipt
 (`<agent>-runs/`), which the command tails and later commands read to recover the receipt.
 
@@ -84,9 +88,10 @@ src/
   agents/mod.rs        the adapter interface and dispatch, request types, provenance header
   agents/lifecycle.rs  receipt and approval lifecycle, observation bounds (deadline, signals)
   agents/history.rs    read paging (query, page cut, cursors); remote history shared by Codex and OpenCode
+  agents/acp.rs        an ACP agent child (JSON-RPC over its stdio), shared by Grok and Devin
   agents/child.rs      agent CLI children: environment, version, session lock, run logs
   agents/decode.rs     tolerant field decoders
-  agents/<agent>/      one directory per adapter: codex, claude, opencode, grok, antigravity, pi
+  agents/<agent>/      one directory per adapter: codex, claude, opencode, grok, antigravity, pi, devin
 tests/live.py          regression harness against the real agents; see tests/README.md
 skills/agent-talk/     the skill that teaches agents the CLI (installed with `npx skills add`)
 ```
@@ -160,7 +165,7 @@ for all. agent-talk never approves.
   Where the agent allows it they never ask (Codex `approvalPolicy: never`, Claude
   `--permission-prompts none`, OpenCode session rules that deny what the user's rules would ask;
   headless Claude and Antigravity deny on their own), and what still reaches agent-talk is
-  declined (Codex `decline`, OpenCode `reject` with a message, Grok `reject_once`).
+  declined (Codex `decline`, OpenCode `reject` with a message, Grok and Devin `reject_once`).
 - Sessions agent-talk did not start belong to the user: agent-talk never answers there and never
   changes their settings. It records pending requests and lets the deadline pass with
   `state: waiting`.
@@ -177,14 +182,15 @@ unvalidated in the agent's syntax: the agent owns the set of valid values. `new`
 
 agent-talk stores the settings of the sessions it started and passes again on each send what the
 agent does not keep between turns (§6). The agent itself keeps a model change on every agent but
-Antigravity, an effort change on Codex, OpenCode and Grok, and full access on OpenCode; the
-user's own client then sees the change too. A change the agent refused is taken back from
+Antigravity, an effort change on Codex, OpenCode, Grok and Devin, and full access on OpenCode and
+Devin; the user's own client then sees the change too. A change the agent refused is taken back from
 agent-talk's store, so a refused value is not passed again.
 
 Full access gives a session every permission and no approval prompts (Codex
 `danger-full-access`, Claude `bypassPermissions`, an OpenCode allow-all session rule, Grok
-`yoloMode`, Antigravity `--dangerously-skip-permissions`; pi has no prompts to lift). Without it
-the session runs under the agent's own configuration. Once given it is not taken back.
+`yoloMode`, Antigravity `--dangerously-skip-permissions`, Devin's `bypass` mode; pi has no prompts
+to lift). Without it the session runs under the agent's own configuration, except on Devin, whose
+ACP interface starts every session in `accept-edits` (§6.7). Once given it is not taken back.
 
 ### Provenance and loops (best-effort)
 
@@ -232,8 +238,8 @@ server speaks both the stateless 2026-07-28 protocol (Claude Code, Antigravity) 
 `initialize` handshake of earlier versions (Codex, Grok). Logging is stderr only.
 
 `new` and `send` with `wait=false` return once the agent accepted the message, as the CLI does
-without `--wait`. A Grok turn needs agent-talk's connection until it ends (§6.4), so the server
-keeps the turn a prompt starts: the call returns the receipt at acceptance, and the server goes on
+without `--wait`. A Grok or Devin turn needs agent-talk's connection until it ends (§6.4, §6.7),
+so the server keeps the turn a prompt starts: the call returns the receipt at acceptance, and the server goes on
 observing the turn, declining its permission requests on sessions agent-talk started, until it
 ends. A steer message joins a turn that a prompt started and is observed only until it joined. A
 client's cancellation or tool timeout ends only the client's wait: the call runs on to its own end
@@ -244,7 +250,7 @@ for the user's answer to an approval).
 Only the CLI ends observation on Ctrl-C or SIGTERM. Once tokio listens for a signal, its default
 action never returns for the life of the process, so the server keeps the default actions: a
 signal stops the server, the requests it is running and the turns it keeps; a direct-mode Grok turn
-ends with it.
+or a Devin turn ends with it.
 
 ## 5. CLI
 
@@ -266,16 +272,18 @@ agent-talk mcp [--caller H]
   transport failure.
 - `new` and `send` without `--wait` return once the agent accepted the message. The turn goes on
   in the agent's shared process or, on Claude, Antigravity and pi, in the child, whose run log
-  `wait` reads. A Grok turn needs agent-talk's connection until it ends (§6.4), so on Grok the
-  command still observes to the end of the turn; `agent-talk mcp` returns at acceptance and keeps
-  the turn (§4).
-- On agents with an event stream (Codex, OpenCode, Grok), a command that observes the turn
+  `wait` reads. A Grok or Devin turn needs agent-talk's connection until it ends (§6.4, §6.7), so
+  on Grok and Devin the command still observes to the end of the turn; `agent-talk mcp` returns at
+  acceptance and keeps the turn (§4).
+- On agents with an event stream (Codex, OpenCode, Grok, Devin), a command that observes the turn
   subscribes before it submits, so no event of the turn is missed.
 - `wait` first checks what is persisted (history, or the run log of an agent-talk child), since the
   turn may be complete, then observes. It names one turn or receipt; there is no "latest".
 - `send` queues by default: the message runs after the current reply, as its own turn on Codex,
-  Grok, Antigravity and pi, inside the same execution on OpenCode. `--steer` joins the running turn
-  (Codex, OpenCode, Grok through a live leader) and is refused when the session is idle.
+  Grok, Antigravity and pi, inside the same execution on OpenCode. Devin admits one process per
+  session, so a send while a turn runs is refused (`E_LOCKED`, `E_FOREIGN_LIVE`). `--steer` joins
+  the running turn (Codex, OpenCode, Grok through a live leader) and is refused when the session is
+  idle.
 - `models A` lists what `--model` and `--effort` take on one agent, as `{id, efforts}` rows read
   from the agent each time. Claude Code has no listing interface; its rows are the aliases and
   effort levels `claude --help` names, the one model list agent-talk carries itself.
@@ -298,16 +306,18 @@ E_CAP_MISSING   a required agent capability is missing (Codex queue methods, `cl
 E_PRECONDITION  agent rejected (stale turn id, idle steer, unknown session or receipt), or a
                 settings change §4 does not allow
 E_LOCKED        another agent-talk command or child holds the session (Claude, direct Grok,
-                Antigravity, pi)
+                Antigravity, pi, Devin)
 E_FOREIGN_LIVE  held by a process agent-talk cannot talk to (Claude TUI, Grok TUI outside the
-                leader, Antigravity TUI, a Codex thread written by another app-server process)
-E_NO_STEER      agent cannot steer (Claude, Antigravity, pi, Grok without a live leader)
+                leader, Antigravity TUI, a Codex thread written by another app-server process,
+                a Devin session another process holds)
+E_NO_STEER      agent cannot steer (Claude, Antigravity, pi, Devin, Grok without a live leader)
 E_MAX_HOPS      hop depth exceeded
 E_TIMEOUT       deadline passed; outcome unknown, receipt retained
 E_INTERRUPTED   Ctrl-C or SIGTERM while observing; outcome unknown, receipt retained
 E_TRANSPORT     connection failed or dropped, or a live service unreachable (sandbox); outcome
                 unknown if an intent was sent
-E_UNSUPPORTED   option or method absent in this agent
+E_UNSUPPORTED   option or method absent in this agent, or a Devin session in a permission mode
+                its ACP interface cannot run
 ```
 
 ## 6. Agents
@@ -759,14 +769,120 @@ pi's own environment with no session variable, and `tools/call` `_meta` carries 
 message a pi session sends through `agent-talk mcp` has no sender unless the server is pinned
 with `--caller`.
 
+### 6.7 Devin CLI (3000.11.92)
+
+Devin updates itself in the background (`auto_update`; 3000.11.3 became 3000.11.92 within one
+morning), so behaviour can change under an installation.
+
+**Interface.** ACP (line-delimited JSON-RPC over stdio) to one `devin acp` child per `new`, `send`,
+`ls` and `models`, started in the session's working directory with the user's environment (§3).
+`devin -p` is not used: it prints the final text only, names no session, ends the turn at the
+first permission request, and rewrites the session's `working_directory` even when it is refused.
+No `authenticate` call is needed; the child uses the CLI's stored login. Each child writes a log
+file under `~/.local/share/devin/cli/logs/`.
+
+**Sessions and turns.**
+
+- One store for TUI, `-p` and ACP sessions: `sessions.db` (SQLite, WAL) in
+  `~/.local/share/devin/cli/`, or `$DEVIN_SESSIONS_DIR` (docs). agent-talk opens it read-only
+  (`mode=ro`) and never writes it. Session ids are two-word names. The conversation is the
+  `parent_node_id` chain of `message_nodes` from `sessions.main_chain_id`, read in one statement.
+  Devin copies the system prefix into a new root when it changes, so one logical message can
+  appear in several chains under one `message_id`.
+- `session/prompt` takes a client message id as `_meta["cognition.ai/clientMessageId"]` (a UUID;
+  anything else is ignored silently), echoes it in the `user_message_chunk`, which is the
+  acceptance, and stores it with the user node (`metadata.extensions["chisel/client-message-id"]`).
+  `-p` and the TUI set one too. A prompt's turn id is that id, else the node's `message_id`. The
+  `session/prompt` response (`stopReason: end_turn | cancelled`) ends an observed turn.
+- `read`: a user node with `is_user_input` is a `prompt`; the assistant node that ends a turn
+  (`finish_reason: stop`, no tool calls) is `final`, other assistant text `commentary`; each tool
+  call is one `other` message, its status from the matching tool node. Item ids are
+  `<message_id>-<phase>` and the tool call id, both stable across the copies. `--raw` gives the
+  span's `chat_message` records.
+- A turn agent-talk is not observing ends at the first later `final` node, or `interrupted` at a
+  tool node Devin's cancel marked `Canceled`. A prompt that comes before either leaves the earlier
+  turn `unknown`: the process that took it died, or Devin answered both together (a prompt sent
+  while a turn runs is inserted after the running tool result), and the chain does not tell
+  which. Short of an end, `wait` polls the db once a second until the end, the deadline, or proof
+  that nothing will write it: the recorded child gone (own receipts: `interrupted`, or `unknown`
+  when its user node is missing), or no process holding the session (`session/list`, at most
+  every five seconds, and only an explicit `isLocked: false` counts): then `unknown`, since a
+  killed turn and one that ended without a final reply (a `-p` run after a rejected permission)
+  leave the same chain. The chain is read once more after that proof, in case the writer finished
+  in between.
+- Closing the child's stdin or SIGTERM ends it within 0.1 s; the lock is released and the running
+  turn dies, leaving only its user node. So a command observes its turn to the end even without
+  `--wait` (over MCP the server keeps it, §4), and at a deadline or signal ends it with
+  `session/cancel`: the response comes `cancelled` within 20 ms. A cancel during a tool call leaves
+  the assistant node and a `Canceled` tool node, which later readers see; one before the first step
+  leaves only the user node.
+- `new` is `session/new`, the settings, then the prompt. Devin writes the session row at the first
+  prompt, so a refused setting leaves only a lock file, and the error says so. The session is
+  recorded as owned at `session/new`. `--name` is `_cognition.ai/session/rename` once the first
+  turn is over, because the title Devin writes after the first prompt overrides an earlier rename;
+  a failed rename is a note on the turn, not a failure.
+- `ls` is `session/list`, followed through `nextCursor`, newest `updatedAt` first; `name` is the
+  title, `preview` the chain's first prompt. A session is `running` while an agent-talk child runs
+  an unfinished turn on it, else `unknown` with `loaded: yes` while locked (an idle TUI holds the
+  lock too), `idle` when the listing says it is not, and `unknown` either way when it does not say. `origin` is `devin` for every session agent-talk did not start: TUI, `-p`
+  and ACP sessions look the same.
+
+**Writers and liveness.** A process holds `session_locks/<id>.lock` from opening a session until it
+exits, idle or not, and a second opener is refused: `session/load` fails `-32015` with
+`data["cognition.ai/errorKind"] = "session_locked"` and `lockHolderPid` before anything is
+written. agent-talk maps it to `E_LOCKED` when the pid is a child it recorded for the session,
+else `E_FOREIGN_LIVE`, keeping the agent's error. It takes no lock of its own and never probes the
+lock file: a probe takes Devin's lock for an instant, and a Devin process opening the session at
+that moment would fail. `session/list` reports the holder (`_meta["cognition.ai/isLocked"]`,
+`lockHolderPid`). A second `session/prompt` on the holding connection joins the running turn, which
+no later command can reach, so steer is refused (`E_NO_STEER`).
+
+**Sending.** `send` checks the session row and its directory, runs `session/load` (whose history
+replay is discarded), applies a settings change, records the intent and the child's pid, and
+prompts. The ACP interface offers no `normal` mode, the CLI's default: a session stored in it loads
+as `accept-edits`, and one prompt would store that. So a session agent-talk did not start is sent
+to only when the mode `session/load` reports equals its stored `agent_mode`, read again after the
+load (the lock then excludes every other writer); otherwise the send is refused with
+`E_UNSUPPORTED` before anything is recorded. A connection lost after acceptance leaves the
+outcome unknown (§4), not a failed turn. `read` and `wait` work on every session.
+
+**Approvals.** ACP sessions start in `accept-edits` whatever the user's default mode,
+`DEVIN_PERMISSION_MODE` or configuration: workspace edits run, other commands and MCP calls ask,
+and the user's `permissions.allow` rules apply. Sessions agent-talk starts therefore run in
+`accept-edits` rather than the user's default (§8). On them agent-talk answers
+`session/request_permission` with `reject_once` (Devin offers no reject-always): the tool fails,
+the model goes on and the turn ends `end_turn`. On the user's sessions requests are recorded and
+left pending; the lock keeps every other client out, so nobody can answer them, and the turn waits
+until the deadline cancels it, or as long as the MCP server keeps it (§8). Full access is
+`session/set_mode {modeId: "bypass"}`, stored with the session and kept by every later load,
+including the user's TUI.
+
+**Settings.** `session/new`, `session/load` and `session/set_config_option` return the current mode
+and `configOptions`, so a value is checked without a prompt. The model is `set_config_option
+model`, which accepts exactly the values its options list (one variant id per family, such as
+`swe-2-high`) and refuses anything else (`-32602`, `E_PRECONDITION`). `devin acp --model` is not
+used: it applies to `session/new` only, matches names loosely and ignores an unknown one. Effort is
+`thought_level` (`medium|high|max` for swe-2), set after the model, since a model change resets it
+to the family's default; after a model change agent-talk applies the effort the session's settings
+hold. Devin stores the resulting variant (`swe-2-medium`) and keeps model, effort and mode across
+loads, so `send` applies only a change. `models` lists the model options of a `session/new` in a
+temporary directory (no prompt: no session row, one lock file), with empty efforts: those are
+known only for a session's current model.
+
+**Identity.** Devin sets no session variable in shell commands or MCP server environments and sends
+no session in `tools/call` `_meta`. It imports MCP servers from other agents' configuration
+(`~/.claude.json`), so every Devin session starts `agent-talk mcp` when the user registered it
+there. A Devin caller is therefore `unknown`, or attributed to the agent whose session variable
+Devin inherited, unless pinned with `--from` or `--caller` (§8).
+
 ## 7. Key decisions
 
 - **Rust, single binary.** Agents call the CLI many times per session; startup time and one
   artifact per platform matter.
 - **No agent-talk daemon.** The agents already run the shared processes; another daemon would add
   install, pid and version-skew problems for state that fits in SQLite. Long-lived state goes into
-  the `agent-talk mcp` process the agent runs, which keeps Grok turns after their call returned
-  (§4).
+  the `agent-talk mcp` process the agent runs, which keeps Grok and Devin turns after their call
+  returned (§4).
 - **The user configures the MCP server globally.** agent-talk never injects itself into a session
   or edits agent configuration, even where the agent's API allows per-thread servers.
 - **Never approve.** Decline or reject is the strongest answer; `once`, `always` and `accept` are
@@ -791,7 +907,8 @@ with `--caller`.
   without a leader and Antigravity have no lock between processes, and a second writer forks or
   overwrites the conversation; agent-talk refuses to write while the agent's marker says another
   process holds the session and locks its own children. pi has no marker at all, so only its own
-  children are refused and the hazard is declared (§6.6, §8).
+  children are refused and the hazard is declared (§6.6, §8). Devin enforces a lock of its own,
+  so agent-talk takes none and maps Devin's refusal to `E_LOCKED` or `E_FOREIGN_LIVE` (§6.7).
 - **Turn ids come from the agent or from agent-talk's own client id**, never made up from text
   (§6), so a turn found later is the turn that was sent.
 - **History is paged to the answer.** `read` and turn lookup follow the agent's cursor, newest
@@ -801,7 +918,7 @@ with `--caller`.
   end of a turn has a different authority on each agent: the `turn/completed` event in Codex, a
   re-read of history in OpenCode, the child and its run log in Claude, Antigravity and pi, the
   `session/prompt` response in Grok (for a steer message, the joined turn's
-  `_x.ai/session/prompt_complete`). A generic event-loop driver would hide those differences
+  `_x.ai/session/prompt_complete`) and in Devin. A generic event-loop driver would hide those differences
   behind mode flags.
 - **OpenCode asks become denials by copying the default agent's rules from the first `ask` on**,
   not by appending a `deny` per `ask` rule, which would override a later, narrower `allow` in the
@@ -813,8 +930,9 @@ with `--caller`.
   at submission).
 - **Steer is refused when idle** on every agent that would silently start a new turn instead.
 - **No tight polling.** Observation uses the agents' event streams. agent-talk polls only where
-  no event source exists: session files of turns it is not running (once a second), its own run
-  logs (a short file tail), and Codex history in the window after a thread's first turn.
+  no event source exists: session files of turns it is not running (once a second; for Devin also
+  `session/list` at most every five seconds), its own run logs (a short file tail), and Codex
+  history in the window after a thread's first turn.
 
 ## 8. Known limitations and open items
 
@@ -866,3 +984,17 @@ with `--caller`.
   denied step already differs); a denied action is not tied to its tool step; the `immutable=1`
   fallback can read a stale page when a writer starts at that moment; `--print-timeout` expiry
   was not observed.
+- Devin: a Devin caller is unidentified, or attributed to the agent whose session variable Devin
+  inherited (a Devin started from a Claude shell carries `CLAUDE_CODE_SESSION_ID`), unless pinned
+  with `--from` or `--caller`. Sessions agent-talk starts run in `accept-edits`, not the user's
+  default mode, which ACP does not offer; for the same reason a `normal`-mode session agent-talk
+  did not start is refused for `send` (`E_UNSUPPORTED`) until Devin offers `normal` over ACP. A turn
+  killed with its process leaves no marker, so a later reader cannot tell it from a running one
+  without the lock, nor from one that ended without a final reply, nor a prompt joined mid-turn
+  from one whose process died. A pending approval on the user's session cannot be answered by anyone while
+  agent-talk's child holds the lock: the command waits for its deadline, and an MCP call without
+  one keeps the turn until the server exits. Devin updates itself in the background, and each
+  `devin acp` run (also `ls` and `models`) leaves a log file under its `logs/`; `models` also leaves
+  a lock file. `models` lists no efforts per model. Unverified: errors from the model service over
+  ACP, `session/close`, and whether a TUI shows a turn another process ran once it reopens the
+  session.

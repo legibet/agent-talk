@@ -5,7 +5,7 @@ end-to-end behaviour: receipts and their recovery, turn correlation, queue and s
 foreign holders, approvals, settings, paging and MCP. Facts about the agents themselves belong
 in the findings, and the parsing rules in the unit tests (`cargo test`).
 
-    uv run tests/live.py (offline|codex|claude|opencode|grok|antigravity|pi ... | all) [--keep]
+    uv run tests/live.py (offline|codex|claude|opencode|grok|antigravity|pi|devin ... | all) [--keep]
 
 Every agent runs the same three checks, `start`, `converse` and `recover`, driven by its entry in
 `AGENTS`; the checks that only one agent has follow in its tier. A check belongs here when it
@@ -17,10 +17,11 @@ Codex, where `sleep` runs under any sandbox.
 
 Every tier but `offline` makes real model calls, so name the tiers you need: the one for the
 adapter you changed, `offline` always, `all` before a release. Default models are gpt-6-luna,
-sonnet, deepseek/deepseek-flash, grok-4.7, gemini-3.8-flash and deepseek/deepseek-flash; override
-them with `LIVE_CODEX_MODEL`, `LIVE_CLAUDE_MODEL`, `LIVE_OPENCODE_MODEL`, `LIVE_GROK_MODEL`,
-`LIVE_ANTIGRAVITY_MODEL`, `LIVE_PI_MODEL`. Codex's `foreign-writer` runs last, once its thread has
-unloaded (about 60 s after its last use).
+sonnet, deepseek/deepseek-flash, grok-4.7, gemini-3.8-flash, deepseek/deepseek-flash and
+swe-2-high (at effort medium); override them with `LIVE_CODEX_MODEL`, `LIVE_CLAUDE_MODEL`,
+`LIVE_OPENCODE_MODEL`, `LIVE_GROK_MODEL`, `LIVE_ANTIGRAVITY_MODEL`, `LIVE_PI_MODEL`,
+`LIVE_DEVIN_MODEL`. Codex's `foreign-writer` runs last, once its thread has unloaded (about 60 s
+after its last use).
 
 The script builds `target/release/agent-talk` first and runs a tier only when `agent-talk status`
 reports `new` and `send` available for its agent; otherwise it prints `SKIP <agent>: <reason>`.
@@ -28,10 +29,20 @@ Approval checks on sessions agent-talk did not start create those sessions thems
 approvals on, and end the request with `turn/interrupt` (Codex) or `reject` (OpenCode), never an
 approval. Grok leader cases are not covered: they need a leader, which the harness never starts.
 
+The Devin tier runs in the user's Devin store, whose hooks may report to herdr; run it with those
+variables unset: `env -u HERDR_ENV -u HERDR_SOCKET_PATH -u HERDR_PANE_ID uv run tests/live.py
+devin`. Its own sessions live in `target/live-work`: the foreign holder is a `devin acp` child the
+harness opens on one of them, and the `normal`-mode session is one `devin -p` creates there. Its
+permission check needs a command the user's `permissions.allow` does not allow (`touch`), and is
+INCONCLUSIVE otherwise.
+
 Cleanup removes only what the run created: Codex threads are archived, OpenCode and Grok sessions
-deleted through the agent, Claude and pi session files and agent-talk's run logs unlinked. agy has
-no delete command, so Antigravity conversations stay and are printed at the end; intents stay in
-`~/.agent-talk/store.db`; files the checks write stay under `target/live-work`.
+deleted through the agent, Devin sessions with `devin rm --force` together with their lock files
+(and the lock files `models` left, once their holder is gone and no session row names them),
+Claude and pi session files and agent-talk's run logs unlinked. agy has no delete command, so
+Antigravity conversations stay and are printed at the end; intents stay in `~/.agent-talk/store.db`;
+files the checks write stay under `target/live-work`; Devin's own log of each `devin acp` run stays
+in its `logs/`.
 
 Each check prints `PASS|FAIL|SKIP|INCONCLUSIVE <agent>/<name> <secs>s`. INCONCLUSIVE means the
 model did not do what the check needs (ended a turn before its deadline, made no approval
