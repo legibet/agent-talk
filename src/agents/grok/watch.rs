@@ -3,9 +3,9 @@
 //! the end of the turn. The authority for the end is the `session/prompt` response, or for a
 //! steer message the joined turn's `_x.ai/session/prompt_complete` (DESIGN.md §7).
 
-use super::acp::{Conn, Event, Response};
 use super::handle;
 use super::updates;
+use crate::agents::acp::{Conn, Event, Response};
 use crate::agents::history::first_line;
 use crate::agents::lifecycle::{ApprovalPolicy, record, resolve};
 use crate::model::{self, Approval, ApprovalOutcome, Error, ErrorCode, Progress, Result};
@@ -238,9 +238,32 @@ impl<'s> Watch<'s> {
                 if end.result.is_ok() {
                     self.accept()?;
                 }
+                // The reader pushed the turn's last notifications before it resolved the
+                // response, and the biased select took the response first: the text chunks
+                // still buffered belong to this turn. The turn is over: an answer that fails
+                // to reach the child now does not change its outcome.
+                for ev in conn.drain() {
+                    if let Err(e) = self.on_event(conn, ev).await {
+                        tracing::warn!("after the turn ended: {e}");
+                    }
+                }
                 Ok(Some(end))
             }
-            Next::Event(Some(Event::Request(r))) if r.method == REQUEST_PERMISSION => {
+            Next::Event(Some(ev)) => self.on_event(conn, ev).await,
+            // Never reached with a response pending: the reader drops the waiters before
+            // the event channels close, so the biased select above has already taken the
+            // response (or its loss).
+            Next::Event(None) => Err(Error::new(
+                ErrorCode::Transport,
+                "grok agent exited while agent-talk was observing; outcome unknown",
+            )),
+        }
+    }
+
+    /// One event from the agent; `Some` when it ends a steer message's turn.
+    async fn on_event(&mut self, conn: &Conn, ev: Event) -> Result<Option<End>> {
+        match ev {
+            Event::Request(r) if r.method == REQUEST_PERMISSION => {
                 let id = r.id.clone();
                 if let Some((a, answer)) = self.on_permission(r.id, r.params) {
                     // Recorded as declined only once the answer is written.
@@ -252,21 +275,12 @@ impl<'s> Watch<'s> {
                 Ok(None)
             }
             // agent-talk offers no client capabilities.
-            Next::Event(Some(Event::Request(r))) => {
+            Event::Request(r) => {
                 conn.respond_error(&r.id, -32601, "not supported by agent-talk")
                     .await?;
                 Ok(None)
             }
-            Next::Event(Some(Event::Notification { method, params })) => {
-                self.on_notification(&method, &params)
-            }
-            // Never reached with a response pending: the reader drops the waiters before
-            // the event channels close, so the biased select above has already taken the
-            // response (or its loss).
-            Next::Event(None) => Err(Error::new(
-                ErrorCode::Transport,
-                "grok agent exited while agent-talk was observing; outcome unknown",
-            )),
+            Event::Notification { method, params } => self.on_notification(&method, &params),
         }
     }
 
@@ -671,6 +685,41 @@ mod tests {
             outcomes,
             [ApprovalOutcome::Resolved, ApprovalOutcome::Declined]
         );
+    }
+
+    /// The turn's last text chunk and its response arrive together: the chunk the reader
+    /// buffered before it resolved the response still counts for the turn.
+    #[tokio::test]
+    async fn text_buffered_with_the_response_is_kept() {
+        let _children = crate::agents::acp::SPAWN_LOCK.lock().await;
+        let store = store_with_intent("p");
+        // An agent that answers `initialize`, then writes the last chunk and the prompt's
+        // response in one go.
+        let chunk = json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": SESSION, "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "pong"}}, "_meta": {"promptId": "p"}}});
+        let script = format!(
+            "read l; echo '{}'; read l; echo '{chunk}'; echo '{}'; read l",
+            json!({"jsonrpc": "2.0", "id": 1, "result": {}}),
+            json!({"jsonrpc": "2.0", "id": 2, "result": {"stopReason": "end_turn"}}),
+        );
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.args(["-c", &script]);
+        let mut conn = crate::agents::acp::spawn(cmd, "test agent").await.unwrap();
+        let response = conn.submit("session/prompt", json!({})).await.unwrap();
+        let mut w = Watch::prompt(
+            &store,
+            SESSION,
+            "r",
+            "p",
+            response,
+            ApprovalPolicy::Deny,
+            false,
+        );
+        // Both lines are read before the watcher first polls.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let end = w.finish(&mut conn).await.unwrap();
+        assert!(end.result.is_ok());
+        assert_eq!(w.final_text().as_deref(), Some("pong"));
+        conn.close().await;
     }
 
     /// Fields of a permission request that do not fit leave the rest usable: `deny` still

@@ -13,16 +13,15 @@
 //! `turn_completed.prompt_id`, so it is the turn id. History, turn ends after the
 //! command and listings come from the session store (`sessions.rs`, `updates.rs`).
 
-mod acp;
 mod sessions;
 mod updates;
 mod watch;
 
-use self::acp::{Conn, Spawn};
 use self::sessions::{Active, Summary};
 use self::updates::{History, first_prompt};
 use self::watch::{End, Watch};
-use crate::agents::child::{cli_version, lock, pid_alive};
+use crate::agents::acp::{self, Conn};
+use crate::agents::child::{agent_cmd, cli_version, lock, pid_alive};
 use crate::agents::history::{ReadPage, ReadQuery, cut, first_line};
 use crate::agents::lifecycle::{
     ApprovalPolicy, approval_policy, bounded, note_waiting, reject, settle, wait_receipt,
@@ -113,6 +112,40 @@ impl Listed {
             resident: row["resident"] == true,
             activity: row["activity"].as_str().unwrap_or("unknown").to_string(),
         })
+    }
+}
+
+/// How the `grok agent` child is started.
+struct Spawn<'a> {
+    /// `--leader` (a proxy into the live leader) instead of `--no-leader`.
+    leader: bool,
+    /// `--leader-socket`, passed only when `GROK_LEADER_SOCKET` is set.
+    leader_socket: Option<&'a Path>,
+    model: Option<&'a str>,
+}
+
+impl Spawn<'_> {
+    /// The child's command in `cwd`. GROK_HOME and GROK_LEADER_SOCKET are honoured by the
+    /// child as by agent-talk.
+    fn command(&self, cwd: &Path) -> tokio::process::Command {
+        let mut cmd = agent_cmd("grok");
+        // `grok agent` has no --no-auto-update (only `grok agent leader` does); the
+        // binary's GROK_DISABLE_AUTOUPDATER is set instead (its effect on a stdio agent
+        // was not observed; grok 1.0.46).
+        cmd.env("GROK_DISABLE_AUTOUPDATER", "1").arg("agent");
+        cmd.arg(if self.leader {
+            "--leader"
+        } else {
+            "--no-leader"
+        });
+        if let Some(p) = self.leader_socket {
+            cmd.arg("--leader-socket").arg(p);
+        }
+        if let Some(m) = self.model {
+            cmd.args(["-m", m]);
+        }
+        cmd.arg("stdio").current_dir(cwd);
+        cmd
     }
 }
 
@@ -213,7 +246,7 @@ impl<'a> Grok<'a> {
             leader_socket: self.leader_socket.as_deref(),
             model,
         };
-        acp::spawn(cwd, &opts).await
+        acp::spawn(opts.command(cwd), "grok agent").await
     }
 
     /// `_x.ai/sessions/list`: every session the answering process knows.
@@ -1049,6 +1082,7 @@ mod tests {
     /// never "no leader" (that would start a second writer beside a live leader).
     #[test]
     fn leader_probe_classification() {
+        let _children = crate::agents::acp::SPAWN_LOCK.blocking_lock();
         let store = Store::memory();
         let dir = std::env::temp_dir().join(format!("bgl-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

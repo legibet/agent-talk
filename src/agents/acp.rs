@@ -1,5 +1,5 @@
-//! A `grok agent … stdio` child speaking ACP: line-delimited JSON-RPC 2.0 on its
-//! stdin/stdout.
+//! An agent child speaking ACP (`grok agent … stdio`, `devin acp`): line-delimited
+//! JSON-RPC 2.0 on its stdin/stdout.
 //!
 //! One reader task dispatches three kinds of frames separately, as in the Codex
 //! transport: responses to our requests (by id), notifications (unbounded: one child
@@ -7,13 +7,11 @@
 //! server-to-client requests such as `session/request_permission` (their ids overlap
 //! with ours). The reader never answers server requests; the adapter decides.
 
-use crate::agents::child::agent_cmd;
 use crate::model::{AgentError, Error, ErrorCode, Result};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::path::Path;
 use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -21,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, ready};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin};
+use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
@@ -77,8 +75,9 @@ struct Pending {
 }
 
 /// What the connection, the reader and the stderr task share.
-#[derive(Default)]
 struct Shared {
+    /// The agent's name in error messages (`grok agent`, `devin acp`).
+    agent: &'static str,
     pending: Mutex<Pending>,
     /// The tail of the child's stderr, for error messages.
     stderr: Mutex<String>,
@@ -90,7 +89,8 @@ impl Shared {
         let reason = self.pending.lock().unwrap().closed.clone();
         let stderr = self.stderr.lock().unwrap().trim().to_string();
         let mut msg = format!(
-            "grok agent connection lost: {}",
+            "{} connection lost: {}",
+            self.agent,
             reason.as_deref().unwrap_or("connection closed")
         );
         if !stderr.is_empty() {
@@ -135,17 +135,8 @@ impl Future for Response {
     }
 }
 
-/// How the child is started.
-pub struct Spawn<'a> {
-    /// `--leader` (a proxy into the live leader) instead of `--no-leader`.
-    pub leader: bool,
-    /// `--leader-socket`, passed only when `GROK_LEADER_SOCKET` is set.
-    pub leader_socket: Option<&'a Path>,
-    pub model: Option<&'a str>,
-}
-
 pub struct Conn {
-    /// The `initialize` response: `_meta.modelState` lists the account's models.
+    /// The `initialize` response (Grok: `_meta.modelState` lists the account's models).
     pub init: Value,
     child: Child,
     stdin: tokio::sync::Mutex<Option<ChildStdin>>,
@@ -162,36 +153,27 @@ impl Drop for Conn {
     }
 }
 
-/// Spawn the child in `cwd` and run the ACP `initialize` handshake.
-pub async fn spawn(cwd: &Path, s: &Spawn<'_>) -> Result<Conn> {
-    // GROK_HOME and GROK_LEADER_SOCKET are honoured by the child as by agent-talk.
-    let mut cmd = agent_cmd("grok");
-    // `grok agent` has no --no-auto-update (only `grok agent leader` does); the
-    // binary's GROK_DISABLE_AUTOUPDATER is set instead (its effect on a stdio agent
-    // was not observed; grok 1.0.46).
-    cmd.env("GROK_DISABLE_AUTOUPDATER", "1").arg("agent");
-    cmd.arg(if s.leader { "--leader" } else { "--no-leader" });
-    if let Some(p) = s.leader_socket {
-        cmd.arg("--leader-socket").arg(p);
-    }
-    if let Some(m) = s.model {
-        cmd.args(["-m", m]);
-    }
+/// Spawn `cmd`, the agent's command prepared by the adapter (program, arguments, cwd,
+/// environment, from `child::agent_cmd`), and run the ACP `initialize` handshake. `agent`
+/// names it in errors.
+pub async fn spawn(mut cmd: Command, agent: &'static str) -> Result<Conn> {
     // Its own process group, so that Ctrl-C reaches agent-talk, which then ends the
     // turn itself; kill_on_drop for a command that unwinds without closing.
     let mut child = cmd
-        .arg("stdio")
-        .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0)
         .kill_on_drop(true)
         .spawn()
-        .map_err(|e| Error::transport("spawn grok", e))?;
+        .map_err(|e| Error::transport(format!("spawn {agent}"), e))?;
     let stdout = child.stdout.take().expect("stdout is piped");
     let mut err_pipe = child.stderr.take().expect("stderr is piped");
-    let shared = Arc::new(Shared::default());
+    let shared = Arc::new(Shared {
+        agent,
+        pending: Mutex::default(),
+        stderr: Mutex::default(),
+    });
     let tail = shared.clone();
     tokio::spawn(async move {
         let mut buf = [0u8; 1024];
@@ -307,8 +289,23 @@ impl Conn {
         while self.events.try_recv().is_ok() {}
     }
 
-    /// Close stdin, which ends the child (in direct mode it exits within about two
-    /// seconds and a running turn dies with it), and reap it; killed after 10 s.
+    /// The events buffered right now, server requests first, as `next_event` orders them.
+    /// The reader pushes a turn's last notifications before it resolves the `session/prompt`
+    /// response, so a watcher that took the response drains them before it ends the turn.
+    pub fn drain(&mut self) -> Vec<Event> {
+        let mut out = Vec::new();
+        while let Ok(r) = self.requests.try_recv() {
+            out.push(Event::Request(r));
+        }
+        while let Ok(ev) = self.events.try_recv() {
+            out.push(ev);
+        }
+        out
+    }
+
+    /// Close stdin, which ends the child (Grok in direct mode exits within about two
+    /// seconds, Devin within 0.1 s, and a running turn dies with it), and reap it; killed
+    /// after 10 s.
     pub async fn close(mut self) {
         drop(self.stdin.lock().await.take());
         if tokio::time::timeout(Duration::from_secs(10), self.child.wait())
@@ -322,15 +319,26 @@ impl Conn {
     async fn write(&self, msg: Value) -> Result<()> {
         let mut stdin = self.stdin.lock().await;
         let Some(w) = stdin.as_mut() else {
-            return Err(Error::new(ErrorCode::Transport, "grok agent stdin closed"));
+            let agent = self.shared.agent;
+            return Err(Error::new(
+                ErrorCode::Transport,
+                format!("{agent} stdin closed"),
+            ));
         };
         let mut line = msg.to_string();
         line.push('\n');
         w.write_all(line.as_bytes())
             .await
-            .map_err(|e| Error::transport("write to grok agent", e))
+            .map_err(|e| Error::transport(format!("write to {}", self.shared.agent), e))
     }
 }
+
+/// Held by unit tests that spawn a fake agent, and by the test that drops a listening
+/// socket and expects it refused. macOS has no atomic `SOCK_CLOEXEC`: std creates the
+/// socket and then sets `FD_CLOEXEC`, and a child forked by another test thread in between
+/// inherits the listener, which then survives the drop (seen about one run in five).
+#[cfg(test)]
+pub static SPAWN_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 async fn read_loop(
     stdout: tokio::process::ChildStdout,
@@ -342,7 +350,7 @@ async fn read_loop(
     let reason = loop {
         let line = match lines.next_line().await {
             Ok(Some(l)) => l,
-            Ok(None) => break "grok agent exited".to_string(),
+            Ok(None) => break format!("{} exited", shared.agent),
             Err(e) => break e.to_string(),
         };
         if line.trim().is_empty() {
@@ -351,7 +359,7 @@ async fn read_loop(
         let msg: Incoming = match serde_json::from_str(&line) {
             Ok(m) => m,
             Err(e) => {
-                tracing::warn!("undecodable line from grok agent: {e}");
+                tracing::warn!("undecodable line from {}: {e}", shared.agent);
                 continue;
             }
         };

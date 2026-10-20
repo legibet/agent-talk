@@ -1,3 +1,4 @@
+pub mod acp;
 pub mod antigravity;
 pub mod child;
 pub mod claude;
