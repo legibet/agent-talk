@@ -1,16 +1,18 @@
 //! An agent child speaking ACP (`grok agent … stdio`, `devin acp`): line-delimited
 //! JSON-RPC 2.0 on its stdin/stdout.
 //!
-//! One reader task dispatches three kinds of frames separately, as in the Codex
-//! transport: responses to our requests (by id), notifications (unbounded: one child
-//! serves one command, so the buffer holds at most one session's replay and turn), and
-//! server-to-client requests such as `session/request_permission` (their ids overlap
-//! with ours). The reader never answers server requests; the adapter decides.
+//! One reader task resolves responses to our requests (by id) and queues the rest in
+//! arrival order: notifications and server-to-client requests such as
+//! `session/request_permission` (their ids overlap with ours). The queue is unbounded: one
+//! child serves one command, so it holds at most one session's replay and turn. Order
+//! matters: a permission request follows the `tool_call` update it is about, and a watcher
+//! that saw the request first would not know the call. The reader never answers server
+//! requests; the adapter decides.
 
 use crate::model::{AgentError, Error, ErrorCode, Result};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as _;
 use std::pin::Pin;
 use std::process::Stdio;
@@ -86,8 +88,13 @@ struct Shared {
 impl Shared {
     /// The error for a connection the reader saw end.
     fn closed(&self) -> Error {
-        let reason = self.pending.lock().unwrap().closed.clone();
-        let stderr = self.stderr.lock().unwrap().trim().to_string();
+        let reason = self.pending.lock().expect("lock poisoned").closed.clone();
+        let stderr = self
+            .stderr
+            .lock()
+            .expect("lock poisoned")
+            .trim()
+            .to_string();
         let mut msg = format!(
             "{} connection lost: {}",
             self.agent,
@@ -111,7 +118,12 @@ pub struct Response {
 
 impl Drop for Response {
     fn drop(&mut self) {
-        self.shared.pending.lock().unwrap().waiters.remove(&self.id);
+        self.shared
+            .pending
+            .lock()
+            .expect("lock poisoned")
+            .waiters
+            .remove(&self.id);
     }
 }
 
@@ -143,7 +155,8 @@ pub struct Conn {
     shared: Arc<Shared>,
     next_id: AtomicU64,
     events: mpsc::UnboundedReceiver<Event>,
-    requests: mpsc::UnboundedReceiver<ServerRequest>,
+    /// Server requests `discard_notifications` set aside: delivered before newer events.
+    held: VecDeque<ServerRequest>,
     reader: JoinHandle<()>,
 }
 
@@ -174,13 +187,13 @@ pub async fn spawn(mut cmd: Command, agent: &'static str) -> Result<Conn> {
         pending: Mutex::default(),
         stderr: Mutex::default(),
     });
-    let tail = shared.clone();
+    let tail = Arc::clone(&shared);
     tokio::spawn(async move {
         let mut buf = [0u8; 1024];
         while let Ok(n) = err_pipe.read(&mut buf).await
             && n > 0
         {
-            let mut t = tail.stderr.lock().unwrap();
+            let mut t = tail.stderr.lock().expect("lock poisoned");
             t.push_str(&String::from_utf8_lossy(&buf[..n]));
             if t.len() > STDERR_TAIL {
                 let cut = t.len() - STDERR_TAIL;
@@ -190,8 +203,7 @@ pub async fn spawn(mut cmd: Command, agent: &'static str) -> Result<Conn> {
         }
     });
     let (tx, events) = mpsc::unbounded_channel();
-    let (req_tx, requests) = mpsc::unbounded_channel();
-    let reader = tokio::spawn(read_loop(stdout, shared.clone(), tx, req_tx));
+    let reader = tokio::spawn(read_loop(stdout, Arc::clone(&shared), tx));
     let mut conn = Conn {
         init: Value::Null,
         stdin: tokio::sync::Mutex::new(child.stdin.take()),
@@ -199,7 +211,7 @@ pub async fn spawn(mut cmd: Command, agent: &'static str) -> Result<Conn> {
         shared,
         next_id: AtomicU64::new(1),
         events,
-        requests,
+        held: VecDeque::new(),
         reader,
     };
     conn.init = conn
@@ -226,7 +238,7 @@ impl Conn {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         {
-            let mut p = self.shared.pending.lock().unwrap();
+            let mut p = self.shared.pending.lock().expect("lock poisoned");
             if p.closed.is_some() {
                 drop(p);
                 return Err(self.shared.closed());
@@ -237,7 +249,7 @@ impl Conn {
         let response = Response {
             id,
             rx,
-            shared: self.shared.clone(),
+            shared: Arc::clone(&self.shared),
         };
         tracing::debug!(id, method, %params, "send");
         self.write(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))
@@ -273,30 +285,30 @@ impl Conn {
             .await
     }
 
-    /// Next event, server requests first; `None` once the child is gone and both
-    /// buffers are drained.
+    /// Next event, in arrival order; `None` once the child is gone and the queue is drained.
     pub async fn next_event(&mut self) -> Option<Event> {
-        tokio::select! {
-            biased;
-            Some(r) = self.requests.recv() => Some(Event::Request(r)),
-            ev = self.events.recv() => ev,
+        match self.held.pop_front() {
+            Some(r) => Some(Event::Request(r)),
+            None => self.events.recv().await,
         }
     }
 
     /// Drop the notifications buffered so far (the history replay of `session/load`,
-    /// which arrives before its response).
+    /// which arrives before its response). Server requests among them (a pending
+    /// permission request) are kept for `next_event`.
     pub fn discard_notifications(&mut self) {
-        while self.events.try_recv().is_ok() {}
+        while let Ok(ev) = self.events.try_recv() {
+            if let Event::Request(r) = ev {
+                self.held.push_back(r);
+            }
+        }
     }
 
-    /// The events buffered right now, server requests first, as `next_event` orders them.
-    /// The reader pushes a turn's last notifications before it resolves the `session/prompt`
-    /// response, so a watcher that took the response drains them before it ends the turn.
+    /// The events buffered right now, as `next_event` orders them. The reader pushes a
+    /// turn's last notifications before it resolves the `session/prompt` response, so a
+    /// watcher that took the response drains them before it ends the turn.
     pub fn drain(&mut self) -> Vec<Event> {
-        let mut out = Vec::new();
-        while let Ok(r) = self.requests.try_recv() {
-            out.push(Event::Request(r));
-        }
+        let mut out: Vec<Event> = self.held.drain(..).map(Event::Request).collect();
         while let Ok(ev) = self.events.try_recv() {
             out.push(ev);
         }
@@ -333,6 +345,18 @@ impl Conn {
     }
 }
 
+/// The answer that declines a `session/request_permission` once, when the agent offers
+/// it (`reject_once`; agent-talk never approves, DESIGN.md §7).
+pub fn reject_once(params: &Value) -> Option<Value> {
+    let option = params["options"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|o| o["kind"] == "reject_once" || o["optionId"] == "reject_once")
+        .find_map(|o| o["optionId"].as_str())?;
+    Some(json!({"outcome": {"outcome": "selected", "optionId": option}}))
+}
+
 /// Held by unit tests that spawn a fake agent, and by the test that drops a listening
 /// socket and expects it refused. macOS has no atomic `SOCK_CLOEXEC`: std creates the
 /// socket and then sets `FD_CLOEXEC`, and a child forked by another test thread in between
@@ -344,7 +368,6 @@ async fn read_loop(
     stdout: tokio::process::ChildStdout,
     shared: Arc<Shared>,
     events: mpsc::UnboundedSender<Event>,
-    requests: mpsc::UnboundedSender<ServerRequest>,
 ) {
     let mut lines = BufReader::new(stdout).lines();
     let reason = loop {
@@ -366,11 +389,11 @@ async fn read_loop(
         match (msg.id, msg.method) {
             (Some(id), Some(method)) => {
                 tracing::info!(%id, method, "server request");
-                let _ = requests.send(ServerRequest {
+                let _ = events.send(Event::Request(ServerRequest {
                     id,
                     method,
                     params: msg.params,
-                });
+                }));
             }
             (None, Some(method)) => {
                 tracing::trace!(method, "notification");
@@ -381,7 +404,12 @@ async fn read_loop(
             }
             (Some(id), None) => {
                 let Some(id) = id.as_u64() else { continue };
-                let waiter = shared.pending.lock().unwrap().waiters.remove(&id);
+                let waiter = shared
+                    .pending
+                    .lock()
+                    .expect("lock poisoned")
+                    .waiters
+                    .remove(&id);
                 if let Some(w) = waiter {
                     let _ = w.send(match msg.error {
                         Some(e) => Err(agent_error(e)),
@@ -393,8 +421,80 @@ async fn read_loop(
         }
     };
     tracing::debug!(reason, "reader stopped");
-    let mut p = shared.pending.lock().unwrap();
+    let mut p = shared.pending.lock().expect("lock poisoned");
     p.closed = Some(reason);
     // Dropping the waiters wakes their requests with a closed-connection error.
     p.waiters.clear();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The `reject_once` option is found by kind or id, past a `reject_once` option
+    /// without a usable id; without one there is no answer.
+    #[test]
+    fn reject_once_option() {
+        let params = json!({"options": [
+            {"kind": "reject_once"},
+            {"optionId": 7, "kind": "reject_once"},
+            {"optionId": "allow-once", "kind": "allow_once"},
+            {"optionId": "reject-once", "kind": "reject_once"},
+        ]});
+        assert_eq!(
+            reject_once(&params),
+            Some(json!({"outcome": {"outcome": "selected", "optionId": "reject-once"}}))
+        );
+        let by_id = json!({"options": [{"optionId": "reject_once"}]});
+        assert_eq!(
+            reject_once(&by_id).unwrap()["outcome"]["optionId"],
+            "reject_once"
+        );
+        assert_eq!(
+            reject_once(&json!({"options": [{"kind": "allow_once"}]})),
+            None
+        );
+        assert_eq!(reject_once(&json!({})), None);
+    }
+
+    /// `discard_notifications` drops the notifications buffered so far and keeps the
+    /// server requests among them, delivered before anything newer.
+    #[tokio::test]
+    async fn discarded_notifications_keep_requests_in_order() {
+        let _children = SPAWN_LOCK.lock().await;
+        let frame = |v: Value| format!("echo '{v}'");
+        let notification = |m: &str| json!({"jsonrpc": "2.0", "method": m, "params": {}});
+        let response = |id: u64| json!({"jsonrpc": "2.0", "id": id, "result": {}});
+        // `initialize`, then a request's events and its response, then another's.
+        let script = [
+            "read l".into(),
+            frame(response(1)),
+            "read l".into(),
+            frame(notification("a")),
+            frame(json!({"jsonrpc": "2.0", "id": 7, "method": "session/request_permission", "params": {}})),
+            frame(notification("b")),
+            frame(response(2)),
+            "read l".into(),
+            frame(notification("c")),
+            frame(response(3)),
+        ]
+        .join("; ");
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", &script]);
+        let mut conn = spawn(cmd, "test agent").await.unwrap();
+        // The events of a response are queued before it resolves.
+        conn.request("x", json!({})).await.unwrap();
+        conn.discard_notifications();
+        conn.request("y", json!({})).await.unwrap();
+        let order: Vec<String> = conn
+            .drain()
+            .iter()
+            .map(|e| match e {
+                Event::Request(r) => format!("request {}", r.id),
+                Event::Notification { method, .. } => format!("notification {method}"),
+            })
+            .collect();
+        assert_eq!(order, ["request 7", "notification c"]);
+        conn.close().await;
+    }
 }

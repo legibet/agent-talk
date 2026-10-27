@@ -27,7 +27,7 @@ use self::transcript::{
 use crate::agents::child::{Runs, agent_cmd, cli_version, lock, pid_alive, tail};
 use crate::agents::history::{ReadPage, ReadQuery, cut};
 use crate::agents::lifecycle::{
-    bounded, note_waiting, record, reject_unstarted, settle, wait_receipt,
+    bounded, note_waiting, record, reject, reject_unstarted, settle, wait_receipt,
 };
 use crate::agents::{
     Agent, AgentStatus, Check, ListFilter, Operation, SendRequest, Settings, StartRequest, Wait,
@@ -39,7 +39,7 @@ use crate::model::{
 };
 use crate::store::{NewIntent, Store};
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
-use serde_json::{Value, json};
+use serde_json::json;
 use std::fs::{File, TryLockError};
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
@@ -75,6 +75,21 @@ fn check_id(id: &str) -> Result<()> {
     })
 }
 
+/// agy starts a new conversation, with a warning only, when it does not find the id
+/// (DESIGN.md §6.5). Nothing reached the requested conversation: the receipt is rejected
+/// with this error, so a later `wait` does not take the other conversation's turn for it.
+fn mismatch(ran_in: &str, wanted: &str) -> Error {
+    Error::new(
+        ErrorCode::Precondition,
+        format!(
+            "agy ran the message in conversation {} instead of {} (agy starts a new conversation when it does not find the id); see {}",
+            handle(ran_in),
+            handle(wanted),
+            handle(ran_in)
+        ),
+    )
+}
+
 /// What this command observes of the `agy -p` run it started.
 struct RunWatch {
     /// The conversation the run must be in.
@@ -87,25 +102,20 @@ impl RunWatch {
     /// Apply one run-log line: refuse a run in another conversation, accept the receipt
     /// on the user step. Whether agy has taken the message.
     fn on_event(&mut self, store: &Store, line: &str) -> Result<bool> {
-        let Some(ev) = decode(line) else {
-            if serde_json::from_str::<Value>(line).is_err() {
-                tracing::warn!("non-JSON line from agy: {line}");
+        let ev = match decode(line) {
+            Ok(ev) => ev,
+            Err(e) => {
+                tracing::warn!("undecodable line from agy ({e}): {line}");
+                return Ok(self.run.turn_id().is_some());
             }
-            return Ok(self.run.turn_id().is_some());
         };
-        // agy starts a new conversation, with a warning only, when it does not find the id
-        // (DESIGN.md §6.5).
         if let Event::Init { conversation_id } = &ev
             && *conversation_id != self.id
         {
-            return Err(Error::new(
-                ErrorCode::Precondition,
-                format!(
-                    "agy ran the message in conversation {} instead of {} (agy starts a new conversation when it does not find the id); see {}",
-                    handle(conversation_id),
-                    handle(&self.id),
-                    handle(conversation_id)
-                ),
+            return Err(reject(
+                store,
+                &self.receipt_id,
+                mismatch(conversation_id, &self.id),
             ));
         }
         let accepted = self.run.turn_id().is_some();
@@ -134,7 +144,7 @@ const RUNNING: &str = "CASCADE_RUN_STATUS_RUNNING";
 
 const SUMMARY_COLUMNS: &str = "conversation_id, title, last_modified_time, workspace_uris, status";
 
-fn summary_row(row: &rusqlite::Row) -> rusqlite::Result<Summary> {
+fn summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Summary> {
     let uris: String = row.get(3)?;
     let cwd = serde_json::from_str::<Vec<String>>(&uris)
         .ok()
@@ -199,10 +209,13 @@ impl<'a> Antigravity<'a> {
             return Ok(None);
         }
         let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI;
-        let db = Connection::open_with_flags(&path, flags).or_else(|e| {
-            let uri = format!("file:{}?immutable=1", path.display());
-            Connection::open_with_flags(&uri, flags).map_err(|_| e)
-        })?;
+        let db = Connection::open_with_flags(&path, flags)
+            .or_else(|e| {
+                let uri = format!("file:{}?immutable=1", path.display());
+                Connection::open_with_flags(&uri, flags)
+                    .map_err(|e2| format!("{e}; immutable: {e2}"))
+            })
+            .map_err(|e| Error::transport(path.display(), e))?;
         Ok(Some(db))
     }
 
@@ -211,13 +224,13 @@ impl<'a> Antigravity<'a> {
         let Some(db) = self.summaries_db()? else {
             return Ok(Vec::new());
         };
-        let mut stmt = db.prepare(&format!(
-            "SELECT {SUMMARY_COLUMNS} FROM conversation_summaries
-             ORDER BY last_modified_time DESC, conversation_id ASC"
-        ))?;
-        let rows = stmt
-            .query_map([], summary_row)?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let rows = db
+            .prepare(&format!(
+                "SELECT {SUMMARY_COLUMNS} FROM conversation_summaries
+                 ORDER BY last_modified_time DESC, conversation_id ASC"
+            ))
+            .and_then(|mut stmt| stmt.query_map([], summary_row)?.collect())
+            .map_err(|e| Error::transport("conversation_summaries.db", e))?;
         Ok(rows)
     }
 
@@ -233,7 +246,8 @@ impl<'a> Antigravity<'a> {
                 [id],
                 summary_row,
             )
-            .optional()?;
+            .optional()
+            .map_err(|e| Error::transport("conversation_summaries.db", e))?;
         Ok(row)
     }
 
@@ -345,23 +359,9 @@ impl<'a> Antigravity<'a> {
             return Err(reject_unstarted(self.store, receipt_id, e));
         };
         let Some(turn) = run.turn(h.to_string()) else {
-            let turn = model::Turn {
-                handle: h.to_string(),
-                turn_id,
-                status: match status {
-                    Some(s) if !s.success() => TurnStatus::Failed,
-                    _ => TurnStatus::Unknown,
-                },
-                error: Some(json!({
-                    "message": "agy exited without a result event",
-                    "exit_code": status.and_then(|s| s.code()),
-                })),
-                final_text: None,
-                duration_ms: None,
-                basis: Some(
-                    "the agy -p process agent-talk started exited without a result event".into(),
-                ),
-            };
+            let turn = self
+                .runs
+                .exited_turn(h.to_string(), turn_id, "result", status);
             return Ok((turn, Vec::new()));
         };
         let approvals = run.denials(h, receipt_id);
@@ -418,6 +418,9 @@ impl<'a> Antigravity<'a> {
     /// A turn agent-talk did not run (or whose run log is gone), from the transcript
     /// (DESIGN.md §6.5): the USER_INPUT `turn_id` must exist, and `foreign_end` decides.
     fn foreign_turn(&self, id: &str, turn_id: &str) -> Result<Foreign> {
+        // Presence before the transcript: a transcript read after the holder let go is
+        // complete. Its error matters only for a turn the transcript does not close.
+        let held = self.presence_held(id);
         let lines = load(&self.transcript_path(id))?;
         let Some(start) = user_input(&lines, turn_id) else {
             return Err(Error::new(
@@ -435,9 +438,8 @@ impl<'a> Antigravity<'a> {
         let (held, status) = if closed {
             (false, String::new())
         } else {
-            let held = self.presence_held(id)?;
             (
-                held,
+                held?,
                 self.summary(id)?.map(|s| s.status).unwrap_or_default(),
             )
         };
@@ -806,13 +808,20 @@ impl Agent for Antigravity<'_> {
                 if let Some((r, log)) = &run_log
                     && log.is_file()
                 {
+                    // Liveness before the log: once the process is gone, the log read
+                    // after that is complete.
+                    let pid = self.store.process(r)?.filter(|&p| pid_alive(p));
                     let run = Run::from_log(log);
+                    if let Some(c) = &run.conversation_id
+                        && c != id
+                    {
+                        return Err(reject(self.store, r, mismatch(c, id)));
+                    }
                     if unaccepted && let Some(t) = run.turn_id() {
                         self.store.accept(r, None, Some(&t), None)?;
                         unaccepted = false;
                     }
-                    let pid = self.store.process(r)?;
-                    if run.result.is_some() || !pid.is_some_and(pid_alive) {
+                    if run.result.is_some() || pid.is_none() {
                         // This command did not start the process: no exit code.
                         return self.finished(&h, r, &run, None);
                     }
@@ -856,9 +865,26 @@ impl Agent for Antigravity<'_> {
 mod tests {
     use super::*;
 
+    /// A run agy started in another conversation is refused and its receipt rejected, so
+    /// a later `wait` does not take that conversation's turn for it.
     #[test]
     fn mismatched_conversation_is_refused() {
+        use crate::agents::Outgoing;
+        use crate::model::{Caller, ReceiptState};
+
         let s = Store::memory();
+        s.insert_intent(&NewIntent {
+            receipt_id: "r",
+            handle: "antigravity:11111111-2222-3333-4444-555555555555",
+            client_msg_id: "c",
+            message: &Outgoing {
+                text: "x",
+                delivered: "x",
+                from: &Caller::UNKNOWN,
+                depth: 0,
+            },
+        })
+        .unwrap();
         let mut w = RunWatch {
             id: "11111111-2222-3333-4444-555555555555".into(),
             receipt_id: "r".into(),
@@ -868,6 +894,10 @@ mod tests {
         let e = w.on_event(&s, init).unwrap_err();
         assert_eq!(e.code, ErrorCode::Precondition);
         assert!(e.message.contains("06615f44") && e.message.contains("11111111"));
+        assert_eq!(
+            s.receipt("r").unwrap().unwrap().state,
+            ReceiptState::Rejected
+        );
     }
 
     /// A run that never took the message rejects its receipt; one that took it but has no
@@ -922,6 +952,7 @@ mod tests {
     /// The decision table of a turn agent-talk did not run.
     #[test]
     fn foreign_turn_rule() {
+        const IDLE: &str = "CASCADE_RUN_STATUS_IDLE";
         let end = |closed, replied, held, status| {
             let turn = model::Turn {
                 handle: "antigravity:x".into(),
@@ -937,7 +968,6 @@ mod tests {
                 Foreign::Open(_) => None,
             }
         };
-        const IDLE: &str = "CASCADE_RUN_STATUS_IDLE";
         // A later USER_INPUT ends the turn, whoever holds the lock.
         assert_eq!(end(true, true, true, RUNNING), Some(TurnStatus::Completed));
         assert_eq!(end(true, false, false, ""), Some(TurnStatus::Unknown));
@@ -977,7 +1007,7 @@ mod tests {
         let row = |id: &str, efforts: &[&str]| {
             (
                 id.to_string(),
-                efforts.iter().map(|e| e.to_string()).collect(),
+                efforts.iter().map(ToString::to_string).collect(),
             )
         };
         assert_eq!(

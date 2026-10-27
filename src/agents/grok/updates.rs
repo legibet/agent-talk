@@ -395,22 +395,22 @@ mod tests {
 
     #[test]
     fn interleaved_writers_attribute_by_prompt_id() {
-        let h = History::new(parse(TWO_WRITERS));
+        let history = History::new(parse(TWO_WRITERS));
         let a = "d6b9ca89-36d5-49bf-af24-4c558560ee39";
         let b = "c173acf1-b1ac-4810-a2a2-a22afd57eb78";
-        assert_eq!(h.spans.len(), 2);
-        assert_eq!(h.spans[0].id.as_deref(), Some(a));
-        assert_eq!(h.spans[1].id.as_deref(), Some(b));
+        assert_eq!(history.spans.len(), 2);
+        assert_eq!(history.spans[0].id.as_deref(), Some(a));
+        assert_eq!(history.spans[1].id.as_deref(), Some(b));
         // A's last turn_completed (end_turn) is its end, not B's `interrupted` marker.
-        assert_eq!(h.spans[0].end, Some(10));
-        let m = h.messages();
-        let t = h.turn("grok:s".into(), 0, &m).unwrap();
+        assert_eq!(history.spans[0].end, Some(10));
+        let m = history.messages();
+        let t = history.turn("grok:s".into(), 0, &m).unwrap();
         assert_eq!(
             (t.status, t.final_text.as_deref()),
             (TurnStatus::Completed, Some("DONE-A"))
         );
         assert_eq!(
-            texts(&h),
+            texts(&history),
             [
                 (a.into(), "prompt", "Run this shell command: for i in 1 2 3 4 5 6 7 8; do echo $i; sleep 2; done . Then reply with exactly DONE-A.".into()),
                 (a.into(), "commentary", "I'll run the loop, then reply with exactly DONE-A.".into()),

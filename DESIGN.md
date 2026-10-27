@@ -353,7 +353,8 @@ intent is recorded.
   it is unreadable: `thread/resume` and `thread/turns/list` fail with `-32603 "... rollout at
   <path> is empty"`, and `thread/turns/list` can fail with `-32601 "list_turns is not supported
   yet"` (seen once; cause read in daemon source), while `thread/read` answers `idle` with no turns.
-  agent-talk retries the resume once a second, at most ten times.
+  agent-talk retries the resume once a second, at most ten times; `read` and turn lookup treat
+  the window as an empty history.
 - `thread/resume` on a loaded thread rejoins without replaying earlier notifications, except
   pending server requests. An idle thread unloads about 60 s after its last subscriber leaves; a
   running thread keeps running and drains its queue with nobody subscribed.
@@ -609,7 +610,9 @@ takes its own lock only in direct mode, since clients of one leader do not exclu
 - Steer: `_x.ai/interject` on a session `working` in a live leader (`E_NO_STEER` without one,
   `E_PRECONDITION` when idle). It has no client id and no expected-turn check: the ack is
   acceptance, the turn comes from `_x.ai/session/interjection`, and if the turn ended meanwhile
-  Grok starts a fallback turn that the receipt then names.
+  Grok starts a fallback turn that the receipt then names. A steer receipt accepted before the
+  interjection was seen names no turn, and `wait --receipt` on it is refused (`E_PRECONDITION`,
+  pointing at `read`), since nothing in the session store carries its id.
 - In direct mode the turn dies with the child (closing stdin ends it within about two seconds,
   with no `turn_completed`), and a `session/cancel` sent before the prompt is running is ignored.
   So agent-talk observes the turn to its end even without `--wait`, in the command or, over MCP,
@@ -943,15 +946,19 @@ Devin inherited, unless pinned with `--from` or `--caller` (§8).
 - OpenCode and Grok apply a settings change before the message is submitted; when the message
   is then refused, the session keeps the change and agent-talk takes back only its own stored
   settings.
-- Claude and Grok identify a recorded child by pid and an unfinished turn only; after a crash and
-  pid reuse a session can stay `E_LOCKED` until the row ages out of the newest ten.
+- Claude, Grok, Antigravity and pi identify a recorded child by pid and an unfinished turn only;
+  after a crash and pid reuse a session can stay `E_LOCKED` until the row ages out of the newest
+  ten.
 - Codex: `wait --turn` on a steered turn attaches the newest receipt on that turn (steered
   messages share the turn id). A thread written by another app-server process is refused only at
   `thread/resume`, and `ls` does not show which process holds it. Only `send` starts a dormant
   queued item; `wait --receipt` on one left dormant earlier reports it `pending`. `status` marks a
   method unavailable only when the daemon reports it missing. Unverified: how a terminal TUI
   renders a decline from agent-talk; `send` changing the model (effort and full access were
-  exercised).
+  exercised). On codex-cli 0.164.0 idle threads stayed loaded for well over the 60 s observed
+  on 0.160 (one for 25 minutes while an MCP client was connected to the daemon), so the
+  unload timing and what holds a thread loaded need re-checking; the live `foreign-writer`
+  check waits 180 s for an unload and fails until then.
 - Claude: `control_request` approvals would need an answerer (`--permission-prompt-tool stdio`);
   agent-talk relies on the agent's own denial. Unverified: whether `CLAUDE_CODE_SESSION_ID`
   reaches a globally registered MCP server the same way, and whether attribution through a TUI's
@@ -965,7 +972,9 @@ Devin inherited, unless pinned with `--from` or `--caller` (§8).
   the user's configuration, approvals saved with `always` and plugin permission hooks do not reach
   them, and sub-sessions inherit them (§6.3).
 - Grok: a turn that continues in a leader after the sending command stopped observing waits for
-  another client to answer a permission request it raises. `reject_once`, an unanswered request
+  another client to answer a permission request it raises. A steer receipt whose outcome is
+  unknown and that names no turn is not refused by `wait --receipt`: it polls the session to
+  the deadline. `reject_once`, an unanswered request
   and the `session/cancel` at the deadline rest on captured frames, not re-verified. Unverified:
   whether a TUI renders live a turn another leader client ran; leader behaviour with a grok.com
   subscription login (it may open a relay).

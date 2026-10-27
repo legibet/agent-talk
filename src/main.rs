@@ -248,7 +248,7 @@ fn main() -> ExitCode {
             if json {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&json!({ "error": e })).unwrap()
+                    serde_json::to_string_pretty(&json!({ "error": e })).expect("serializable")
                 );
             } else {
                 eprintln!("error: {e}");
@@ -400,7 +400,10 @@ async fn run(store: &Store, cmd: Cmd, json: bool) -> model::Result<()> {
 
 fn print<T: Serialize>(json: bool, out: &T, human: fn(&T)) {
     if json {
-        println!("{}", serde_json::to_string_pretty(out).unwrap());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(out).expect("serializable")
+        );
     } else {
         human(out);
     }
@@ -544,7 +547,10 @@ fn print_read(
         println!("{time}[{label}] {}", m.text);
     }
     if let Some(rows) = raw {
-        println!("{}", serde_json::to_string_pretty(rows).unwrap());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(rows).expect("serializable")
+        );
     }
     if let Some(c) = next_cursor {
         println!("next cursor: {c}");

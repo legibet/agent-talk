@@ -175,7 +175,7 @@ impl RemoteHistory {
                 item: m.item_id.clone(),
                 page: self.fetched_with[*i].clone(),
             };
-            serde_json::to_string(&b).unwrap()
+            serde_json::to_string(&b).expect("serializable")
         });
         Ok(ReadPage {
             messages: Page {

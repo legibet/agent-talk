@@ -4,6 +4,7 @@
 
 use crate::agents::Settings;
 use crate::agents::child::Runs;
+use crate::agents::decode::or_default;
 use crate::model::{
     self, AgentError, Approval, ApprovalOutcome, Error, ErrorCode, Result, TurnStatus,
 };
@@ -67,6 +68,7 @@ pub struct StepUpdate {
     step_index: i64,
     /// user_input | agent_response | tool | system_message
     step_type: String,
+    #[serde(default, deserialize_with = "or_default")]
     text_delta: Option<String>,
 }
 
@@ -94,8 +96,10 @@ impl RunResult {
     }
 }
 
-pub fn decode(line: &str) -> Option<Event> {
-    serde_json::from_str(line).ok()
+/// One run-log line; an error for a line that is not JSON or a known event whose shape
+/// does not fit. Unknown events are `Other`.
+pub fn decode(line: &str) -> serde_json::Result<Event> {
+    serde_json::from_str(line)
 }
 
 /// What a run log says about one `agy -p` process (one input line, so one turn).
@@ -113,7 +117,7 @@ impl Run {
     pub fn from_log(path: &Path) -> Run {
         let mut run = Run::default();
         let text = std::fs::read_to_string(path).unwrap_or_default();
-        for ev in text.lines().filter_map(decode) {
+        for ev in text.lines().filter_map(|l| decode(l).ok()) {
             run.apply(ev);
         }
         run
@@ -176,7 +180,7 @@ impl Run {
 
     /// `result.denied_actions` as approvals: the denial ended the turn.
     pub fn denials(&self, handle: &str, receipt_id: &str) -> Vec<Approval> {
-        let denied = self.result.iter().flat_map(|r| r.denied_actions());
+        let denied = self.result.iter().flat_map(RunResult::denied_actions);
         denied
             .enumerate()
             .map(|(i, d)| Approval {

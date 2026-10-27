@@ -249,7 +249,10 @@ impl<'a> Pi<'a> {
             }
             let turn_id = watch.turn_id.clone().unwrap_or_default();
             if !watch.run.settled {
-                return Ok(Some(run::exited(h.clone(), turn_id, Some(status))));
+                let turn = self
+                    .runs
+                    .exited_turn(h.clone(), turn_id, "agent_settled", Some(status));
+                return Ok(Some(turn));
             }
             Ok(Some(watch.run.turn(h.clone(), turn_id)))
         };
@@ -280,6 +283,12 @@ impl<'a> Pi<'a> {
         if !log.is_file() {
             return Ok(None);
         }
+        // Liveness before the log: once the process is gone, the log read after that is
+        // complete.
+        let alive = self
+            .store
+            .process(receipt_id)?
+            .filter(|&pid| pid_alive(pid));
         let run = Run::from_log(&log);
         if turn_id.is_none()
             && run.user.is_some()
@@ -294,11 +303,7 @@ impl<'a> Pi<'a> {
             let turn = run.turn(h.into(), turn_id.clone().unwrap_or_default());
             return Ok(Some(RunState::Settled(turn)));
         }
-        match self
-            .store
-            .process(receipt_id)?
-            .filter(|&pid| pid_alive(pid))
-        {
+        match alive {
             Some(pid) => Ok(Some(RunState::Running(pid))),
             None if run.user.is_none() => Err(self.reject_startup(receipt_id, None)),
             None => Ok(Some(RunState::Exited)),
@@ -415,7 +420,7 @@ impl Agent for Pi<'_> {
                 .map_err(|_| Error::new(ErrorCode::Precondition, format!("invalid cursor {c}")))?,
             None => 0,
         };
-        let end = (offset + limit as usize).min(files.len());
+        let end = offset.saturating_add(limit as usize).min(files.len());
         let next_cursor = (end < files.len()).then(|| end.to_string());
         let mut items = Vec::new();
         for (_, id, path) in files.into_iter().skip(offset).take(limit as usize) {
@@ -588,7 +593,12 @@ impl Agent for Pi<'_> {
                     // What the file does not tell of a run that exited is unknown.
                     _ if exited => {
                         let turn_id = turn_id.clone().unwrap_or_default();
-                        return Ok(run::exited(h.clone(), turn_id, None));
+                        return Ok(self.runs.exited_turn(
+                            h.clone(),
+                            turn_id,
+                            "agent_settled",
+                            None,
+                        ));
                     }
                     Err(e) => return Err(e),
                     Ok(None) => {}

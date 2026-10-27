@@ -169,7 +169,7 @@ async fn interrupted() {
     };
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}
-        _ = term => {}
+        () = term => {}
     }
 }
 
@@ -187,11 +187,11 @@ pub async fn bounded<T>(
     };
     tokio::select! {
         r = fut => r,
-        _ = until => Err(Error::new(
+        () = until => Err(Error::new(
             ErrorCode::Timeout,
             "deadline passed before the turn completed; outcome unknown, receipt retained",
         )),
-        _ = interrupted() => Err(Error::new(
+        () = interrupted() => Err(Error::new(
             ErrorCode::Interrupted,
             "interrupted; outcome unknown, receipt retained",
         )),

@@ -161,10 +161,10 @@ struct WaitParams {
 }
 
 fn invalid(message: &str) -> CallToolResult {
-    tool_error(Error::new(ErrorCode::Precondition, message))
+    tool_error(&Error::new(ErrorCode::Precondition, message))
 }
 
-fn tool_error(e: Error) -> CallToolResult {
+fn tool_error(e: &Error) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(json!({ "error": e }).to_string())])
 }
 
@@ -172,9 +172,11 @@ fn tool_result<T: Serialize>(
     res: Result<model::Result<T>, tokio::task::JoinError>,
 ) -> CallToolResult {
     match res {
-        Ok(Ok(out)) => CallToolResult::structured(serde_json::to_value(&out).unwrap()),
-        Ok(Err(e)) => tool_error(e),
-        Err(e) => tool_error(Error::transport("command failed", e)),
+        Ok(Ok(out)) => {
+            CallToolResult::structured(serde_json::to_value(&out).expect("serializable"))
+        }
+        Ok(Err(e)) => tool_error(&e),
+        Err(e) => tool_error(&Error::transport("command failed", e)),
     }
 }
 

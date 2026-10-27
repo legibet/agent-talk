@@ -1,14 +1,14 @@
 //! pi session files, `<agent dir>/sessions/--<cwd>--/<timestamp>_<id>.jsonl`: finding and
 //! decoding them, the live branch, turn boundaries and normalized messages (DESIGN.md §6.6).
-//! The records are narrow: every field defaults when absent, unknown entry types, roles,
-//! content shapes and block types are tolerated, and content of an unknown shape never ends a
-//! turn.
+//! The records are narrow: every field defaults when absent or when it does not fit, unknown
+//! entry types, roles, content shapes and block types are tolerated, and content of an unknown
+//! shape never ends a turn.
 
+use crate::agents::decode::{self, or_default};
 use crate::agents::history::first_line;
 use crate::agents::strip_provenance;
 use crate::model::{self, Caller, Error, ErrorCode, Message, Phase, Result, Role, TurnStatus};
 use serde::Deserialize;
-use serde::de::IgnoredAny;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -19,32 +19,24 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Body {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "or_default")]
     pub role: String,
     #[serde(default)]
     content: Content,
+    #[serde(default, deserialize_with = "or_default")]
     pub stop_reason: Option<String>,
+    #[serde(default, deserialize_with = "or_default")]
     pub error_message: Option<String>,
+    #[serde(default, deserialize_with = "or_default")]
     pub is_error: Option<bool>,
+    #[serde(default, deserialize_with = "or_default")]
     pub tool_name: Option<String>,
     /// Unix milliseconds; the one value shared by a run-log event and the persisted entry.
+    #[serde(default, deserialize_with = "or_default")]
     pub timestamp: Option<i64>,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum Content {
-    Text(String),
-    Blocks(Vec<Block>),
-    /// A shape this version does not know; it may hold anything, tool calls included.
-    Other(IgnoredAny),
-}
-
-impl Default for Content {
-    fn default() -> Self {
-        Content::Blocks(Vec::new())
-    }
-}
+type Content = decode::Content<Block>;
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
@@ -69,7 +61,8 @@ impl Content {
     fn text(&self) -> String {
         match self {
             Content::Text(s) => s.clone(),
-            Content::Blocks(blocks) => blocks
+            content => content
+                .blocks()
                 .iter()
                 .filter_map(|b| match b {
                     Block::Text { text } => Some(text.as_str()),
@@ -77,7 +70,6 @@ impl Content {
                 })
                 .collect::<Vec<_>>()
                 .join("\n"),
-            Content::Other(_) => String::new(),
         }
     }
 }
@@ -88,27 +80,31 @@ impl Body {
     }
 
     fn tool_calls(&self) -> Vec<String> {
-        match &self.content {
-            Content::Blocks(blocks) => blocks
-                .iter()
-                .filter_map(|b| match b {
-                    Block::ToolCall { name, arguments } => Some(tool_summary(name, arguments)),
-                    _ => None,
-                })
-                .collect(),
-            Content::Text(_) | Content::Other(_) => Vec::new(),
-        }
+        self.content
+            .blocks()
+            .iter()
+            .filter_map(|b| match b {
+                Block::ToolCall { name, arguments } => Some(tool_summary(name, arguments)),
+                _ => None,
+            })
+            .collect()
     }
 
     /// An assistant message that ends a run: no tool calls to execute (DESIGN.md §6.6).
-    /// Content of an unknown shape is not known to be free of them.
+    /// Content this version cannot read whole is not known to be free of them.
     pub fn is_reply(&self) -> bool {
         self.role == "assistant"
             && match &self.content {
                 Content::Text(_) => true,
                 Content::Blocks(b) => !b.iter().any(|b| matches!(b, Block::ToolCall { .. })),
-                Content::Other(_) => false,
+                Content::Unknown(_) => false,
             }
+    }
+
+    /// A user message that starts a turn; content this version cannot read whole may be
+    /// anything, so it starts none (and ends none).
+    fn is_prompt(&self) -> bool {
+        self.role == "user" && !matches!(self.content, Content::Unknown(_))
     }
 }
 
@@ -116,29 +112,37 @@ impl Body {
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Line {
-    #[serde(rename = "type", default)]
+    #[serde(rename = "type", default, deserialize_with = "or_default")]
     pub kind: String,
+    #[serde(default, deserialize_with = "or_default")]
     pub id: Option<String>,
+    #[serde(default, deserialize_with = "or_default")]
     pub parent_id: Option<String>,
     /// ISO 8601.
+    #[serde(default, deserialize_with = "or_default")]
     pub timestamp: Option<String>,
+    #[serde(default, deserialize_with = "or_default")]
     pub message: Option<Body>,
     /// `session` header: the working directory pi runs the session in.
+    #[serde(default, deserialize_with = "or_default")]
     pub cwd: Option<String>,
     /// `session_info`: the display name.
+    #[serde(default, deserialize_with = "or_default")]
     pub name: Option<String>,
     /// `context_edit`: the entry whose content later model context sees edited, or, with a
     /// `null` replacement, not at all (an auto-retried failure).
+    #[serde(default, deserialize_with = "or_default")]
     pub target_id: Option<String>,
     #[serde(default)]
     pub replacement: Value,
     /// `custom_message`: text an extension injected into the context.
+    #[serde(default, deserialize_with = "or_default")]
     content: Option<Content>,
 }
 
 impl Line {
     pub fn is_prompt(&self) -> bool {
-        self.kind == "message" && self.message.as_ref().is_some_and(|m| m.role == "user")
+        self.kind == "message" && self.message.as_ref().is_some_and(Body::is_prompt)
     }
 }
 
@@ -189,6 +193,7 @@ pub fn live_branch(entries: &[Entry]) -> HashSet<usize> {
 }
 
 /// What ended a turn in the file.
+#[derive(Clone, Copy)]
 pub enum TurnEnd {
     /// An assistant message without tool calls.
     Reply(usize),
@@ -331,7 +336,9 @@ fn to_message(line: &Line, turn_id: &str, item_id: &str) -> Option<Message> {
         "message" => {
             let body = line.message.as_ref()?;
             match body.role.as_str() {
-                "user" => (Role::User, Phase::Prompt, body.text(), None),
+                "user" if body.is_prompt() => (Role::User, Phase::Prompt, body.text(), None),
+                // Content not read whole: shown, but it started no turn.
+                "user" => (Role::User, Phase::Other, body.text(), None),
                 "toolResult" => {
                     let tag = if body.is_error == Some(true) {
                         "[tool_result error]"
@@ -352,7 +359,7 @@ fn to_message(line: &Line, turn_id: &str, item_id: &str) -> Option<Message> {
                     let text = body.text();
                     let tools = body.tool_calls();
                     if !text.is_empty() {
-                        let phase = if tools.is_empty() {
+                        let phase = if body.is_reply() {
                             Phase::Final
                         } else {
                             Phase::Commentary
@@ -374,15 +381,13 @@ fn to_message(line: &Line, turn_id: &str, item_id: &str) -> Option<Message> {
                 _ => return None,
             }
         }
-        "custom_message" => match line.content.as_ref()? {
-            Content::Other(_) => return None,
-            content => (
-                Role::User,
-                Phase::Other,
-                content.text(),
-                Some(Caller::RUNTIME),
-            ),
-        },
+        "custom_message" => {
+            let text = line.content.as_ref()?.text();
+            if text.is_empty() {
+                return None;
+            }
+            (Role::User, Phase::Other, text, Some(Caller::RUNTIME))
+        }
         _ => return None,
     };
     Some(Message {
@@ -615,17 +620,46 @@ mod tests {
         );
     }
 
-    /// Content of a shape this version does not know is tolerated but never a reply.
+    /// Content this version cannot read whole is tolerated but never a reply, and never
+    /// a prompt; the blocks it can read are kept.
     #[test]
     fn unknown_content_is_not_a_reply() {
-        let odd: Body = serde_json::from_str(
-            r#"{"role":"assistant","content":{"kind":"future"},"stopReason":"stop"}"#,
-        )
-        .unwrap();
+        let body = |content: &str| -> Body {
+            serde_json::from_str(&format!(
+                r#"{{"role":"assistant","content":{content},"stopReason":"stop"}}"#
+            ))
+            .unwrap()
+        };
+        let odd = body(r#"{"kind":"future"}"#);
         assert!(!odd.is_reply() && odd.text().is_empty());
-        let bare: Body =
-            serde_json::from_str(r#"{"role":"assistant","content":[{"type":"text"}]}"#).unwrap();
+        let bare = body(r#"[{"type":"text"}]"#);
         assert!(bare.is_reply() && bare.text().is_empty());
+        assert!(!body("[42]").is_reply());
+        let mixed = body(r#"[{"type":"text","text":"hi"},42]"#);
+        assert!(!mixed.is_reply() && mixed.text() == "hi");
+
+        let entries = parse(concat!(
+            r#"{"type":"message","id":"u0","message":{"role":"user","content":"hi"}}"#,
+            "\n",
+            r#"{"type":"message","id":"a0","parentId":"u0","message":{"role":"assistant","content":[{"type":"text","text":"hi"},42]}}"#,
+            "\n",
+            r#"{"type":"message","id":"u1","parentId":"a0","message":{"role":"user","content":[{"type":"text","text":"more"},42]}}"#,
+        ));
+        assert!(entries[0].line.is_prompt() && !entries[2].line.is_prompt());
+        // Shown, but as neither a final reply nor a prompt.
+        let msgs = messages(&entries, &live_branch(&entries));
+        let view: Vec<(&str, Phase, &str)> = msgs
+            .iter()
+            .map(|(_, m)| (m.item_id.as_str(), m.phase, m.text.as_str()))
+            .collect();
+        assert_eq!(
+            view,
+            [
+                ("u0", Phase::Prompt, "hi"),
+                ("a0", Phase::Commentary, "hi"),
+                ("u1", Phase::Other, "more")
+            ]
+        );
     }
 
     /// `custom_message` content is a string or blocks, read like a message's; content of
@@ -638,13 +672,15 @@ mod tests {
             r#"{"type":"custom_message","id":"c2","parentId":"c1","content":[{"type":"text","text":"a"},{"type":"image","data":""},{"type":"text","text":"b"}]}"#,
             "\n",
             r#"{"type":"custom_message","id":"c3","parentId":"c2","content":{"odd":1}}"#,
+            "\n",
+            r#"{"type":"custom_message","id":"c4","parentId":"c3","content":[{"type":"text","text":"c"},42]}"#,
         ));
         let msgs = messages(&e, &live_branch(&e));
         let view: Vec<(&str, &str)> = msgs
             .iter()
             .map(|(_, m)| (m.item_id.as_str(), m.text.as_str()))
             .collect();
-        assert_eq!(view, [("c1", "summary"), ("c2", "a\nb")]);
+        assert_eq!(view, [("c1", "summary"), ("c2", "a\nb"), ("c4", "c")]);
         assert_eq!(msgs[0].1.from, Some(Caller::RUNTIME));
     }
 

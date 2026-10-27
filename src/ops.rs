@@ -131,7 +131,7 @@ pub struct Read {
 
 pub async fn status(store: &Store, sender: Caller) -> Status {
     let adapters = Adapter::all(store);
-    let agents = join_all(adapters.iter().map(|p| p.status())).await;
+    let agents = join_all(adapters.iter().map(super::agents::Agent::status)).await;
     Status { agents, sender }
 }
 
@@ -357,6 +357,9 @@ mod tests {
 
     #[test]
     fn models_page_by_id_after_the_cursor_within_the_query() {
+        fn ids(p: &Models) -> Vec<&str> {
+            p.models.iter().map(|m| m.id.as_str()).collect()
+        }
         let all: Vec<Model> = ["b/m2", "a/m1", "b/M1", "c/x"]
             .map(|id| Model {
                 id: id.into(),
@@ -374,10 +377,6 @@ mod tests {
                 },
             )
         };
-        fn ids(p: &Models) -> Vec<&str> {
-            p.models.iter().map(|m| m.id.as_str()).collect()
-        }
-
         let p = page(None, 3, None).unwrap();
         assert_eq!(ids(&p), ["a/m1", "b/M1", "b/m2"]);
         assert_eq!(p.next_cursor.as_deref(), Some("b/m2"));
@@ -413,7 +412,7 @@ mod tests {
                         depth,
                     },
                 })
-                .unwrap()
+                .unwrap();
         };
         // A person's message is not a hop.
         assert_eq!(hop_depth(&store, &Caller::UNKNOWN).unwrap(), 0);

@@ -367,7 +367,7 @@ mod tests {
         assert!(!span.undecided_abort() && span.turn("ses_x").is_none());
 
         // Nothing after the aborted step yet: undecided until nothing runs any more.
-        let mut span = Span::new(user.clone(), vec![interrupted]);
+        let mut span = Span::new(user, vec![interrupted]);
         assert!(span.undecided_abort());
         span.end_at_abort();
         assert_eq!(span.turn("ses_x").unwrap().status, TurnStatus::Interrupted);
@@ -473,7 +473,7 @@ mod tests {
             brief,
             [
                 ("msg_u".into(), "prompt", "go".into()),
-                ("msg_a1#0".into(), "commentary", "".into()),
+                ("msg_a1#0".into(), "commentary", String::new()),
                 ("msg_a1#1".into(), "other", "[tool shell] ? null".into()),
                 ("msg_a2#0".into(), "final", "done".into()),
             ]

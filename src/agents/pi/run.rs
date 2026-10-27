@@ -2,11 +2,10 @@
 //! the turn. Spawning into the run log and reading it are `agents::child`.
 
 use super::session::{self, Body, Entry};
-use crate::model::{self, TurnStatus};
+use crate::model;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::path::Path;
-use std::process::ExitStatus;
 
 /// `pi --mode json` arguments for one turn; `session` is `--session-id <id>` for a new
 /// session or `--session <path>` to resume one. A resumed session takes the model of its
@@ -117,29 +116,10 @@ impl Run {
     }
 }
 
-/// Turn of a run whose process ended without `agent_settled`: `failed` when the exit
-/// status says so, otherwise `unknown` (the file may still hold a reply).
-pub fn exited(handle: String, turn_id: String, exit: Option<ExitStatus>) -> model::Turn {
-    model::Turn {
-        handle,
-        turn_id,
-        status: match exit {
-            Some(s) if !s.success() => TurnStatus::Failed,
-            _ => TurnStatus::Unknown,
-        },
-        error: Some(json!({
-            "message": "pi exited without an agent_settled event",
-            "exit_code": exit.and_then(|s| s.code()),
-        })),
-        final_text: None,
-        duration_ms: None,
-        basis: Some("pi process exited".into()),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::TurnStatus;
 
     // Literal events from the probe of 2026-10-07 (pi 1.0.3; usage trimmed).
     const USER: &str = r#"{"type":"message_end","message":{"role":"user","content":[{"type":"text","text":"Reply with exactly OK"}],"timestamp":1791376687658}}"#;

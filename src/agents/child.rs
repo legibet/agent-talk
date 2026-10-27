@@ -1,7 +1,8 @@
 //! Agent CLIs as children of agent-talk, and the local files around them: the session
 //! lock and the run log a child writes.
 
-use crate::model::{AgentError, Error, ErrorCode, Result};
+use crate::model::{AgentError, Error, ErrorCode, Result, Turn, TurnStatus};
+use serde_json::json;
 use std::fs::{File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
@@ -143,13 +144,48 @@ impl Runs {
     /// it starts, and pi reads stdin to EOF as its prompt.
     pub async fn deliver(&self, child: &mut Child, message: &[u8]) -> Result<()> {
         let mut stdin = child.stdin.take().expect("stdin is piped");
-        stdin
-            .write_all(message)
-            .await
-            .map_err(|e| Error::transport(format!("write the message to {}", self.program), e))?;
+        match stdin.write_all(message).await {
+            // The child exited without reading its stdin (a refused `--model`); `tail`
+            // then sees how, and the receipt is rejected (DESIGN.md §3).
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+            r => r.map_err(|e| {
+                Error::transport(format!("write the message to {}", self.program), e)
+            })?,
+        }
         // Dropping the handle closes the pipe; `shutdown` does not (a no-op on tokio 1.53.2).
         drop(stdin);
         Ok(())
+    }
+
+    /// The turn of a run whose process ended without its end event (`result`,
+    /// `agent_settled`): `failed` when the exit status says so, else `unknown`, since the
+    /// agent's files may still hold a reply (DESIGN.md §6.5).
+    pub fn exited_turn(
+        &self,
+        handle: String,
+        turn_id: String,
+        event: &str,
+        status: Option<ExitStatus>,
+    ) -> Turn {
+        Turn {
+            handle,
+            turn_id,
+            status: if status.is_some_and(|s| !s.success()) {
+                TurnStatus::Failed
+            } else {
+                TurnStatus::Unknown
+            },
+            error: Some(json!({
+                "message": format!("{} exited without a {event} event", self.program),
+                "exit_code": status.and_then(|s| s.code()),
+            })),
+            final_text: None,
+            duration_ms: None,
+            basis: Some(format!(
+                "the {} process agent-talk started exited without a {event} event",
+                self.program
+            )),
+        }
     }
 
     /// Why the child of `receipt_id` exited before taking the message: its stderr, or how it

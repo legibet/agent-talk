@@ -3,13 +3,14 @@
 //! response decoded, and the `/api/event` stream.
 
 use crate::agents::child::pid_alive;
-use crate::agents::decode::entries;
+use crate::agents::decode::{entries, or_default};
 use crate::model::{AgentError, Error, ErrorCode, Result};
 use futures_util::StreamExt;
 use serde::de::{DeserializeOwned, IgnoredAny};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::time::Duration;
@@ -93,6 +94,7 @@ pub struct SessionInfo {
     pub agent: Option<String>,
     #[serde(default, deserialize_with = "model")]
     pub model: Option<ModelRef>,
+    #[serde(default, deserialize_with = "or_default")]
     location: Option<Location>,
 }
 
@@ -277,7 +279,7 @@ impl Service {
             let mut message = format!("opencode service: {e}");
             let mut cause = std::error::Error::source(&e);
             while let Some(c) = cause {
-                message.push_str(&format!(": {c}"));
+                let _ = write!(message, ": {c}");
                 cause = c.source();
             }
             Error::new(ErrorCode::Transport, message)
@@ -295,9 +297,9 @@ impl Service {
 
     /// Send a request and decode its JSON body (an empty body reads as `null`).
     async fn call<T: DeserializeOwned>(&self, b: reqwest::RequestBuilder) -> Result<T> {
-        let body = self
-            .respond(b)
-            .await?
+        let resp = self.respond(b).await?;
+        let path = resp.url().path().to_owned();
+        let body = resp
             .text()
             .await
             .map_err(|e| Error::transport("opencode service", e))?;
@@ -306,8 +308,12 @@ impl Service {
         } else {
             &body
         };
-        serde_json::from_str(body)
-            .map_err(|e| Error::transport("opencode service: unexpected response", e))
+        serde_json::from_str(body).map_err(|e| {
+            Error::transport(
+                format!("opencode service: unexpected response from {path}"),
+                e,
+            )
+        })
     }
 
     async fn get<T: DeserializeOwned>(&self, path: &str, query: &[(&str, String)]) -> Result<T> {
@@ -368,6 +374,10 @@ impl Service {
     }
 
     /// The sessions with a running execution.
+    #[expect(
+        clippy::zero_sized_map_values,
+        reason = "only the keys of the object are read"
+    )]
     pub async fn active(&self) -> Result<HashSet<String>> {
         let active: Data<Option<HashMap<String, IgnoredAny>>> =
             self.get("/api/session/active", &[]).await?;

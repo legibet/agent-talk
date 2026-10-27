@@ -6,14 +6,14 @@
 //! connection belongs to this prompt.
 
 use super::handle;
-use crate::agents::acp::{Conn, Event, Response};
+use crate::agents::acp::{self, Conn, Event, Response};
 use crate::agents::history::first_line;
 use crate::agents::lifecycle::{ApprovalPolicy, record};
 use crate::model::{
     self, Approval, ApprovalOutcome, Error, ErrorCode, Progress, Result, TurnStatus,
 };
 use crate::store::Store;
-use serde_json::{Value, json};
+use serde_json::Value;
 
 const REQUEST_PERMISSION: &str = "session/request_permission";
 /// Where Devin takes and echoes a client's message id (3000.11.92).
@@ -151,14 +151,19 @@ impl<'s> Watch<'s> {
     async fn on_event(&mut self, conn: &Conn, ev: Event) -> Result<()> {
         match ev {
             Event::Request(r) if r.method == REQUEST_PERMISSION => {
-                let id = r.id.clone();
-                if let Some((a, answer)) = self.on_permission(r.id, r.params) {
-                    // Recorded as declined only once the answer is written.
-                    if let Some(answer) = answer {
-                        conn.respond(&id, answer).await?;
+                if let Some((mut a, answer)) = self.on_permission(r.id, r.params) {
+                    // Declined only once the answer is written; one that could not be
+                    // written leaves the request pending, recorded as such (DESIGN.md §4).
+                    let sent = match answer {
+                        Some(answer) => conn.respond(&a.request_id, answer).await,
+                        None => Ok(()),
+                    };
+                    if sent.is_err() {
+                        a.outcome = ApprovalOutcome::Pending;
                     }
                     record(self.store, &a);
                     self.approvals.push(a);
+                    sent?;
                 }
             }
             // agent-talk offers no client capabilities.
@@ -203,17 +208,9 @@ impl<'s> Watch<'s> {
             return None;
         }
         let call = &params["toolCall"];
-        let reject = params["options"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .find(|o| o["kind"] == "reject_once" || o["optionId"] == "reject_once")
-            .and_then(|o| o["optionId"].as_str());
-        let answer = match (self.policy, reject) {
-            (ApprovalPolicy::Deny, Some(option)) => {
-                Some(json!({"outcome": {"outcome": "selected", "optionId": option}}))
-            }
-            _ => None,
+        let answer = match self.policy {
+            ApprovalPolicy::Deny => acp::reject_once(&params),
+            ApprovalPolicy::Observe => None,
         };
         let summary = call["title"]
             .as_str()
@@ -267,6 +264,7 @@ mod tests {
     use crate::agents::Outgoing;
     use crate::model::{Caller, ReceiptState};
     use crate::store::NewIntent;
+    use serde_json::json;
 
     // Frames in the shape Devin 3000.11.92 sends them (.agents/findings/devin.md §5, §8).
 
@@ -307,7 +305,7 @@ mod tests {
         crate::agents::acp::spawn(cmd, "test agent").await.unwrap()
     }
 
-    fn update(update: Value) -> Value {
+    fn update(update: &Value) -> Value {
         json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": SESSION, "update": update}})
     }
 
@@ -326,19 +324,19 @@ mod tests {
         let store = store_with_intent();
         let mut conn = agent(&[
             update(
-                json!({"sessionUpdate": "user_message_chunk", "content": {"type": "text", "text": "x"}, "_meta": {CLIENT_MESSAGE_ID: CLIENT}}),
+                &json!({"sessionUpdate": "user_message_chunk", "content": {"type": "text", "text": "x"}, "_meta": {CLIENT_MESSAGE_ID: CLIENT}}),
             ),
             update(
-                json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "Checking."}}),
+                &json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "Checking."}}),
             ),
             update(
-                json!({"sessionUpdate": "tool_call", "toolCallId": "exec:0#ab", "title": "ls"}),
+                &json!({"sessionUpdate": "tool_call", "toolCallId": "exec:0#ab", "title": "ls"}),
             ),
             update(
-                json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "po"}}),
+                &json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "po"}}),
             ),
             update(
-                json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "ng"}}),
+                &json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "ng"}}),
             ),
             json!({"jsonrpc": "2.0", "id": 2, "result": {"stopReason": "end_turn", "_meta": {"cognition.ai/userMessageId": CLIENT}}}),
         ])
@@ -404,6 +402,42 @@ mod tests {
             .on_permission(request["id"].clone(), request["params"].clone())
             .unwrap();
         assert_eq!((a.outcome, answer), (ApprovalOutcome::Pending, None));
+    }
+
+    /// A `reject_once` answer that cannot be written leaves the request pending, recorded
+    /// as such, and the failure propagates.
+    #[tokio::test]
+    async fn unwritable_answer_leaves_the_request_pending() {
+        let _children = crate::agents::acp::SPAWN_LOCK.lock().await;
+        let store = store_with_intent();
+        // Answers `initialize`, writes the request and exits before any answer.
+        let script = format!(
+            "read l; echo '{}'; echo '{PERMISSION}'",
+            json!({"jsonrpc": "2.0", "id": 1, "result": {}}),
+        );
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.args(["-c", &script]);
+        let mut conn = crate::agents::acp::spawn(cmd, "test agent").await.unwrap();
+        let Some(Event::Request(r)) = conn.next_event().await else {
+            panic!("the request comes first");
+        };
+        assert!(conn.next_event().await.is_none(), "then the agent is gone");
+        let mut w = Watch {
+            store: &store,
+            session_id: SESSION.into(),
+            receipt_id: "r".into(),
+            turn_id: CLIENT.into(),
+            response: None,
+            policy: ApprovalPolicy::Deny,
+            accepted: false,
+            text: String::new(),
+            approvals: Vec::new(),
+        };
+        let e = w.on_event(&conn, Event::Request(r)).await.unwrap_err();
+        assert_eq!(e.code, crate::model::ErrorCode::Transport);
+        assert_eq!(w.approvals.len(), 1);
+        assert_eq!(w.approvals[0].outcome, ApprovalOutcome::Pending);
+        conn.close().await;
     }
 
     /// A cancelled turn is interrupted; an error response before the echo leaves the receipt

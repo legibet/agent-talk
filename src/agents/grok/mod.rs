@@ -24,7 +24,8 @@ use crate::agents::acp::{self, Conn};
 use crate::agents::child::{agent_cmd, cli_version, lock, pid_alive};
 use crate::agents::history::{ReadPage, ReadQuery, cut, first_line};
 use crate::agents::lifecycle::{
-    ApprovalPolicy, approval_policy, bounded, note_waiting, reject, settle, wait_receipt,
+    ApprovalPolicy, approval_policy, bounded, note_waiting, reject, reject_unstarted, settle,
+    wait_receipt,
 };
 use crate::agents::{
     Agent, AgentStatus, Check, ListFilter, Operation, SendRequest, StartRequest, Wait, WaitTarget,
@@ -168,9 +169,8 @@ enum Route {
 impl<'a> Grok<'a> {
     pub fn new(store: &'a Store) -> Self {
         let home_dir = std::env::home_dir().unwrap_or_default();
-        let home = std::env::var_os("GROK_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home_dir.join(".grok"));
+        let home =
+            std::env::var_os("GROK_HOME").map_or_else(|| home_dir.join(".grok"), PathBuf::from);
         Grok {
             store,
             home,
@@ -374,7 +374,7 @@ impl<'a> Grok<'a> {
     }
 
     /// The session's working directory, from `summary.json`; it must still exist.
-    fn session_cwd(&self, dir: &Path) -> Result<String> {
+    fn session_cwd(dir: &Path) -> Result<String> {
         match sessions::summary(dir)?.info.cwd {
             Some(c) if Path::new(&c).is_dir() => Ok(c),
             Some(c) => Err(Error::new(
@@ -422,7 +422,7 @@ impl<'a> Grok<'a> {
                 }),
             )
             .await
-            .map_err(|e| reject(self.store, intent.receipt_id, e))?;
+            .map_err(|e| reject_unstarted(self.store, intent.receipt_id, e))?;
         let shared = matches!(route, Route::Leader(_));
         let mut w = Watch::prompt(
             self.store,
@@ -489,8 +489,10 @@ impl<'a> Grok<'a> {
                 "session/prompt response",
                 note.as_deref(),
             )),
-            // A refusal of the prompt itself; an error after acceptance is a failed turn.
+            // A refusal of the prompt itself; an error after acceptance is a failed turn,
+            // except a lost connection, whose outcome is unknown (DESIGN.md §4).
             Err(e) if !w.accepted() => Err(reject(self.store, intent.receipt_id, e)),
+            Err(e) if e.code == ErrorCode::Transport => Err(e),
             Err(e) => Ok(model::Turn {
                 handle: h.clone(),
                 turn_id: end.turn_id,
@@ -602,14 +604,13 @@ impl<'a> Grok<'a> {
                 policy,
             );
             let observe = async {
-                match deadline {
-                    Some(_) => w.finish(&mut conn).await.map(Some),
-                    None => {
-                        // Without --wait: only until the joined turn is known.
-                        let joined = w.until_running(&mut conn);
-                        let _ = tokio::time::timeout(Duration::from_secs(5), joined).await;
-                        Ok(None)
-                    }
+                if deadline.is_some() {
+                    w.finish(&mut conn).await.map(Some)
+                } else {
+                    // Without --wait: only until the joined turn is known.
+                    let joined = w.until_running(&mut conn);
+                    let _ = tokio::time::timeout(Duration::from_secs(5), joined).await;
+                    Ok(None)
                 }
             };
             let res = bounded(deadline, observe).await;
@@ -629,13 +630,14 @@ impl<'a> Grok<'a> {
                 )),
                 _ => None,
             });
+            let progress = w.progress();
             settle(
                 self.store,
                 h.clone(),
                 res,
                 Some(&receipt_id),
                 w.approvals,
-                Progress::Running,
+                progress,
             )
         }
         .await;
@@ -890,7 +892,7 @@ impl Agent for Grok<'_> {
         check_id(id)?;
         let h = handle(id);
         let dir = sessions::require(&self.home, id)?;
-        let cwd = self.session_cwd(&dir)?;
+        let cwd = Self::session_cwd(&dir)?;
         let policy = approval_policy(self.store, &h)?;
         if req.steer {
             return self.steer(id, &cwd, req, policy, wait.deadline()).await;
@@ -973,13 +975,22 @@ impl Agent for Grok<'_> {
             WaitTarget::Turn(t) => (t.clone(), self.store.receipt_by_turn(&h, t)?),
             WaitTarget::Receipt(r) => {
                 let rec = wait_receipt(self.store, &h, r)?;
-                // The promptId, recorded as the client message id before submission.
-                (
-                    rec.turn_id
-                        .clone()
-                        .unwrap_or_else(|| rec.client_msg_id.clone()),
-                    Some(rec),
-                )
+                let turn_id = match (&rec.turn_id, rec.state) {
+                    (Some(t), _) => t.clone(),
+                    // Only a steer message is accepted without a turn: `_x.ai/interject`
+                    // carries no client id, so nothing in updates.jsonl names it.
+                    (None, ReceiptState::Accepted) => {
+                        return Err(Error::new(
+                            ErrorCode::Precondition,
+                            format!(
+                                "steer receipt {r} was accepted but the turn it joined was not seen; read {h} to find it"
+                            ),
+                        ));
+                    }
+                    // The promptId, recorded as the client message id before submission.
+                    (None, _) => rec.client_msg_id.clone(),
+                };
+                (turn_id, Some(rec))
             }
         };
         let dir = sessions::require(&self.home, id)?;
@@ -995,6 +1006,9 @@ impl Agent for Grok<'_> {
         };
         let work = async {
             loop {
+                // Liveness before the file: once the child is gone, what the file holds
+                // after that is complete.
+                let child_gone = child.is_some_and(|pid| !pid_alive(pid));
                 let history = History::new(updates::load(&path)?);
                 let span = history.find(&turn_id);
                 if let (Some(_), Some(r)) = (span, &receipt)
@@ -1016,7 +1030,7 @@ impl Agent for Grok<'_> {
                     ));
                 }
                 if let Some(pid) = child
-                    && !pid_alive(pid)
+                    && child_gone
                 {
                     let (status, message) = match span {
                         Some(_) => (
@@ -1069,7 +1083,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
 
-    fn grok<'a>(store: &'a Store, socket: PathBuf) -> Grok<'a> {
+    fn grok(store: &Store, socket: PathBuf) -> Grok<'_> {
         Grok {
             store,
             home: socket.parent().unwrap().to_path_buf(),
@@ -1103,7 +1117,7 @@ mod tests {
             "ECONNREFUSED"
         );
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
-        let denied = grok(&store, sock.clone()).leader();
+        let denied = grok(&store, sock).leader();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(
             denied.err().map(|e| e.code),

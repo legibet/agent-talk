@@ -1065,6 +1065,10 @@ def antigravity_tier():
     def killed():
         # agent-talk's child dies mid-turn: the turn is not reported completed.
         h = need("antigravity")
+        # This send's run log is the one that appears after it starts: the previous check's
+        # log can have been written within the same second.
+        runs = Path.home() / ".agent-talk/antigravity-runs"
+        before = set(runs.glob("*.ndjson"))
         p = subprocess.Popen(
             [B, "send", h, COUNT, "--wait", "--json"],
             env=BASE_ENV,
@@ -1072,12 +1076,11 @@ def antigravity_tier():
             stderr=subprocess.DEVNULL,
             text=True,
         )
-        runs = Path.home() / ".agent-talk/antigravity-runs"
-        t0, child = time.time(), []
+        child = []
 
         def taken():
             kids = subprocess.run(["pgrep", "-P", str(p.pid)], capture_output=True, text=True).stdout.split()
-            logs = [f for f in runs.glob("*.ndjson") if f.stat().st_mtime >= t0 - 1]
+            logs = [f for f in runs.glob("*.ndjson") if f not in before]
             if kids and logs and '"user_input"' in logs[0].read_text():
                 child[:] = [int(kids[0]), logs[0]]
             return bool(child)

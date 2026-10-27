@@ -117,7 +117,7 @@ fn new_msg_id() -> String {
     const ALPHABET: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
         .unwrap_or_default();
     let random = uuid::Uuid::new_v4();
     let bytes = random.as_bytes();
@@ -228,20 +228,22 @@ impl<'a> OpenCode<'a> {
         };
         // Deny only requests of the turn being observed: while the message is still
         // queued, whatever asks belongs to the execution before it.
+        // A reject that fails leaves the request pending, recorded as such (DESIGN.md §4).
+        let mut failed = None;
         if w.policy == ApprovalPolicy::Deny && delivered {
-            a.outcome = match svc.reject(w.session_id, &request_id, DENY_MESSAGE).await {
-                Ok(()) => ApprovalOutcome::Declined,
+            match svc.reject(w.session_id, &request_id, DENY_MESSAGE).await {
+                Ok(()) => a.outcome = ApprovalOutcome::Declined,
                 // Gone already: one reject answers every pending request of the session
                 // (DESIGN.md §6.3), or someone else replied first.
                 Err(e) if e.agent_error.as_ref().is_some_and(|v| v.code == 404) => {
-                    ApprovalOutcome::Resolved
+                    a.outcome = ApprovalOutcome::Resolved;
                 }
-                Err(e) => return Err(e),
-            };
+                Err(e) => failed = Some(e),
+            }
         }
         record(self.store, &a);
         w.approvals.push(a);
-        Ok(())
+        failed.map_or(Ok(()), Err)
     }
 
     /// Inbox first, then history: a message only moves inbox → history, so reading in
@@ -552,24 +554,22 @@ impl Agent for OpenCode<'_> {
         // field.
         let change = req.change;
         if change.model.is_some() || change.effort.is_some() {
-            let model = match &change.model {
-                Some(m) => ModelRef::parse(m)?,
+            let model = if let Some(m) = &change.model {
+                ModelRef::parse(m)?
+            } else {
                 // An effort alone applies to the session's model, the user's default when the
                 // session has none.
-                None => {
-                    let session = svc.session(session_id).await?;
-                    match session.model {
-                        Some(m) => m,
-                        None => {
-                            let cwd = session.directory().ok_or_else(|| {
-                                Error::new(
-                                    ErrorCode::Transport,
-                                    format!("session.get returned no location for {session_id}"),
-                                )
-                            })?;
-                            default_model(&svc, cwd).await?
-                        }
-                    }
+                let session = svc.session(session_id).await?;
+                if let Some(m) = session.model {
+                    m
+                } else {
+                    let cwd = session.directory().ok_or_else(|| {
+                        Error::new(
+                            ErrorCode::Transport,
+                            format!("session.get returned no location for {session_id}"),
+                        )
+                    })?;
+                    default_model(&svc, cwd).await?
                 }
             };
             // The session's effort (the change included), kept across a model change; without

@@ -31,7 +31,7 @@ use crate::agents::{
 };
 use crate::model::{
     self, Approval, ApprovalOutcome, Error, ErrorCode, History, Loaded, Model, Observations,
-    Outcome, Page, Progress, Result, Session, SessionState, TurnStatus,
+    Outcome, Page, Progress, Result, Session, SessionState,
 };
 use crate::store::{NewIntent, Store};
 use serde_json::json;
@@ -90,25 +90,26 @@ fn add_agents(rows: &mut HashMap<String, Row>, agents: Vec<AgentEntry>, cwd: Opt
             continue;
         };
         let started = a.started_at.unwrap_or(0);
-        match rows.get_mut(&id) {
-            Some(row) => {
-                row.recency_ms = row.recency_ms.max(started);
+        if let Some(row) = rows.get_mut(&id) {
+            row.recency_ms = row.recency_ms.max(started);
+            // A session is listed twice when a background run of it ended and a live
+            // process holds it (2.1.311); the live entry wins whatever the order.
+            if a.pid.is_some() || row.agent.is_none() {
                 row.agent = Some(a);
             }
-            None => {
-                if cwd.is_some() && a.cwd.as_deref() != cwd {
-                    continue;
-                }
-                rows.insert(
-                    id.clone(),
-                    Row {
-                        id,
-                        agent: Some(a),
-                        file: None,
-                        recency_ms: started,
-                    },
-                );
+        } else {
+            if cwd.is_some() && a.cwd.as_deref() != cwd {
+                continue;
             }
+            rows.insert(
+                id.clone(),
+                Row {
+                    id,
+                    agent: Some(a),
+                    file: None,
+                    recency_ms: started,
+                },
+            );
         }
     }
 }
@@ -126,7 +127,7 @@ fn page(
             .map_err(|_| Error::new(ErrorCode::Precondition, format!("invalid cursor {c}")))?,
         None => 0,
     };
-    let end = (offset + limit as usize).min(rows.len());
+    let end = offset.saturating_add(limit as usize).min(rows.len());
     let next_cursor = (end < rows.len()).then(|| end.to_string());
     let rows = rows.into_iter().skip(offset).take(limit as usize).collect();
     Ok((rows, next_cursor))
@@ -321,7 +322,7 @@ impl<'a> Claude<'a> {
             .flatten()
         {
             if let Some(s) = &want_slug
-                && dir.file_name().to_string_lossy() != s.as_str()
+                && dir.file_name().to_string_lossy() != *s
             {
                 continue;
             }
@@ -345,8 +346,7 @@ impl<'a> Claude<'a> {
                     .and_then(|m| m.modified())
                     .ok()
                     .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                    .map(|d| d.as_millis() as i64)
-                    .unwrap_or(0);
+                    .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
                 rows.insert(
                     id.to_string(),
                     Row {
@@ -425,7 +425,7 @@ impl<'a> Claude<'a> {
 
     /// Record the intent to deliver `message` to session `id`, and the watch over the run
     /// that will deliver it.
-    fn intent(&self, id: &str, message: &Outgoing) -> Result<RunWatch> {
+    fn intent(&self, id: &str, message: &Outgoing<'_>) -> Result<RunWatch> {
         let receipt_id = uuid::Uuid::new_v4().to_string();
         // The input line's uuid: becomes the transcript user.uuid, i.e. the turn id.
         let client_msg_id = uuid::Uuid::new_v4().to_string();
@@ -521,22 +521,9 @@ impl<'a> Claude<'a> {
         }
         Ok(match &run.result {
             Some(r) => r.turn(handle(id), turn_id.into()),
-            None => model::Turn {
-                handle: handle(id),
-                turn_id: turn_id.into(),
-                status: if status.is_some_and(|s| !s.success()) {
-                    TurnStatus::Failed
-                } else {
-                    TurnStatus::Unknown
-                },
-                error: Some(json!({
-                    "message": "claude exited without a result event",
-                    "exit_code": status.and_then(|s| s.code()),
-                })),
-                final_text: None,
-                duration_ms: None,
-                basis: Some("claude -p process exited".into()),
-            },
+            None => self
+                .runs
+                .exited_turn(handle(id), turn_id.into(), "result", status),
         })
     }
 
@@ -547,6 +534,9 @@ impl<'a> Claude<'a> {
         id: &str,
         turn_id: &str,
     ) -> Result<std::result::Result<model::Turn, String>> {
+        // Liveness before the transcript: a transcript read after every writer is gone
+        // is complete.
+        let live = self.live(id).await;
         let entries = load(&self.require_transcript(id)?)?;
         let branch = live_branch(&entries);
         // Only the live branch is read: a prompt superseded by a resume from an earlier
@@ -565,14 +555,20 @@ impl<'a> Claude<'a> {
                 },
             ));
         };
-        let live = self.live(id).await?;
+        let end = turn_end(&entries, &branch, start);
+        // `claude agents` decides only a turn the transcript does not close; for a closed
+        // one it merely annotates the basis.
+        let live = match end {
+            Some(_) => live.unwrap_or_default(),
+            None => live?,
+        };
         let agent_status = match &live {
             Some(Live::Foreign(a)) => a.status.as_deref(),
             _ => None,
         };
         // A transcript marker or a later prompt closes the turn; so does the end of every
         // process that could still write it.
-        let end = match (turn_end(&entries, &branch, start), &live) {
+        let end = match (end, &live) {
             (Some(end), _) => end,
             (None, None) => TurnEnd::ProcessGone,
             (None, Some(Live::Own(pid))) => {
@@ -789,13 +785,15 @@ impl Agent for Claude<'_> {
                 if let Some((r, log)) = &run_log
                     && log.is_file()
                 {
+                    // Liveness before the log: once the process is gone, the log read
+                    // after that is complete.
+                    let pid = self.store.process(r)?.filter(|&p| pid_alive(p));
                     let run = Run::from_log(log);
                     if unaccepted && run.started() {
                         self.store.accept(r, None, Some(&turn_id), Some(&turn_id))?;
                         unaccepted = false;
                     }
-                    let pid = self.store.process(r)?;
-                    if run.result.is_some() || !pid.is_some_and(pid_alive) {
+                    if run.result.is_some() || pid.is_none() {
                         // This command did not start the process: no exit status.
                         let turn = self.finished(id, r, &turn_id, &run, None)?;
                         if let Some(result) = &run.result {

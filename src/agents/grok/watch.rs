@@ -5,12 +5,12 @@
 
 use super::handle;
 use super::updates;
-use crate::agents::acp::{Conn, Event, Response};
+use crate::agents::acp::{self, Conn, Event, Response};
 use crate::agents::history::first_line;
 use crate::agents::lifecycle::{ApprovalPolicy, record, resolve};
 use crate::model::{self, Approval, ApprovalOutcome, Error, ErrorCode, Progress, Result};
 use crate::store::Store;
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::collections::HashSet;
 
 const REQUEST_PERMISSION: &str = "session/request_permission";
@@ -264,13 +264,18 @@ impl<'s> Watch<'s> {
     async fn on_event(&mut self, conn: &Conn, ev: Event) -> Result<Option<End>> {
         match ev {
             Event::Request(r) if r.method == REQUEST_PERMISSION => {
-                let id = r.id.clone();
-                if let Some((a, answer)) = self.on_permission(r.id, r.params) {
-                    // Recorded as declined only once the answer is written.
-                    if let Some(answer) = answer {
-                        conn.respond(&id, answer).await?;
+                if let Some((mut a, answer)) = self.on_permission(r.id, r.params) {
+                    // Declined only once the answer is written; one that could not be
+                    // written leaves the request pending, recorded as such (DESIGN.md §4).
+                    let sent = match answer {
+                        Some(answer) => conn.respond(&a.request_id, answer).await,
+                        None => Ok(()),
+                    };
+                    if sent.is_err() {
+                        a.outcome = ApprovalOutcome::Pending;
                     }
                     self.add_approval(a);
+                    sent?;
                 }
                 Ok(None)
             }
@@ -401,16 +406,8 @@ impl<'s> Watch<'s> {
             return None;
         }
         let ours = !self.shared || call_id.as_ref().is_some_and(|c| self.tools.contains(c));
-        let reject = params["options"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .find(|o| o["kind"] == "reject_once")
-            .and_then(|o| o["optionId"].as_str());
-        let answer = match (self.policy, ours, reject) {
-            (ApprovalPolicy::Deny, true, Some(option)) => {
-                Some(json!({"outcome": {"outcome": "selected", "optionId": option}}))
-            }
+        let answer = match self.policy {
+            ApprovalPolicy::Deny if ours => acp::reject_once(&params),
             _ => None,
         };
         // As `read` shows the tool call: name and main argument.
@@ -479,6 +476,7 @@ mod tests {
     use crate::agents::Outgoing;
     use crate::model::{Caller, ReceiptState, TurnStatus};
     use crate::store::NewIntent;
+    use serde_json::json;
 
     // Frames as captured on grok 1.0.46 (.agents/findings/grok.md §5, §8, §10), with the
     // session id filled in and elided fields dropped.
@@ -520,7 +518,7 @@ mod tests {
         Watch::new(store, SESSION, "r", kind, policy, shared, None)
     }
 
-    fn frame(w: &mut Watch, method: &str, params: &str) -> Option<End> {
+    fn frame(w: &mut Watch<'_>, method: &str, params: &str) -> Option<End> {
         let params: Value = serde_json::from_str(&params.replace("$S", SESSION)).unwrap();
         w.on_notification(method, &params).unwrap()
     }
@@ -619,7 +617,7 @@ mod tests {
 
     const PERMISSION: &str = r#"{"sessionId":"$S","toolCall":{"toolCallId":"call-f3cb…-0","kind":"execute","title":"Execute `env | grep -iE 'grok' | sort`","rawInput":{"variant":"Bash","command":"env | grep -iE 'grok' | sort"},"_meta":{"x.ai/tool":{"name":"run_terminal_command","read_only":false}}},"options":[{"optionId":"always-allow","kind":"allow_always","name":"Yes, and don't ask again for bash commands"},{"optionId":"allow-once","kind":"allow_once","name":"Yes, proceed"},{"optionId":"reject-once","kind":"reject_once","name":"No, and tell Grok what to do differently"},{"optionId":"reject-always","kind":"reject_always","name":"No, and don't ask again for this command"}]}"#;
 
-    fn permission(w: &mut Watch, id: u64, params: &str) -> Option<Value> {
+    fn permission(w: &mut Watch<'_>, id: u64, params: &str) -> Option<Value> {
         let params = serde_json::from_str(&params.replace("$S", SESSION)).unwrap();
         let (a, answer) = w.on_permission(json!(id), params)?;
         w.add_approval(a);
@@ -719,6 +717,84 @@ mod tests {
         let end = w.finish(&mut conn).await.unwrap();
         assert!(end.result.is_ok());
         assert_eq!(w.final_text().as_deref(), Some("pong"));
+        conn.close().await;
+    }
+
+    /// A `reject_once` answer that cannot be written leaves the request pending, recorded
+    /// as such, and the failure propagates.
+    #[tokio::test]
+    async fn unwritable_answer_leaves_the_request_pending() {
+        let _children = crate::agents::acp::SPAWN_LOCK.lock().await;
+        let store = store_with_intent("p");
+        let request = format!(
+            r#"{{"jsonrpc":"2.0","id":7,"method":"session/request_permission","params":{}}}"#,
+            PERMISSION.replace("$S", SESSION).replace('\'', "")
+        );
+        // Answers `initialize`, writes the request and exits before any answer.
+        let script = format!(
+            "read l; echo '{}'; echo '{request}'",
+            json!({"jsonrpc": "2.0", "id": 1, "result": {}}),
+        );
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.args(["-c", &script]);
+        let mut conn = crate::agents::acp::spawn(cmd, "test agent").await.unwrap();
+        let Some(Event::Request(r)) = conn.next_event().await else {
+            panic!("the request comes first");
+        };
+        assert!(conn.next_event().await.is_none(), "then the agent is gone");
+        let mut w = prompt(&store, "p", ApprovalPolicy::Deny, false);
+        let e = w.on_event(&conn, Event::Request(r)).await.err();
+        assert_eq!(e.map(|e| e.code), Some(crate::model::ErrorCode::Transport));
+        assert_eq!(w.approvals.len(), 1);
+        assert_eq!(w.approvals[0].outcome, ApprovalOutcome::Pending);
+        conn.close().await;
+    }
+
+    /// Through a leader, a tool call's update and its permission request arrive back to
+    /// back; read in that order, the request is this prompt's and `deny` answers it even
+    /// when both are buffered before the watcher polls.
+    #[tokio::test]
+    async fn buffered_permission_request_follows_its_tool_call() {
+        let _children = crate::agents::acp::SPAWN_LOCK.lock().await;
+        let store = store_with_intent("p");
+        let tool_call = r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"$S","update":{"sessionUpdate":"tool_call","toolCallId":"call-3b49b159-0","title":"run_terminal_command","rawInput":{"command":"env"},"_meta":{"x.ai/tool":{"name":"run_terminal_command","kind":"execute","read_only":false}}},"_meta":{"promptId":"p"}}}"#;
+        let request = format!(
+            r#"{{"jsonrpc":"2.0","id":7,"method":"session/request_permission","params":{}}}"#,
+            PERMISSION
+                .replace("call-f3cb…-0", "call-3b49b159-0")
+                .replace('\'', "")
+        );
+        // An agent that answers `initialize`, then writes both frames in one go, and ends
+        // the turn once the answer arrives.
+        let script = format!(
+            "read l; echo '{}'; read l; echo '{}'; echo '{}'; read answer; echo '{}'; read l",
+            json!({"jsonrpc": "2.0", "id": 1, "result": {}}),
+            tool_call.replace("$S", SESSION),
+            request.replace("$S", SESSION),
+            json!({"jsonrpc": "2.0", "id": 2, "result": {"stopReason": "end_turn"}}),
+        );
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.args(["-c", &script]);
+        let mut conn = crate::agents::acp::spawn(cmd, "test agent").await.unwrap();
+        let response = conn.submit("session/prompt", json!({})).await.unwrap();
+        let mut w = Watch::prompt(
+            &store,
+            SESSION,
+            "r",
+            "p",
+            response,
+            ApprovalPolicy::Deny,
+            true,
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // Bounded: a request read out of order would never be answered and never end.
+        let end = tokio::time::timeout(std::time::Duration::from_secs(10), w.finish(&mut conn))
+            .await
+            .expect("the turn ends once the request is answered")
+            .unwrap();
+        assert!(end.result.is_ok());
+        assert_eq!(w.approvals.len(), 1);
+        assert_eq!(w.approvals[0].outcome, ApprovalOutcome::Declined);
         conn.close().await;
     }
 

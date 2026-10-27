@@ -2,10 +2,11 @@
 //! decoding, turn boundaries and normalized messages. Pure apart from reading the file;
 //! the records are narrow and unknown fields and step types are tolerated.
 
+use crate::agents::decode::{or_default, read_entries};
 use crate::agents::history::first_line;
 use crate::agents::strip_provenance;
 use crate::model::{Caller, Error, Message, Phase, Result, Role};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
 use std::collections::{HashSet, VecDeque};
 use std::fs::File;
@@ -15,25 +16,60 @@ use std::path::Path;
 /// One line of `transcript.jsonl`: one step, written when it first finishes or runs.
 #[derive(Debug, Deserialize)]
 struct Step {
+    #[serde(default, deserialize_with = "or_default")]
     step_index: Option<i64>,
     /// USER_INPUT | PLANNER_RESPONSE | SYSTEM_MESSAGE | GENERIC | RUN_COMMAND | …
     /// Required: a line without it is not a step.
     #[serde(rename = "type")]
     kind: String,
     /// USER_EXPLICIT | MODEL | SYSTEM
-    #[serde(default)]
+    #[serde(default, deserialize_with = "or_default")]
     source: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "or_default")]
     status: String,
+    #[serde(default, deserialize_with = "or_default")]
     created_at: Option<String>,
+    #[serde(default, deserialize_with = "or_default")]
     content: Option<String>,
     #[serde(default)]
-    tool_calls: Vec<ToolCall>,
+    tool_calls: ToolCalls,
+}
+
+/// A step's tool calls: absent is none. A list this version cannot read whole, or any
+/// other shape (`null` included), may hold calls, so it never makes a step a reply; the
+/// calls it can read are kept.
+#[derive(Debug)]
+enum ToolCalls {
+    Known(Vec<ToolCall>),
+    Unknown(Vec<ToolCall>),
+}
+
+impl Default for ToolCalls {
+    fn default() -> Self {
+        ToolCalls::Known(Vec::new())
+    }
+}
+
+impl<'de> Deserialize<'de> for ToolCalls {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        Ok(match read_entries(Value::deserialize(d)?) {
+            (calls, true) => ToolCalls::Known(calls),
+            (calls, false) => ToolCalls::Unknown(calls),
+        })
+    }
+}
+
+impl ToolCalls {
+    fn calls(&self) -> &[ToolCall] {
+        match self {
+            ToolCalls::Known(calls) | ToolCalls::Unknown(calls) => calls,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
 struct ToolCall {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "or_default")]
     name: String,
     /// Values are JSON-encoded strings (`"CommandLine": "\"ls\""`).
     #[serde(default)]
@@ -55,7 +91,9 @@ impl Step {
 
     /// A planner response with text and no tool call: a reply that can end a turn.
     fn is_reply(&self) -> bool {
-        self.is_planner() && self.tool_calls.is_empty() && !self.text().is_empty()
+        self.is_planner()
+            && matches!(&self.tool_calls, ToolCalls::Known(c) if c.is_empty())
+            && !self.text().is_empty()
     }
 
     /// A tool's own step (GENERIC, RUN_COMMAND, VIEW_FILE, …). System bookkeeping steps
@@ -191,7 +229,7 @@ pub fn messages(lines: &[Entry]) -> Vec<(usize, Message)> {
         let Some(s) = &l.step else { continue };
         let step = s.step_index.map(|n| n.to_string()).unwrap_or_default();
         if s.is_user() {
-            turn_id = step.clone();
+            turn_id.clone_from(&step);
         }
         let msg = |item_id: String, role, phase, text: String, from| Message {
             turn_id: turn_id.clone(),
@@ -243,9 +281,10 @@ pub fn messages(lines: &[Entry]) -> Vec<(usize, Message)> {
                     ),
                 ));
             }
-            if !s.tool_calls.is_empty() {
-                pending_tools.extend(s.tool_calls.iter().map(|c| c.name.clone()));
-                let text = s.tool_calls.iter().map(tool_summary).collect::<Vec<_>>();
+            let calls = s.tool_calls.calls();
+            if !calls.is_empty() {
+                pending_tools.extend(calls.iter().map(|c| c.name.clone()));
+                let text = calls.iter().map(tool_summary).collect::<Vec<_>>();
                 out.push((
                     i,
                     msg(
@@ -454,6 +493,34 @@ mod tests {
         assert_eq!(turn_span(&tools, 0), (3, false));
         assert!(!ends_with_reply(&tools));
         assert_eq!(span_reply(&tools), None);
+    }
+
+    /// A planner step whose `tool_calls` this version cannot read whole may hold calls: it
+    /// is not a reply, so it does not end the turn. The calls it can read are kept.
+    #[test]
+    fn unknown_tool_calls_are_not_a_reply() {
+        let reply = r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","content":"OK"}"#;
+        let with = |calls: &str| reply.replace(r#""content""#, &format!(r#"{calls}"content""#));
+        for calls in [
+            r#""tool_calls":"x","#,
+            r#""tool_calls":["x"],"#,
+            r#""tool_calls":null,"#,
+        ] {
+            assert!(!ends_with_reply(&parse_entries(&with(calls))), "{calls}");
+        }
+        let user = CHAT.lines().next().unwrap();
+        let mixed = with(r#""tool_calls":[{"name":"run_command","args":{}},42],"#);
+        let entries = parse_entries(&format!("{user}\n{mixed}"));
+        assert!(!ends_with_reply(&entries));
+        let tools = messages(&entries)
+            .into_iter()
+            .find(|(_, m)| m.item_id.ends_with(":tools"))
+            .map(|(_, m)| m.text);
+        assert_eq!(tools.as_deref(), Some("[tool_use run_command]"));
+        assert!(ends_with_reply(&parse_entries(reply)));
+        assert!(ends_with_reply(&parse_entries(
+            &reply.replace(r#""content""#, r#""tool_calls":[],"content""#)
+        )));
     }
 
     /// The preview is the first prompt without its wrapper; history is any line at all.

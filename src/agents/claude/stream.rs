@@ -2,6 +2,7 @@
 //! unknown event types and subtypes are tolerated.
 
 use super::transcript::tool_summary;
+use crate::agents::decode::or_default;
 use crate::model::{self, Approval, ApprovalOutcome, TurnStatus};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -18,13 +19,17 @@ pub enum StreamEvent {
 #[serde(tag = "subtype", rename_all = "snake_case")]
 pub enum System {
     Init {
+        #[serde(default, deserialize_with = "or_default")]
         session_id: Option<String>,
     },
     /// Claude's own rules denied a tool that would have prompted; the model is told and
     /// nothing is pending (DESIGN.md §6.2).
     PermissionDenied {
+        #[serde(default, deserialize_with = "or_default")]
         tool_name: Option<String>,
+        #[serde(default, deserialize_with = "or_default")]
         tool_use_id: Option<String>,
+        #[serde(default, deserialize_with = "or_default")]
         message: Option<String>,
     },
     #[serde(other)]

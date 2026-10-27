@@ -99,12 +99,10 @@ fn approval_summary(method: &str, params: &Value) -> String {
     match method {
         "item/commandExecution/requestApproval" | "execCommandApproval" => params["command"]
             .as_str()
-            .map(|c| format!("run: {c}"))
-            .unwrap_or_else(|| "run a command".into()),
+            .map_or_else(|| "run a command".into(), |c| format!("run: {c}")),
         "item/fileChange/requestApproval" | "applyPatchApproval" => params["reason"]
             .as_str()
-            .map(|r| format!("file change: {r}"))
-            .unwrap_or_else(|| "file change".into()),
+            .map_or_else(|| "file change".into(), |r| format!("file change: {r}")),
         "item/permissions/requestApproval" => "additional permissions".into(),
         "item/tool/requestUserInput" => "user input requested".into(),
         "mcpServer/elicitation/request" => format!(
@@ -444,13 +442,16 @@ impl<'a> Codex<'a> {
                         ..
                     },
                 ) => {
-                    let n: ItemNotification = decode(&method, &params)?;
-                    if let Item::User(u) = n.item
+                    // An item that does not decode is not the one looked for.
+                    if let Ok(ItemNotification {
+                        turn_id,
+                        item: Item::User(u),
+                    }) = decode::<ItemNotification>(&method, &params)
                         && u.client_id.as_deref() == Some(client_id)
                     {
                         self.store
-                            .accept(receipt_id, None, Some(&n.turn_id), Some(&u.id))?;
-                        *target = Target::Turn(n.turn_id);
+                            .accept(receipt_id, None, Some(&turn_id), Some(&u.id))?;
+                        *target = Target::Turn(turn_id);
                     }
                 }
                 // Other turns' completions are skipped undecoded.
@@ -584,7 +585,7 @@ fn session_state(s: &ThreadStatus) -> SessionState {
         ThreadStatus::Idle => SessionState::Idle,
         ThreadStatus::Active { active_flags } if !active_flags.is_empty() => SessionState::Waiting,
         ThreadStatus::Active { .. } => SessionState::Running,
-        _ => SessionState::Unknown,
+        ThreadStatus::Unknown => SessionState::Unknown,
     }
 }
 
@@ -710,8 +711,8 @@ impl Agent for Codex<'_> {
             let origin = if owned {
                 "agent-talk".to_string()
             } else {
-                t.originator.clone().unwrap_or_else(|| match &t.source {
-                    Value::String(s) => s.clone(),
+                t.originator.unwrap_or_else(|| match t.source {
+                    Value::String(s) => s,
                     other => other.to_string(),
                 })
             };
@@ -885,7 +886,12 @@ impl Agent for Codex<'_> {
             if let Some(c) = cursor {
                 params["cursor"] = json!(c);
             }
-            let page: CursorPage<Value> = conn.call("thread/turns/list", params).await?;
+            // In the window after a thread's first turn history is not readable yet
+            // (DESIGN.md §6.1): an empty page, as `lookup` treats it.
+            let page: CursorPage<Value> = match conn.call("thread/turns/list", params).await {
+                Err(e) if history_not_ready(&e) => return Ok((Vec::new(), None)),
+                r => r?,
+            };
             Ok((page.data, page.next_cursor))
         };
         let normalize = |turns: &[Value]| self.messages(turns);

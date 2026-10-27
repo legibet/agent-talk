@@ -1,8 +1,8 @@
 //! Session transcripts, `~/.claude/projects/<cwd-slug>/<session>.jsonl`: decoding, the
-//! live branch, turn boundaries and normalized messages. Pure; the records are narrow and
-//! unknown fields, line types and block types are tolerated.
+//! live branch, turn boundaries and normalized messages. Pure apart from reading the file;
+//! the records are narrow and unknown fields, line types and block types are tolerated.
 
-use crate::agents::decode::or_default;
+use crate::agents::decode::{self, or_default};
 use crate::agents::history::first_line;
 use crate::agents::strip_provenance;
 use crate::model::{self, Caller, Error, Message, Phase, Result, Role, TurnStatus};
@@ -12,6 +12,8 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
+
+type Content = decode::Content<Block>;
 
 /// `message` of a transcript `user`/`assistant` line.
 #[derive(Debug, Deserialize)]
@@ -27,6 +29,7 @@ struct Body {
 struct RawBody {
     #[serde(default)]
     content: Content,
+    #[serde(default, deserialize_with = "or_default")]
     stop_reason: Option<String>,
 }
 
@@ -34,7 +37,8 @@ impl From<RawBody> for Body {
     fn from(b: RawBody) -> Body {
         let text = match &b.content {
             Content::Text(s) => s.clone(),
-            Content::Blocks(blocks) => blocks
+            content => content
+                .blocks()
                 .iter()
                 .filter_map(|b| match b {
                     Block::Text { text } => Some(text.as_str()),
@@ -48,19 +52,6 @@ impl From<RawBody> for Body {
             stop_reason: b.stop_reason,
             text,
         }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum Content {
-    Text(String),
-    Blocks(Vec<Block>),
-}
-
-impl Default for Content {
-    fn default() -> Self {
-        Content::Blocks(Vec::new())
     }
 }
 
@@ -91,39 +82,58 @@ impl Body {
         matches!(&self.content, Content::Blocks(b)
             if !b.is_empty() && b.iter().all(|b| matches!(b, Block::ToolResult { .. })))
     }
+
+    /// Content that starts a turn: read whole, and not only tool results. Content this
+    /// version cannot read whole may be tool results, so it starts no turn (and ends none).
+    fn is_input(&self) -> bool {
+        !matches!(self.content, Content::Unknown(_)) && !self.tool_result_only()
+    }
 }
 
-/// One transcript line.
+/// One transcript line. Every field but `type` defaults when absent or when it does not
+/// fit (DESIGN.md §3).
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Line {
     #[serde(rename = "type")]
     kind: String,
+    #[serde(default, deserialize_with = "or_default")]
     subtype: Option<String>,
+    #[serde(default, deserialize_with = "or_default")]
     parent_uuid: Option<String>,
     /// Set where `parentUuid` is null after a compaction boundary.
+    #[serde(default, deserialize_with = "or_default")]
     logical_parent_uuid: Option<String>,
     /// Shared by a turn's prompt line and its tool_result lines.
+    #[serde(default, deserialize_with = "or_default")]
     prompt_id: Option<String>,
     #[serde(default, deserialize_with = "or_default")]
     is_sidechain: bool,
     #[serde(default, deserialize_with = "or_default")]
     is_meta: bool,
+    #[serde(default, deserialize_with = "or_default")]
     message: Option<Body>,
+    #[serde(default, deserialize_with = "or_default")]
     cwd: Option<String>,
+    #[serde(default, deserialize_with = "or_default")]
     entrypoint: Option<String>,
     /// `{"type":"custom-title"}` line: the session name (`claude --name`, `/rename`).
+    #[serde(default, deserialize_with = "or_default")]
     custom_title: Option<String>,
     /// `{"type":"last-prompt"}` line: the leaf the session continues from.
+    #[serde(default, deserialize_with = "or_default")]
     leaf_uuid: Option<String>,
+    #[serde(default, deserialize_with = "or_default")]
     timestamp: Option<String>,
     /// Who produced a user line: `{"kind":"human"}`, `{"kind":"task-notification",…}`.
     /// Only `kind` is read; a shape that does not fit is no origin.
     #[serde(default)]
     origin: Value,
     /// `typed`, `sdk`, `system`, …
+    #[serde(default, deserialize_with = "or_default")]
     prompt_source: Option<String>,
     /// Set on the `[Request interrupted by user]` line.
+    #[serde(default, deserialize_with = "or_default")]
     interrupted_message_id: Option<String>,
 }
 
@@ -193,7 +203,7 @@ impl Line {
             && !self.is_meta
             && !self.is_interrupt()
             && !self.is_local_command()
-            && self.message.as_ref().is_some_and(|m| !m.tool_result_only())
+            && self.message.as_ref().is_some_and(Body::is_input)
     }
 
     fn is_turn_duration(&self) -> bool {
@@ -482,21 +492,15 @@ fn to_message(line: &Line, turn_id: &str, item_id: &str) -> Option<Message> {
     let (role, phase, text) = match line.kind.as_str() {
         "user" if body.tool_result_only() => (Role::User, Phase::Other, tool_result_summary(body)),
         "user" if line.is_interrupt() => (Role::User, Phase::Other, "[interrupted]".to_string()),
-        "user" if line.is_runtime() => (Role::User, Phase::Other, body.text.clone()),
+        "user" if line.is_runtime() || !body.is_input() => {
+            (Role::User, Phase::Other, body.text.clone())
+        }
         "user" => (Role::User, Phase::Prompt, body.text.clone()),
         "assistant" => {
-            if !body.text.is_empty() {
-                let phase = if body.stop_reason.as_deref() == Some("end_turn") {
-                    Phase::Final
-                } else {
-                    Phase::Commentary
-                };
-                (Role::Assistant, phase, body.text.clone())
-            } else {
-                let Content::Blocks(blocks) = &body.content else {
-                    return None;
-                };
-                let tools: Vec<String> = blocks
+            if body.text.is_empty() {
+                let tools: Vec<String> = body
+                    .content
+                    .blocks()
                     .iter()
                     .filter_map(|b| match b {
                         Block::ToolUse { name, input } => Some(tool_summary(name, input)),
@@ -507,6 +511,13 @@ fn to_message(line: &Line, turn_id: &str, item_id: &str) -> Option<Message> {
                     return None;
                 }
                 (Role::Assistant, Phase::Other, tools.join("\n"))
+            } else {
+                let phase = if body.stop_reason.as_deref() == Some("end_turn") {
+                    Phase::Final
+                } else {
+                    Phase::Commentary
+                };
+                (Role::Assistant, phase, body.text.clone())
             }
         }
         _ => return None,
@@ -539,11 +550,8 @@ pub fn tool_summary(name: &str, input: &Value) -> String {
 }
 
 fn tool_result_summary(body: &Body) -> String {
-    let Content::Blocks(blocks) = &body.content else {
-        return "[tool_result]".into();
-    };
     let mut parts = Vec::new();
-    for b in blocks {
+    for b in body.content.blocks() {
         if let Block::ToolResult { content, is_error } = b {
             let text = match content {
                 Value::String(s) => s.clone(),
@@ -610,11 +618,43 @@ pub fn head(path: &Path) -> Head {
     head
 }
 
-/// Project directory name Claude uses for a cwd.
+/// Project directory name Claude uses for a cwd: every UTF-16 unit that is not ASCII
+/// alphanumeric becomes `-` (an astral character two of them). Claude cuts a name over
+/// `SLUG_CUT` units there and appends `-<hash>` of the cwd (2.1.311).
 pub fn slug(cwd: &str) -> String {
-    cwd.chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect()
+    let units: Vec<u16> = cwd.encode_utf16().collect();
+    let mut name: String = units
+        .iter()
+        .map(|&u| char::from_u32(u.into()).filter(char::is_ascii_alphanumeric))
+        .map(|c| c.unwrap_or('-'))
+        .collect();
+    if name.len() > SLUG_CUT {
+        // `h * 31 + unit` in wrapping i32, over the UTF-16 units of the cwd itself.
+        let hash = units
+            .iter()
+            .fold(0i32, |h, &u| h.wrapping_mul(31).wrapping_add(u.into()));
+        name.truncate(SLUG_CUT);
+        name.push('-');
+        name.push_str(&base36(hash.unsigned_abs()));
+    }
+    name
+}
+
+const SLUG_CUT: usize = 200;
+
+/// `Number.prototype.toString(36)`: lowercase digits.
+fn base36(mut n: u32) -> String {
+    const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut out = Vec::new();
+    loop {
+        out.push(DIGITS[(n % 36) as usize]);
+        n /= 36;
+        if n == 0 {
+            break;
+        }
+    }
+    out.reverse();
+    String::from_utf8(out).expect("base36 digits are ASCII")
 }
 
 #[cfg(test)]
@@ -931,11 +971,49 @@ mod tests {
         assert_eq!(turns, expected);
     }
 
+    /// Content this version cannot read whole starts no turn: it neither begins a turn
+    /// of its own nor ends the one before it. The blocks it can read are kept.
+    #[test]
+    fn unknown_content_starts_no_turn() {
+        let text = format!(
+            "{USER_LINE}\n{ASSISTANT_LINE}\n{}\n{}\n{}",
+            r#"{"type":"user","uuid":"u2","parentUuid":"ef3a61c5-486b-400b-bce2-11e12cd41331","message":{"role":"user","content":{"kind":"future"}}}"#,
+            r#"{"type":"user","uuid":"u3","parentUuid":"u2","message":{"role":"user","content":[42]}}"#,
+            r#"{"type":"user","uuid":"u4","parentUuid":"u3","message":{"role":"user","content":[{"type":"text","text":"hi"},{"type":"tool_result","content":"ok"},"odd"]}}"#,
+        );
+        let entries = parse_entries(&text);
+        let branch = live_branch(&entries);
+        assert_eq!(turn_end(&entries, &branch, 0), None);
+        let line = |i: usize| entries[i].line.as_ref().unwrap();
+        for i in 2..5 {
+            assert!(
+                !line(i).is_prompt() && !line(i).is_tool_result(),
+                "line {i}"
+            );
+        }
+        assert_eq!(line(4).message.as_ref().unwrap().text, "hi");
+        // Shown, but not as a prompt.
+        let msgs = messages(&entries, &branch);
+        let (_, m) = msgs.iter().find(|(i, _)| *i == 4).unwrap();
+        assert_eq!((m.phase, m.text.as_str()), (Phase::Other, "hi"));
+    }
+
+    /// Expected names are from Claude Code's own function (2.1.311): the sanitized cwd,
+    /// cut at 200 UTF-16 units with `-<hash>` appended when longer.
     #[test]
     fn slug_matches_project_dirs() {
         assert_eq!(
             slug("/Users/me/projects/demo/experiments"),
             "-Users-me-projects-demo-experiments"
         );
+        let a = |n: usize| format!("/Users/me/projects/{}", "a".repeat(n - 19));
+        let cut = slug(&a(200));
+        assert_eq!(cut.len(), 200);
+        assert_eq!(slug(&a(201)), format!("{cut}-km5rys"));
+        assert_eq!(slug(&a(260)), format!("{cut}-9aimxf"));
+        // Non-ASCII counts per UTF-16 unit: one dash per unit, two for an astral char.
+        assert_eq!(slug("/Users/me/项目/😀x"), "-Users-me------x");
+        let long = format!("/Users/me/{}/x", "é".repeat(195));
+        assert_eq!(slug(&long), format!("-Users-me-{}-37awmp", "-".repeat(190)));
     }
 }

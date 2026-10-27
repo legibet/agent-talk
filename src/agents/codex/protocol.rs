@@ -77,13 +77,17 @@ pub struct CursorPage<T> {
 #[serde(rename_all = "camelCase")]
 pub struct Thread {
     pub id: String,
+    #[serde(default, deserialize_with = "or_default")]
     pub cwd: Option<String>,
     #[serde(default)]
     pub source: Value,
+    #[serde(default, deserialize_with = "or_default")]
     pub originator: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "or_default")]
     pub status: ThreadStatus,
+    #[serde(default, deserialize_with = "or_default")]
     pub name: Option<String>,
+    #[serde(default, deserialize_with = "or_default")]
     pub preview: Option<String>,
 }
 
@@ -93,8 +97,9 @@ pub enum ThreadStatus {
     Idle,
     #[serde(rename_all = "camelCase")]
     Active {
+        /// Only whether any is set is read, so an odd flag still counts.
         #[serde(default)]
-        active_flags: Vec<String>,
+        active_flags: Vec<Value>,
     },
     /// `notLoaded`, `systemError`, or anything newer.
     #[default]
@@ -209,7 +214,7 @@ pub struct ItemNotification {
 // ---- items ----
 
 /// A turn item. Only user and agent messages are read; any other kind, and a user or
-/// agent message that does not decode, is `Other`, never displayed or matched.
+/// agent message without its id, is `Other`, never displayed or matched.
 #[derive(Deserialize, Debug)]
 #[serde(from = "Value")]
 pub enum Item {
@@ -232,8 +237,9 @@ impl From<Value> for Item {
 #[serde(rename_all = "camelCase")]
 pub struct UserMessage {
     pub id: String,
+    #[serde(default, deserialize_with = "or_default")]
     pub client_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "or_default")]
     pub content: Vec<Value>,
 }
 
@@ -252,8 +258,9 @@ impl UserMessage {
 #[derive(Deserialize, Debug)]
 pub struct AgentMessage {
     pub id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "or_default")]
     pub text: String,
+    #[serde(default, deserialize_with = "or_default")]
     pub phase: Option<AgentPhase>,
 }
 
@@ -427,7 +434,7 @@ mod tests {
         assert_eq!(turn.status, TurnStatus::Completed);
         assert!(turn.error.is_none());
         assert_eq!(turn.duration_ms, Some(6982));
-        assert_eq!(turn.completed_at, Some(1791031124));
+        assert_eq!(turn.completed_at, Some(1_791_031_124));
         match &turn.items[0] {
             Item::Agent(a) => {
                 assert_eq!(a.text, "pong");

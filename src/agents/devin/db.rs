@@ -367,12 +367,12 @@ mod tests {
         n
     }
 
-    fn assistant(id: &str, text: &str, finish: &str, calls: Value) -> Value {
+    fn assistant(id: &str, text: &str, finish: &str, calls: &Value) -> Value {
         json!({"message_id": id, "role": "assistant", "content": text, "tool_calls": calls,
             "metadata": {"finish_reason": finish, "created_at": "2026-10-20T08:00:00Z"}})
     }
 
-    fn tool(call: &str, ext: Value) -> Value {
+    fn tool(call: &str, ext: &Value) -> Value {
         json!({"message_id": format!("t-{call}"), "role": "tool", "tool_call_id": call,
             "content": "Canceled due to user interrupt", "metadata": {"extensions": ext}})
     }
@@ -391,29 +391,29 @@ mod tests {
         History::new(vec![
             system(),
             prompt("u1", Some("c1"), "run ls"),
-            assistant("a1", "Listing.", "tool_calls", exec("exec:0#1", "ls")),
+            assistant("a1", "Listing.", "tool_calls", &exec("exec:0#1", "ls")),
             tool(
                 "exec:0#1",
-                json!({"chisel/tool_result_meta": {"success": true, "kind": "execute"}}),
+                &json!({"chisel/tool_result_meta": {"success": true, "kind": "execute"}}),
             ),
-            assistant("a2", "Done.", "stop", json!([])),
+            assistant("a2", "Done.", "stop", &json!([])),
             prompt("u2", Some("c2"), "sleep"),
-            assistant("a3", "", "tool_calls", exec("exec:1#2", "sleep 30")),
+            assistant("a3", "", "tool_calls", &exec("exec:1#2", "sleep 30")),
             tool(
                 "exec:1#2",
-                json!({"chisel/tool_failure": {"reason": "Canceled"}, "chisel/tool_result_meta": {"success": false, "failure_reason": "Canceled"}}),
+                &json!({"chisel/tool_failure": {"reason": "Canceled"}, "chisel/tool_result_meta": {"success": false, "failure_reason": "Canceled"}}),
             ),
             prompt("u3", None, "killed"),
             prompt("u4", Some("c4"), "first"),
-            assistant("a4", "", "tool_calls", exec("exec:2#3", "sleep 5")),
+            assistant("a4", "", "tool_calls", &exec("exec:2#3", "sleep 5")),
             tool(
                 "exec:2#3",
-                json!({"chisel/tool_result_meta": {"success": true}}),
+                &json!({"chisel/tool_result_meta": {"success": true}}),
             ),
             prompt("u5", Some("c5"), "also this"),
-            assistant("a5", "Both answered.", "stop", json!(null)),
+            assistant("a5", "Both answered.", "stop", &json!(null)),
             prompt("u6", Some("c6"), "still running"),
-            assistant("a6", "", "tool_calls", exec("exec:3#4", "make")),
+            assistant("a6", "", "tool_calls", &exec("exec:3#4", "make")),
         ])
     }
 
@@ -490,7 +490,7 @@ mod tests {
                 "a1",
                 "",
                 "tool_calls",
-                json!([{"name": "exec"}, {"id": "e#1", "name": "read", "arguments": "{\"file_path\":\"/a\"}"}]),
+                &json!([{"name": "exec"}, {"id": "e#1", "name": "read", "arguments": "{\"file_path\":\"/a\"}"}]),
             ),
             Value::String("not json".into()),
         ]);

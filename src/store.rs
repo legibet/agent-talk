@@ -97,7 +97,7 @@ impl Store {
     /// Persist an intent and its pending receipt. Called before anything is sent. The
     /// delivered text is kept only when the agent got something other than the caller's
     /// text (the provenance header).
-    pub fn insert_intent(&self, i: &NewIntent) -> Result<()> {
+    pub fn insert_intent(&self, i: &NewIntent<'_>) -> Result<()> {
         let m = i.message;
         let tx = self.db.unchecked_transaction()?;
         tx.execute(
@@ -109,7 +109,7 @@ impl Store {
                 i.handle,
                 i.client_msg_id,
                 m.text,
-                serde_json::to_string(m.from).unwrap(),
+                serde_json::to_string(m.from).expect("serializable"),
                 m.depth,
                 (m.delivered != m.text).then_some(m.delivered)
             ],
@@ -153,7 +153,7 @@ impl Store {
         state: ReceiptState,
         agent_error: Option<&AgentError>,
     ) -> Result<()> {
-        let agent_error = agent_error.map(|v| serde_json::to_string(v).unwrap());
+        let agent_error = agent_error.map(|v| serde_json::to_string(v).expect("serializable"));
         self.db.execute(
             "UPDATE receipts SET state = ?2, agent_error = COALESCE(?3, agent_error),
              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')

@@ -22,7 +22,8 @@ use crate::agents::acp::{self, Conn};
 use crate::agents::child::{agent_cmd, cli_version, pid_alive};
 use crate::agents::history::{ReadPage, ReadQuery, cut, first_line};
 use crate::agents::lifecycle::{
-    ApprovalPolicy, approval_policy, bounded, note_waiting, reject, settle, wait_receipt,
+    ApprovalPolicy, approval_policy, bounded, note_waiting, reject, reject_unstarted, settle,
+    wait_receipt,
 };
 use crate::agents::{
     Agent, AgentStatus, Check, ListFilter, Operation, SendRequest, Settings, StartRequest, Wait,
@@ -141,13 +142,12 @@ async fn wind_down(w: &mut Watch<'_>, conn: &mut Conn, id: &str) {
 
 impl<'a> Devin<'a> {
     pub fn new(store: &'a Store) -> Self {
-        let dir = std::env::var_os("DEVIN_SESSIONS_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                std::env::home_dir()
-                    .unwrap_or_default()
-                    .join(".local/share/devin/cli")
-            });
+        let dir = match std::env::var_os("DEVIN_SESSIONS_DIR") {
+            Some(d) => PathBuf::from(d),
+            None => std::env::home_dir()
+                .unwrap_or_default()
+                .join(".local/share/devin/cli"),
+        };
         Devin {
             store,
             db_path: dir.join("sessions.db"),
@@ -231,9 +231,9 @@ impl<'a> Devin<'a> {
             .and_then(|l| l.locked))
     }
 
-    /// A recorded child of the session that is still alive and whose turn has no end in
+    /// Whether a recorded child of the session is still alive with its turn not ended in
     /// the chain yet (a pid alone may have been reused).
-    fn own_run(&self, id: &str, history: &History) -> Result<Option<u32>> {
+    fn own_run(&self, id: &str, history: &History) -> Result<bool> {
         for (receipt_id, pid) in self.store.processes(&handle(id))? {
             if !pid_alive(pid) {
                 continue;
@@ -244,10 +244,10 @@ impl<'a> Devin<'a> {
                     .is_some_and(|s| history.spans[s].end.is_some())
             });
             if !ended {
-                return Ok(Some(pid));
+                return Ok(true);
             }
         }
-        Ok(None)
+        Ok(false)
     }
 
     /// `e`, a refused `session/load`, as agent-talk's error: Devin's `session_locked` names
@@ -319,7 +319,7 @@ impl<'a> Devin<'a> {
                 }),
             )
             .await
-            .map_err(|e| reject(self.store, intent.receipt_id, e))?;
+            .map_err(|e| reject_unstarted(self.store, intent.receipt_id, e))?;
         let mut w = Watch::new(
             self.store,
             id,
@@ -379,7 +379,10 @@ impl<'a> Devin<'a> {
                 error: Some(json!({"message": e.message, "agent_error": e.agent_error})),
                 final_text: w.final_text(),
                 duration_ms: None,
-                basis: Some("session/prompt error response".into()),
+                basis: Some(match &note {
+                    Some(n) => format!("session/prompt error response; {n}"),
+                    None => "session/prompt error response".into(),
+                }),
             }),
             Err(mut e) => {
                 if let Some(n) = &note {
@@ -426,7 +429,7 @@ impl<'a> Devin<'a> {
             None => None,
         };
         let running = match &history {
-            Some(history) => self.own_run(&l.id, history)?.is_some(),
+            Some(history) => self.own_run(&l.id, history)?,
             None => false,
         };
         let (state, loaded) = match (running, l.locked) {
@@ -567,9 +570,10 @@ impl Agent for Devin<'_> {
             apply(&conn, id, req.settings, req.settings)
                 .await
                 .map_err(|mut e| {
-                    e.message.push_str(&format!(
-                        "; Devin writes the session {id} at its first prompt, so only its lock file exists"
-                    ));
+                    e.message = format!(
+                        "{}; Devin writes the session {id} at its first prompt, so only its lock file exists",
+                        e.message
+                    );
                     e
                 })?;
             let receipt_id = uuid::Uuid::new_v4().to_string();

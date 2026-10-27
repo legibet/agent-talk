@@ -40,3 +40,44 @@ path = "src/main.rs"
 [profile.dist]
 inherits = "release"
 lto = "thin"
+
+# BeautifulRust's drop-in lints (https://github.com/morganlinton/BeautifulRust) without the
+# library-only ones, `unreachable_pub` (a binary) and `as_conversions` (paging arithmetic;
+# lossy casts are still caught). The last five allows: record field values in prose, JSON
+# field names, async trait impls without an await, long adapter functions and
+# `assert!(x.is_empty())`.
+[lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+missing_debug_implementations = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "allow"
+panic_in_result_fn = "warn"
+allow_attributes = "warn"
+allow_attributes_without_reason = "warn"
+undocumented_unsafe_blocks = "warn"
+multiple_unsafe_ops_per_block = "warn"
+fn_params_excessive_bools = "warn"
+struct_excessive_bools = "warn"
+clone_on_ref_ptr = "warn"
+redundant_clone = "warn"
+rc_buffer = "warn"
+string_add = "warn"
+wildcard_imports = "warn"
+dbg_macro = "warn"
+todo = "warn"
+cast_possible_truncation = "warn"
+cast_sign_loss = "warn"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+module_inception = "allow"
+enum_glob_use = "allow"
+doc_markdown = "allow"
+struct_field_names = "allow"
+unused_async_trait_impl = "allow"
+assert_is_empty = "allow"
+too_many_lines = "allow"

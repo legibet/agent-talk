@@ -2,6 +2,7 @@
 //! Spawning into a run log and reading it are `agents::child`.
 
 use crate::agents::child::agent_cmd;
+use crate::agents::decode::or_default;
 use crate::agents::lifecycle::ApprovalPolicy;
 use serde::Deserialize;
 use std::process::Stdio;
@@ -21,7 +22,7 @@ pub struct TurnArgs<'a> {
 
 /// `claude -p` for one turn. `--resume` restores the model from the transcript but neither the
 /// effort nor the permission mode (DESIGN.md §6.2), so those pass again on every turn.
-pub fn command(a: &TurnArgs) -> Command {
+pub fn command(a: &TurnArgs<'_>) -> Command {
     // A nested `claude -p` with the inherited CLAUDECODE=1 runs normally (observed on
     // claude 2.1.288).
     let mut cmd = agent_cmd("claude");
@@ -66,16 +67,24 @@ pub fn command(a: &TurnArgs) -> Command {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentEntry {
+    /// Strict with `pid`: an entry that does not say which process holds which session
+    /// fails the listing (see `agents`).
     pub session_id: Option<String>,
+    #[serde(default, deserialize_with = "or_default")]
     pub cwd: Option<String>,
+    #[serde(default, deserialize_with = "or_default")]
     pub kind: Option<String>,
     /// Background sessions, live or ended: blocked, failed, stopped, … (2.1.302). A live one
     /// waiting for its next prompt showed `blocked` with status `idle`.
+    #[serde(default, deserialize_with = "or_default")]
     pub state: Option<String>,
     /// Live processes: busy | idle
+    #[serde(default, deserialize_with = "or_default")]
     pub status: Option<String>,
     pub pid: Option<u32>,
+    #[serde(default, deserialize_with = "or_default")]
     pub name: Option<String>,
+    #[serde(default, deserialize_with = "or_default")]
     pub started_at: Option<i64>,
 }
 
@@ -94,8 +103,9 @@ pub async fn agents() -> std::result::Result<Vec<AgentEntry>, String> {
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    // Every entry must decode: a dropped one could be the process that is writing the
-    // session, and the caller would then proceed as if nothing ran it.
+    // Every entry must decode (its session id and pid; the other fields default): a
+    // dropped one could be the process that is writing the session, and the caller would
+    // then proceed as if nothing ran it.
     serde_json::from_slice(&out.stdout)
         .map_err(|e| format!("claude agents --json: unexpected output: {e}"))
 }

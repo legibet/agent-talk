@@ -54,7 +54,7 @@ struct Pending {
 }
 
 pub struct Conn {
-    sink: Arc<tokio::sync::Mutex<Sink>>,
+    sink: tokio::sync::Mutex<Sink>,
     pending: Arc<Mutex<Pending>>,
     next_id: AtomicU64,
     events: mpsc::Receiver<Event>,
@@ -101,23 +101,23 @@ pub async fn connect(socket: &Path) -> Result<Conn> {
         .map_err(|e| match e.kind() {
             std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound => no_daemon(),
             std::io::ErrorKind::PermissionDenied => sandboxed(e),
-            _ => Error::transport("connect", e),
+            _ => Error::transport(format!("connect {}", socket.display()), e),
         })?;
     let (ws, _) = client_async("ws://localhost/", stream)
         .await
         .map_err(|e| Error::transport("websocket upgrade", e))?;
     let (sink, stream) = ws.split();
-    let sink = Arc::new(tokio::sync::Mutex::new(sink));
+    let sink = tokio::sync::Mutex::new(sink);
     let pending = Arc::new(Mutex::new(Pending::default()));
     let overflow = Arc::new(AtomicBool::new(false));
     let (tx, events) = mpsc::channel(EVENT_BUFFER);
     let (req_tx, requests) = mpsc::unbounded_channel();
     let reader = tokio::spawn(read_loop(
         stream,
-        pending.clone(),
+        Arc::clone(&pending),
         tx,
         req_tx,
-        overflow.clone(),
+        Arc::clone(&overflow),
     ));
     let conn = Conn {
         sink,
@@ -153,7 +153,7 @@ impl Conn {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         {
-            let mut p = self.pending.lock().unwrap();
+            let mut p = self.pending.lock().expect("lock poisoned");
             if let Some(reason) = &p.closed {
                 return Err(closed(reason));
             }
@@ -166,11 +166,15 @@ impl Conn {
             Ok(Ok(Ok(v))) => Ok(v),
             Ok(Ok(Err(e))) => Err(Error::from_agent(classify_error(&e), e)),
             Ok(Err(_)) => {
-                let reason = self.pending.lock().unwrap().closed.clone();
+                let reason = self.pending.lock().expect("lock poisoned").closed.clone();
                 Err(closed(reason.as_deref().unwrap_or("connection closed")))
             }
             Err(_) => {
-                self.pending.lock().unwrap().waiters.remove(&id);
+                self.pending
+                    .lock()
+                    .expect("lock poisoned")
+                    .waiters
+                    .remove(&id);
                 Err(Error::new(
                     ErrorCode::Timeout,
                     format!("no response to {method} within {}s", RPC_TIMEOUT.as_secs()),
@@ -319,7 +323,7 @@ async fn read_loop(
             }
             (Some(id), None) => {
                 let Some(id) = id.as_u64() else { continue };
-                let waiter = pending.lock().unwrap().waiters.remove(&id);
+                let waiter = pending.lock().expect("lock poisoned").waiters.remove(&id);
                 if let Some(w) = waiter {
                     let r = match msg.error {
                         Some(e) => Err(e),
@@ -332,7 +336,7 @@ async fn read_loop(
         }
     };
     tracing::debug!(reason, "reader stopped");
-    let mut p = pending.lock().unwrap();
+    let mut p = pending.lock().expect("lock poisoned");
     p.closed = Some(reason);
     // Dropping the waiters wakes their requests with a closed-connection error.
     p.waiters.clear();

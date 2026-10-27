@@ -94,7 +94,8 @@ stopped) left the outcome unknown. Use the receipt printed with the error to che
 with `wait`; resending may duplicate the message. If `new` did not print a handle, `ls`
 identifies sessions it created with `origin=agent-talk`. Grok without a leader and Devin cancel
 the turn when the command times out or is interrupted; `wait` reports how that turn ended and does
-not restart it.
+not restart it. A Grok `--steer` receipt left before its turn was seen cannot be waited on; `read`
+the session to find the turn it joined.
 
 Exit code 2 reports a refused request with an `E_*` code and an explanation of the cause. Exit
 code 4 reports a transport failure, which can occur before or after delivery. If the error
