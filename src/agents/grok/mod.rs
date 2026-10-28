@@ -37,6 +37,7 @@ use crate::model::{
 };
 use crate::store::{NewIntent, Store};
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -957,17 +958,23 @@ impl Agent for Grok<'_> {
         check_id(id)?;
         let dir = sessions::require(&self.home, id)?;
         let history = History::new(updates::load(&dir.join("updates.jsonl"))?);
-        let mut messages = history.messages();
-        for m in &mut messages {
-            if m.prompt
-                && let Some(s) = m.span
-                && let Some(p) = &history.spans[s].id
-            {
-                m.message.from = self.store.sender_of(p)?;
+        let messages = history.messages();
+        // Each prompt's id by its item id, so that only the page's senders are looked up.
+        let prompt_ids: HashMap<String, &str> = messages
+            .iter()
+            .filter(|m| m.prompt)
+            .filter_map(|m| {
+                let p = history.spans[m.span?].id.as_deref()?;
+                Some((m.message.item_id.clone(), p))
+            })
+            .collect();
+        let messages = messages.into_iter().map(|m| (m.line, m.message)).collect();
+        let mut cut = cut(q, q.cursor.as_deref(), messages, history.lines.len(), false)?;
+        for (_, m) in &mut cut.messages {
+            if let Some(p) = prompt_ids.get(&m.item_id) {
+                m.from = self.store.sender_of(p)?;
             }
         }
-        let messages = messages.into_iter().map(|m| (m.line, m.message)).collect();
-        let cut = cut(q, q.cursor.as_deref(), messages, history.lines.len(), false)?;
         Ok(ReadPage {
             messages: Page {
                 next_cursor: cut.cursor_item().map(|(_, m)| m.item_id.clone()),

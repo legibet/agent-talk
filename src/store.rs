@@ -29,8 +29,9 @@ CREATE TABLE IF NOT EXISTS receipts (
     agent_error TEXT,
     updated_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
--- Store::sender_of looks prompts up by their item id.
+-- Prompts are looked up by their item id and turns by their id (`sender_of`, `*_by_turn`).
 CREATE INDEX IF NOT EXISTS receipts_item_id ON receipts (item_id);
+CREATE INDEX IF NOT EXISTS receipts_turn_id ON receipts (turn_id);
 CREATE TABLE IF NOT EXISTS owned (
     handle     TEXT PRIMARY KEY,
     cwd        TEXT NOT NULL,

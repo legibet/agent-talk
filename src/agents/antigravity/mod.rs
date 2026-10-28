@@ -768,13 +768,12 @@ impl Agent for Antigravity<'_> {
         self.require_conversation(id)?;
         let h = handle(id);
         let lines = load(&self.transcript_path(id))?;
-        let mut messages = messages(&lines);
-        for (_, m) in &mut messages {
+        let mut cut = cut(q, q.cursor.as_deref(), messages(&lines), lines.len(), false)?;
+        for (_, m) in &mut cut.messages {
             if m.role == Role::User && m.from.is_none() {
                 m.from = self.store.sender_by_turn(&h, &m.turn_id)?;
             }
         }
-        let cut = cut(q, q.cursor.as_deref(), messages, lines.len(), false)?;
         Ok(ReadPage {
             messages: Page {
                 next_cursor: cut.cursor_item().map(|(_, m)| m.item_id.clone()),
