@@ -620,7 +620,9 @@ takes its own lock only in direct mode, since clients of one leader do not exclu
   `--reasoning-effort`: an unknown `-m` silently runs the default model, and a leader proxy
   ignores `--reasoning-effort` (1.0.70). Grok refuses a model it does not list and an effort the
   session's current model does not offer (`-32602`), so the model goes first. A model change keeps
-  the effort; a model without efforts drops it, and the next model starts at its default. Grok
+  the effort; a model without efforts drops it, and the next model starts at its default. The
+  response lists the session's options, `reasoning_effort` with its value only while the model has
+  efforts, so after a model change agent-talk stores the effort Grok reports, or none. Grok
   writes the value to `summary.json` at once, and every later load, by any process or client,
   runs with it, so later sends pass neither again; through a leader a change applies to the next
   prompt of every attached client. A refused value fails with `E_PRECONDITION` before anything is
@@ -1023,13 +1025,11 @@ Devin inherited, unless pinned with `--from` or `--caller` (§8).
 - Grok: a turn that continues in a leader after the sending command stopped observing waits for
   another client to answer a permission request it raises. A steer receipt whose outcome is
   unknown and that names no turn is not refused by `wait --receipt`: it polls the session to
-  the deadline. A model change through a model without efforts resets Grok's effort to the next
-  model's default while agent-talk's stored effort keeps the old value, so a send asking for that
-  value again sees no change and passes nothing. `reject_once` rests on frames captured on 1.0.46,
-  not re-verified. The cancel of a direct-mode turn with a pending request was verified on 1.0.70
-  with an `ask` rule; the live tier, which has no such rule, does not cover it. Unverified: whether
-  a TUI renders live a turn another leader client ran; leader behaviour with a grok.com
-  subscription login (it may open a relay).
+  the deadline. `reject_once` rests on frames captured on 1.0.46, not re-verified. The cancel of a
+  direct-mode turn with a pending request was verified on 1.0.70 with an `ask` rule; the live
+  tier, which has no such rule, does not cover it. Unverified: whether a TUI renders live a turn
+  another leader client ran; leader behaviour with a grok.com subscription login (it may open a
+  relay).
 - pi: a session open in a TUI cannot be detected, so `send` to it branches the conversation:
   the TUI shows neither the message nor its reply, its next message starts a branch beside them,
   and whichever process writes last decides the branch the next load continues, so a turn

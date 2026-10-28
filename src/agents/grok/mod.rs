@@ -81,11 +81,16 @@ fn with_yolo(mut params: Value, full_access: bool) -> Value {
 }
 
 /// `session/set_config_option`: `config` (`model`, `reasoning_effort`) of the session,
-/// which Grok stores in `summary.json` at once (DESIGN.md §6.4).
-async fn set_config(conn: &Conn, id: &str, config: &str, value: &str) -> Result<()> {
+/// which Grok stores in `summary.json` at once (DESIGN.md §6.4). Returns the session's effort
+/// after the change as Grok reports it, `None` when its model has no efforts.
+async fn set_config(conn: &Conn, id: &str, config: &str, value: &str) -> Result<Option<String>> {
     let params = json!({"sessionId": id, "configId": config, "value": value});
     match conn.request("session/set_config_option", params).await {
-        Ok(_) => Ok(()),
+        Ok(r) => Ok(r["configOptions"]
+            .as_array()
+            .and_then(|o| o.iter().find(|o| o["id"] == "reasoning_effort"))
+            .and_then(|o| o["currentValue"].as_str())
+            .map(str::to_string)),
         Err(mut e) => {
             e.message = format!("{config} {value} refused: {}", e.message);
             Err(e)
@@ -96,15 +101,17 @@ async fn set_config(conn: &Conn, id: &str, config: &str, value: &str) -> Result<
 /// Set the model, then the effort, of `settings` on the session (DESIGN.md §6.4). The
 /// model goes first: Grok refuses an effort the session's current model does not offer,
 /// and a model change keeps the effort. A value set here stays stored even when the next
-/// one is refused.
-async fn configure(conn: &Conn, id: &str, settings: &Settings) -> Result<()> {
+/// one is refused. Returns the session's effort as Grok reports it after the last value set
+/// (`None` when nothing was set).
+async fn configure(conn: &Conn, id: &str, settings: &Settings) -> Result<Option<String>> {
+    let mut effort = None;
     if let Some(m) = &settings.model {
-        set_config(conn, id, "model", m).await?;
+        effort = set_config(conn, id, "model", m).await?;
     }
     if let Some(e) = &settings.effort {
-        set_config(conn, id, "reasoning_effort", e).await?;
+        effort = set_config(conn, id, "reasoning_effort", e).await?;
     }
-    Ok(())
+    Ok(effort)
 }
 
 /// A session as `_x.ai/sessions/list` describes it. `resident` and `activity` describe
@@ -921,7 +928,15 @@ impl Agent for Grok<'_> {
             // every later load and, in a leader, every attached client (DESIGN.md §6.4).
             // A refusal fails the send before anything is recorded, as in `start`. A
             // value set here stays stored even if the prompt below is then refused.
-            configure(&conn, id, req.change).await?;
+            let effort = configure(&conn, id, req.change).await?;
+            // After a model without efforts the next model starts at its default effort, so
+            // a model change stores the effort Grok reports, or none (DESIGN.md §6.4).
+            if req.change.model.is_some()
+                && let Some(s) = req.settings
+                && s.effort != effort
+            {
+                self.store.set_settings(&h, &Settings { effort, ..s.clone() })?;
+            }
             let receipt_id = uuid::Uuid::new_v4().to_string();
             let prompt_id = uuid::Uuid::new_v4().to_string();
             let intent = NewIntent {
