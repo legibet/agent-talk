@@ -554,9 +554,14 @@ impl Agent for OpenCode<'_> {
                 // An effort alone applies to the session's model, the user's default when the
                 // session has none.
                 let session = svc.session(session_id).await?;
-                match session.model {
-                    Some(m) => m,
-                    None => default_model(&svc, &location(&session, session_id)?).await?,
+                if let Some(m) = session.model {
+                    m
+                } else {
+                    // The default model as the location's configuration sets it, read once
+                    // that is applied, as in `start`.
+                    let cwd = location(&session, session_id)?;
+                    svc.load_location(&cwd).await?;
+                    default_model(&svc, &cwd).await?
                 }
             };
             // The session's effort (the change included), kept across a model change; without

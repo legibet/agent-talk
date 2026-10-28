@@ -491,9 +491,9 @@ continue without subscribers, so agent-talk subscribes before submitting and fil
 - `new` creates the session with its location, model (`provider/model`, effort as the model's
   `variant`), title and permission rules, then sends the first prompt as a queue send. The
   service answers a location's first requests before its configuration is applied, without the
-  user's default model and rules (2.0.23), so `new` first calls `GET /api/integration`, which
-  waits for plugin activation (read in source). An unknown model or variant is accepted and the
-  turn then fails.
+  user's default model and rules (2.0.23), so `new`, `send --full-access` and `send --effort` on
+  a session without a model first call `GET /api/integration`, which waits for plugin activation
+  (read in source). An unknown model or variant is accepted and the turn then fails.
 - There is no turn id; execution events carry only the session id. The client may choose the user
   message id and attach `metadata`, both stored verbatim, so agent-talk's message id (in the
   service's ascending format) is the turn id and the queue id, and the metadata carries receipt,
