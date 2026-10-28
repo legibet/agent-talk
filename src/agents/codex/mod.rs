@@ -226,14 +226,25 @@ impl<'a> Codex<'a> {
         let queue_id = added.queued_submission.id;
         self.store
             .accept(intent.receipt_id, Some(&queue_id), None, None)?;
-        if idle {
-            self.start_if_dormant(conn, w, &queue_id, intent.receipt_id)
-                .await?;
-        }
+        let queued = if idle {
+            match self
+                .start_if_dormant(conn, w, &queue_id, intent.receipt_id)
+                .await?
+            {
+                Some(turn_id) => return Ok(Target::Turn(turn_id)),
+                // A turn started, maybe a dormant one queued ahead, or nothing was dormant.
+                // Until a `userMessage` ties a turn to this message, seconds later on a cold
+                // thread (DESIGN.md §6.1), whether it runs or waits is unknown.
+                None => false,
+            }
+        } else {
+            // Behind the running turn.
+            true
+        };
         Ok(Target::Client {
             client_id: intent.client_msg_id.into(),
             receipt_id: intent.receipt_id.into(),
-            queued: true,
+            queued,
         })
     }
 
@@ -244,13 +255,15 @@ impl<'a> Codex<'a> {
     /// add nor the daemon's 10 s queue watcher starts anything until some turn starts
     /// (codex-rs ext/queue `wake_if_loaded`, `on_thread_idle`). The rest, including the two
     /// `thread/queue/start` refusals that mean nothing is dormant, is in DESIGN.md §6.1.
+    /// Returns the turn when it started the submission itself; `None` when some turn started
+    /// on its own or nothing was dormant.
     async fn start_if_dormant(
         &self,
         conn: &mut Conn,
         w: &mut Watch<'_>,
         queue_id: &str,
         receipt_id: &str,
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         let end = Instant::now() + DORMANT_WINDOW;
         loop {
             match tokio::time::timeout_at(end, conn.next_event()).await {
@@ -264,7 +277,7 @@ impl<'a> Codex<'a> {
                 Ok(Some(Event::Request(r))) => self.on_request(conn, w, r).await?,
                 Ok(Some(Event::Notification { method, params })) => {
                     if method == "turn/started" && params["threadId"] == w.thread_id {
-                        return Ok(());
+                        return Ok(None);
                     }
                 }
             }
@@ -274,10 +287,12 @@ impl<'a> Codex<'a> {
             .call::<TurnResponse>("thread/queue/start", params)
             .await
         {
-            Ok(started) => self
-                .store
-                .accept(receipt_id, None, Some(&started.turn.id), None),
-            Err(e) if nothing_dormant(&e) => Ok(()),
+            Ok(started) => {
+                self.store
+                    .accept(receipt_id, None, Some(&started.turn.id), None)?;
+                Ok(Some(started.turn.id))
+            }
+            Err(e) if nothing_dormant(&e) => Ok(None),
             Err(e) => Err(e),
         }
     }

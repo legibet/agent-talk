@@ -396,6 +396,12 @@ every resume of a full-access thread passes it again (a loaded busy thread ignor
   add on an idle thread `send` waits briefly for the turn to start, then calls
   `thread/queue/start`, which refuses harmlessly (`"queued submission not found: <id>"`,
   `"thread already has an active or pending turn"`) when there is nothing dormant.
+- A message is `pending` only while it is known to wait in the queue: added behind a running
+  turn, or found in `thread/queue/list`. After an add on an idle thread, a `turn/started` may
+  belong to a dormant submission queued ahead, and on a cold thread the `userMessage` that ties
+  a turn to the message comes 2-5 s after `turn/started` (hooks run first; 17 ms on a loaded
+  thread, codex 0.165.0); until then the state is `unknown`. A turn `thread/queue/start`
+  started is the message's and `running`.
 - A turn ends at `turn/completed` with matching thread and turn id; the `idle` status change
   before it is not a turn end. `wait` searches history newest turn first, then observes; a turn
   an accepted receipt names is observed even while history is still empty, and a turn id nobody
