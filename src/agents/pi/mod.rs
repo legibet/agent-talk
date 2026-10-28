@@ -247,13 +247,11 @@ impl<'a> Pi<'a> {
             if watch.run.user.is_none() {
                 return Err(self.reject_startup(&watch.receipt_id, Some(status)));
             }
-            let turn_id = watch.turn_id.clone().unwrap_or_default();
             if !watch.run.settled {
-                let turn = self
-                    .runs
-                    .exited_turn(h.clone(), turn_id, "agent_settled", Some(status));
-                return Ok(Some(turn));
+                let (file, turn_id) = (watch.file.as_deref(), watch.turn_id.as_deref());
+                return Ok(Some(self.exited_run(&h, file, turn_id, Some(status))));
             }
+            let turn_id = watch.turn_id.clone().unwrap_or_default();
             Ok(Some(watch.run.turn(h.clone(), turn_id)))
         };
         let res = bounded(deadline, work).await;
@@ -265,6 +263,26 @@ impl<'a> Pi<'a> {
             Vec::new(),
             Progress::Running,
         )
+    }
+
+    /// The turn of a run that took the message and exited without `agent_settled` (killed,
+    /// crashed): what the session file holds of it, else how the process exited (DESIGN.md
+    /// §6.6). `status` is `None` when this command did not see the exit.
+    fn exited_run(
+        &self,
+        h: &str,
+        file: Option<&Path>,
+        turn_id: Option<&str>,
+        status: Option<ExitStatus>,
+    ) -> Turn {
+        if let (Some(f), Some(t)) = (file, turn_id)
+            && let Ok(Some(turn)) = load(f).and_then(|e| file_turn(h, &e, t))
+        {
+            return turn;
+        }
+        let turn_id = turn_id.unwrap_or_default().into();
+        self.runs
+            .exited_turn(h.into(), turn_id, "agent_settled", status)
     }
 
     /// What the run log of the process agent-talk started for `receipt_id` says, `None`
@@ -567,7 +585,7 @@ impl Agent for Pi<'_> {
                     Some(r) => self.run_state(&h, r, &mut turn_id, file.as_deref())?,
                     None => None,
                 };
-                let exited = match run {
+                match run {
                     Some(RunState::Settled(turn)) => return Ok(turn),
                     Some(RunState::Running(pid)) => {
                         waiting_for = format!(
@@ -576,32 +594,24 @@ impl Agent for Pi<'_> {
                         tokio::time::sleep(Duration::from_secs(1)).await;
                         continue;
                     }
-                    Some(RunState::Exited) => true,
-                    None => false,
-                };
+                    Some(RunState::Exited) => {
+                        return Ok(self.exited_run(&h, file.as_deref(), turn_id.as_deref(), None));
+                    }
+                    None => {}
+                }
                 // 2. The session file.
                 let turn = match (&file, turn_id.as_deref()) {
-                    (Some(f), Some(t)) => file_turn(&h, &load(f)?, t),
-                    (Some(_), None) => Err(Error::new(
-                        ErrorCode::Precondition,
-                        "the receipt has no turn id and no run log; its outcome cannot be recovered",
-                    )),
-                    (None, _) => Err(self.missing_file(id)),
-                };
-                match turn {
-                    Ok(Some(turn)) => return Ok(turn),
-                    // What the file does not tell of a run that exited is unknown.
-                    _ if exited => {
-                        let turn_id = turn_id.clone().unwrap_or_default();
-                        return Ok(self.runs.exited_turn(
-                            h.clone(),
-                            turn_id,
-                            "agent_settled",
-                            None,
+                    (Some(f), Some(t)) => file_turn(&h, &load(f)?, t)?,
+                    (Some(_), None) => {
+                        return Err(Error::new(
+                            ErrorCode::Precondition,
+                            "the receipt has no turn id and no run log; its outcome cannot be recovered",
                         ));
                     }
-                    Err(e) => return Err(e),
-                    Ok(None) => {}
+                    (None, _) => return Err(self.missing_file(id)),
+                };
+                if let Some(turn) = turn {
+                    return Ok(turn);
                 }
                 waiting_for = "session file: waiting for an assistant message without tool calls or a later user message after the prompt (best effort; pi records no process liveness)".into();
                 tokio::time::sleep(Duration::from_secs(1)).await;

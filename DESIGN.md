@@ -719,7 +719,8 @@ holds.
   the `result` and the denials from the run log (without the log an unknown receipt stays
   unknown; no text matching).
 - A run that took the message and exited without `result` is `failed` when the sending command
-  saw an unsuccessful exit status, as for Claude and pi, and `unknown` otherwise.
+  saw an unsuccessful exit status, as for Claude and pi (once its session file does not end the
+  turn, §6.6), and `unknown` otherwise.
 - `result.response` joins every response of the turn, commentary included, so the reply is the
   last response step's text. On a resumed conversation `result` reports conversation totals.
 - A line written during a turn becomes the next turn: queue only (`E_NO_STEER`).
@@ -782,9 +783,11 @@ from a later command.
   `stopReason`. While the process lives, `wait` reads only its run log, because the file may hold
   a failed message pi is about to retry. Once it is gone without `agent_settled`, a run that never
   took the message is `rejected` with pi's stderr, and one that did is read from the file, best
-  effort, like any other turn: it ends at the first assistant entry on the live branch without
-  tool calls (skipping one a later context edit hides, which is how pi's auto-retry leaves a
-  failed message), or at a later user message. Steer and follow-up messages are plain user
+  effort, like any other turn, by the sending command and a later `wait` alike: it ends at the
+  first assistant entry on the live branch without tool calls (skipping one a later context edit
+  hides, which is how pi's auto-retry leaves a failed message), or at a later user message.
+  When the file does not end it, the turn is `failed` if the sending command saw an unsuccessful
+  exit status, else `unknown`. Steer and follow-up messages are plain user
   entries, so they read as prompts of their own. No `duration_ms`: pi stamps an assistant message
   when its request starts, not when the reply ends.
 - An unknown `--model` exits before any file exists and the receipt is `rejected` with pi's
