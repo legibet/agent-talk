@@ -356,8 +356,9 @@ intent is recorded.
   agent-talk retries the resume once a second, at most ten times; `read` and turn lookup treat
   the window as an empty history.
 - `thread/resume` on a loaded thread rejoins without replaying earlier notifications, except
-  pending server requests. An idle thread unloads about 60 s after its last subscriber leaves; a
-  running thread keeps running and drains its queue with nobody subscribed.
+  pending server requests. An idle thread unloads `thread_unload_delay_secs` after its last
+  subscriber leaves (60 s up to 0.162, 30 minutes on 0.163 and 0.164); a connected subscriber
+  holds it loaded; a running thread keeps running and drains its queue with nobody subscribed.
 - `thread/list` returns only interactive sources unless source kinds are named (`ls --all` adds
   sub-agent and unknown kinds). It has one row per rollout file, so a thread resumed into a new
   file repeats and only its newest row counts. (The state-DB-only listing avoids the repeats but
@@ -955,10 +956,9 @@ Devin inherited, unless pinned with `--from` or `--caller` (§8).
   queued item; `wait --receipt` on one left dormant earlier reports it `pending`. `status` marks a
   method unavailable only when the daemon reports it missing. Unverified: how a terminal TUI
   renders a decline from agent-talk; `send` changing the model (effort and full access were
-  exercised). On codex-cli 0.164.0 idle threads stayed loaded for well over the 60 s observed
-  on 0.160 (one for 25 minutes while an MCP client was connected to the daemon), so the
-  unload timing and what holds a thread loaded need re-checking; the live `foreign-writer`
-  check waits 180 s for an unload and fails until then.
+  exercised). The unload delay follows the daemon's `thread_unload_delay_secs` default, 30
+  minutes on 0.163 and 0.164; the live `foreign-writer` check waits 180 s for an unload and
+  fails on those versions.
 - Claude: `control_request` approvals would need an answerer (`--permission-prompt-tool stdio`);
   agent-talk relies on the agent's own denial. Unverified: whether `CLAUDE_CODE_SESSION_ID`
   reaches a globally registered MCP server the same way, and whether attribution through a TUI's
