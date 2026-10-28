@@ -536,8 +536,8 @@ request gone records `resolved`. `always` would save a project-wide rule.
 A request is answered by the last rule matching action and resource in the agent's ruleset
 followed by the session's, and asks when none matches; the agent's ruleset already holds the
 user's configuration (read in source; verified live on 2.0.23 and 2.2.0). A session agent-talk
-starts therefore gets session rules at creation, and again at `send --full-access`, so that the
-service itself answers what would wait for an answer:
+starts therefore gets session rules at creation, and again at the `send --full-access` that turns
+full access on, so that the service itself answers what would wait for an answer:
 
 - the default agent's rules from its first `ask` on, in order, with every `ask` turned into
   `deny`, or into `allow` under full access. Allowed and denied requests keep their answer, the
@@ -550,7 +550,8 @@ service itself answers what would wait for an answer:
 Full access is not one rule allowing everything, which would also lift the denials: on 2.2.0 the
 browser plugin denies its 45 tools to every agent after the user's configuration and allows them
 for a session while the desktop app attaches a browser to it, by appending allow rules to the
-session's rules (read in source).
+session's rules (read in source). A session given full access by agent-talk 0.4.0 or earlier keeps
+its allow-all rule: full access is not taken back, and a repeated `--full-access` changes nothing.
 
 The model sees a tool denied for every resource as absent from its toolset, and a denied call as
 a tool error; the turn continues (2.0.23). Requests that still reach agent-talk (a plugin hook can

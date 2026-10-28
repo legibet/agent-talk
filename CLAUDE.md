@@ -26,7 +26,9 @@ alongside them:
 - Clean up only sessions and files you created. The user's sessions are never deleted,
   archived or written to by tests.
 - agent-talk answers approval requests with decline or reject only. On OpenCode that means
-  `reject` with a message; `once` and `always` are never sent.
+  `reject` with a message; `once` and `always` are never sent. The one other answer is ACP's
+  `cancelled`, to the requests still pending when agent-talk cancels a Grok or Devin turn
+  (DESIGN.md §4).
 - Reach sessions through agent interfaces only: no PTY, no terminal input injection. TUI cases
   run in herdr panes opened with `--no-focus`; close only the panes you opened.
 - The OpenCode service password stays in `service.json`; it goes into no file of this repo.
