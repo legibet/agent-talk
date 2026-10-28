@@ -1377,6 +1377,8 @@ def devin_tier():
         if not out["approvals"]:
             raise Inconclusive("no permission request (the model ran no command, or the user allows touch)")
         expect(out["approvals"][0]["outcome"] == "declined", "the request declined")
+        summary = out["approvals"][0]["summary"]
+        expect("live-devin-probe.txt" in summary, f"the summary names the command, got {summary!r}")
         expect(out["turn"]["status"] == "completed", f"the turn went on, got {out['turn']['status']}")
         expect(not probe.exists(), "the command did not run")
 

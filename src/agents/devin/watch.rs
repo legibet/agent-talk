@@ -236,8 +236,11 @@ impl<'s> Watch<'s> {
             ApprovalPolicy::Deny => acp::reject_once(&params),
             ApprovalPolicy::Observe => None,
         };
+        // On 3000.11.228 the `toolCall` carries only its id and `_meta`, whose
+        // `editableCommand` is the command asked about.
         let summary = call["title"]
             .as_str()
+            .or(call["_meta"]["cognition.ai/editableCommand"].as_str())
             .or(call["rawInput"]["command"].as_str())
             .map_or_else(|| "permission request".into(), |t| first_line(t, 160));
         let a = Approval {
@@ -380,7 +383,8 @@ mod tests {
         conn.close().await;
     }
 
-    const PERMISSION: &str = r#"{"jsonrpc":"2.0","id":"5b1f0c52-0d55-4d8e-a0f3-4b1d9e7f5a10","method":"session/request_permission","params":{"sessionId":"swanky-towel","toolCall":{"toolCallId":"exec:1#9f","title":"touch probe.txt","rawInput":{"command":"touch probe.txt"}},"options":[{"optionId":"allow_once","kind":"allow_once","name":"Allow once"},{"optionId":"allow_session","kind":"allow_always","name":"Allow for this session"},{"optionId":"switch_bypass","kind":"allow_always","name":"Switch to bypass"},{"optionId":"reject_once","kind":"reject_once","name":"Reject"}]}}"#;
+    // As 3000.11.228 sends it: no `title` or `rawInput` (findings §12).
+    const PERMISSION: &str = r#"{"jsonrpc":"2.0","id":"5b1f0c52-0d55-4d8e-a0f3-4b1d9e7f5a10","method":"session/request_permission","params":{"sessionId":"swanky-towel","toolCall":{"toolCallId":"exec:1#9f","_meta":{"cognition.ai/editableCommand":"touch probe.txt","cognition.ai/permissionRule":"Exec(touch)"}},"options":[{"optionId":"allow_once","kind":"allow_once","name":"Allow once"},{"optionId":"allow_session","kind":"allow_always","name":"Allow for this session"},{"optionId":"switch_bypass","kind":"allow_always","name":"Switch to bypass"},{"optionId":"reject_once","kind":"reject_once","name":"Reject"}]}}"#;
 
     /// `deny` answers `reject_once` and the turn goes on to its end; `observe` leaves the
     /// request pending.
