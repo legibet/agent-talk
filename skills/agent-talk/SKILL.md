@@ -21,7 +21,8 @@ conversation history, so the prompt must include the task and any context it nee
 conversation.
 
 `--full-access` lets the session edit files, run commands and use the network without approval
-prompts. Without it, the agent's own permission settings apply. Sessions created by agent-talk
+prompts. On OpenCode, tools the user's permission rules deny stay denied. Without it, the agent's
+own permission settings apply. Sessions created by agent-talk
 run unattended: actions that require approval are denied by the agent or declined by agent-talk.
 
 `--model <id>` and `--effort <value>` select the model and reasoning effort; omitted options use

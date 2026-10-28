@@ -27,6 +27,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 import urllib.request
 import uuid
 from dataclasses import dataclass, field
@@ -884,7 +885,7 @@ def opencode_tier():
 
     def settings():
         # The session itself changes: the variant for this and later prompts, the rules to
-        # allow everything.
+        # allow what the default agent would ask and keep everything else.
         out = new(a, "reply with the single word plum", "--wait")
         h = out["handle"]
         efforts = next((m["efforts"] for m in cli("models", "opencode", a.model)["models"] if m["id"] == a.model), [])
@@ -902,8 +903,12 @@ def opencode_tier():
         out = cli("send", h, "reply with the single word fig", "--full-access", "--wait")
         expect(variants(out) == {effort}, f"a later send keeps variant {effort}")
         rules = opencode_api("GET", f"/api/session/{native(h)}")["data"].get("permissions") or []
-        allow_all = {"action": "*", "resource": "*", "effect": "allow"}
-        expect(allow_all in rules, f"the session's rules allow everything, got {rules}")
+        location = urllib.parse.urlencode({"location[directory]": str(DIR)})
+        agent = opencode_api("GET", f"/api/agent?{location}")["data"][0]["permissions"]
+        first_ask = next((i for i, r in enumerate(agent) if r["effect"] == "ask"), len(agent))
+        mirror = [{**r, "effect": "allow"} if r["effect"] == "ask" else r for r in agent[first_ask:]]
+        mirror.append({"action": "question", "resource": "*", "effect": "deny"})
+        expect(rules == mirror, f"the default agent's rules with asks allowed, got {rules}")
 
     def foreign_approval():
         # A session agent-talk did not start whose rules ask before an edit: agent-talk leaves

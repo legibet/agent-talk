@@ -13,7 +13,7 @@ mod history;
 mod transport;
 
 use self::history::{find_span, messages, turn_before};
-use self::transport::{Event, Events, ModelRef, Service};
+use self::transport::{Event, Events, ModelRef, Service, SessionInfo};
 use crate::agents::history::{ReadPage, ReadQuery, RemoteHistory};
 use crate::agents::lifecycle::{
     ApprovalPolicy, approval_policy, bounded, record, reject, resolve, settle, wait_receipt,
@@ -130,35 +130,38 @@ fn new_msg_id() -> String {
     format!("msg_{time:012x}{tail}")
 }
 
-/// Session rules that make the default agent deny what it would ask (DESIGN.md §6.3):
-/// its rules from the first `ask` on, with every `ask` turned into `deny`. The service
-/// evaluates the agent's rules, then the session's, and the last match wins, so every
-/// other answer stays. The rules before the first `ask` decide the same either way and
-/// are left out, so sub-agents, which inherit session rules, keep their own there.
-fn no_asks(agent_rules: &[Value]) -> Vec<Value> {
-    agent_rules
+/// The rules of a session agent-talk started, so that the default agent never asks
+/// (DESIGN.md §6.3): its rules from the first `ask` on, with every `ask` turned into `deny`,
+/// or into `allow` under full access, then a denied question tool, since nobody answers it.
+/// The service evaluates the agent's rules, then the session's, and the last match wins, so
+/// every other answer stays, the user's denials included. The rules before the first `ask`
+/// decide the same either way and are left out, so sub-agents, which inherit session rules,
+/// keep their own there.
+fn session_rules(agent_rules: &[Value], full_access: bool) -> Value {
+    let answer = if full_access { "allow" } else { "deny" };
+    let mut rules: Vec<Value> = agent_rules
         .iter()
         .skip_while(|r| r["effect"] != "ask")
         .map(|r| {
             let mut r = r.clone();
             if r["effect"] == "ask" {
-                r["effect"] = json!("deny");
+                r["effect"] = json!(answer);
             }
             r
         })
-        .collect()
-}
-
-/// Full access: one rule allowing every action (DESIGN.md §4).
-fn allow_all() -> Vec<Value> {
-    vec![json!({"action": "*", "resource": "*", "effect": "allow"})]
-}
-
-/// The rules of a session agent-talk started (DESIGN.md §6.3): `rules` (`allow_all` or
-/// `no_asks`) plus a denied question tool, since nobody answers it.
-fn session_rules(mut rules: Vec<Value>) -> Value {
+        .collect();
     rules.push(json!({"action": "question", "resource": "*", "effect": "deny"}));
     json!(rules)
+}
+
+/// The location of an existing session.
+fn location(session: &SessionInfo, id: &str) -> Result<String> {
+    session.directory().map(String::from).ok_or_else(|| {
+        Error::new(
+            ErrorCode::Transport,
+            format!("session.get returned no location for {id}"),
+        )
+    })
 }
 
 /// The user's default model for `cwd`, which an effort without a model applies to.
@@ -527,17 +530,8 @@ impl Agent for OpenCode<'_> {
         }
         // Session rules, so that the service itself never waits for an answer here
         // (DESIGN.md §4, §6.3).
-        body["permissions"] = if req.settings.full_access {
-            session_rules(allow_all())
-        } else {
-            let Some(rules) = svc.default_agent_rules(req.cwd).await? else {
-                return Err(Error::new(
-                    ErrorCode::Transport,
-                    format!("agent.list returned no default agent for {}", req.cwd),
-                ));
-            };
-            session_rules(no_asks(&rules))
-        };
+        let rules = svc.default_agent_rules(req.cwd).await?;
+        body["permissions"] = session_rules(&rules, req.settings.full_access);
         let session_id = svc.create_session(&body).await?;
         self.store
             .insert_owned(&handle(&session_id), req.cwd, req.settings)?;
@@ -560,16 +554,9 @@ impl Agent for OpenCode<'_> {
                 // An effort alone applies to the session's model, the user's default when the
                 // session has none.
                 let session = svc.session(session_id).await?;
-                if let Some(m) = session.model {
-                    m
-                } else {
-                    let cwd = session.directory().ok_or_else(|| {
-                        Error::new(
-                            ErrorCode::Transport,
-                            format!("session.get returned no location for {session_id}"),
-                        )
-                    })?;
-                    default_model(&svc, cwd).await?
+                match session.model {
+                    Some(m) => m,
+                    None => default_model(&svc, &location(&session, session_id)?).await?,
                 }
             };
             // The session's effort (the change included), kept across a model change; without
@@ -581,7 +568,12 @@ impl Agent for OpenCode<'_> {
             svc.set_model(session_id, &model).await?;
         }
         if change.full_access {
-            svc.set_permissions(session_id, &session_rules(allow_all()))
+            // The default agent's rules as they are now, read once the location's
+            // configuration is applied, as in `start`.
+            let cwd = location(&svc.session(session_id).await?, session_id)?;
+            svc.load_location(&cwd).await?;
+            let rules = svc.default_agent_rules(&cwd).await?;
+            svc.set_permissions(session_id, &session_rules(&rules, true))
                 .await?;
         }
         self.submit(&svc, session_id, &req.message, req.steer, deadline)
@@ -677,25 +669,30 @@ mod tests {
         assert!(ModelRef::parse("sonnet").is_err());
     }
 
-    /// What asks is denied, everything else keeps its answer, including a narrower
-    /// allow after an ask; rules before the first ask are left to the agent (shapes from
-    /// `GET /api/agent`, opencode 2.0.23).
+    /// What asks is denied, or allowed under full access; everything else keeps its answer,
+    /// including a narrower allow or deny after an ask; rules before the first ask are left
+    /// to the agent (shapes from `GET /api/agent`, opencode 2.2.0).
     #[test]
-    fn session_rules_deny_what_would_ask() {
+    fn session_rules_answer_what_would_ask() {
         let agent = vec![
             json!({"action": "*", "resource": "*", "effect": "allow"}),
             json!({"action": "edit", "resource": "*", "effect": "ask"}),
             json!({"action": "edit", "resource": "src/*", "effect": "allow"}),
+            json!({"action": "edit", "resource": "*.lock", "effect": "deny"}),
             json!({"action": "browser", "resource": "*", "effect": "deny"}),
         ];
-        assert_eq!(
-            no_asks(&agent),
-            vec![
-                json!({"action": "edit", "resource": "*", "effect": "deny"}),
-                json!({"action": "edit", "resource": "src/*", "effect": "allow"}),
-                json!({"action": "browser", "resource": "*", "effect": "deny"}),
-            ]
-        );
-        assert!(no_asks(&agent[..1]).is_empty());
+        let question = json!({"action": "question", "resource": "*", "effect": "deny"});
+        let rules = |asked: &str| {
+            json!([
+                {"action": "edit", "resource": "*", "effect": asked},
+                agent[2],
+                agent[3],
+                agent[4],
+                question,
+            ])
+        };
+        assert_eq!(session_rules(&agent, false), rules("deny"));
+        assert_eq!(session_rules(&agent, true), rules("allow"));
+        assert_eq!(session_rules(&agent[..1], true), json!([question]));
     }
 }

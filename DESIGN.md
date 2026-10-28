@@ -163,7 +163,8 @@ for all. agent-talk never approves.
 
 - Sessions agent-talk started have nobody else to answer, so they must not wait on approvals.
   Where the agent allows it they never ask (Codex `approvalPolicy: never`, Claude
-  `--permission-prompts none`, OpenCode session rules that deny what the user's rules would ask;
+  `--permission-prompts none`, OpenCode session rules that deny what the user's rules would ask,
+  or allow it under full access;
   headless Claude and Antigravity deny on their own), and what still reaches agent-talk is
   declined (Codex `decline`, OpenCode `reject` with a message, Grok and Devin `reject_once`).
 - Sessions agent-talk did not start belong to the user: agent-talk never answers there and never
@@ -187,10 +188,11 @@ Devin; the user's own client then sees the change too. A change the agent refuse
 agent-talk's store, so a refused value is not passed again.
 
 Full access gives a session every permission and no approval prompts (Codex
-`danger-full-access`, Claude `bypassPermissions`, an OpenCode allow-all session rule, Grok
-`yoloMode`, Antigravity `--dangerously-skip-permissions`, Devin's `bypass` mode; pi has no prompts
-to lift). Without it the session runs under the agent's own configuration, except on Devin, whose
-ACP interface starts every session in `accept-edits` (§6.7). Once given it is not taken back.
+`danger-full-access`, Claude `bypassPermissions`, Grok `yoloMode`, Antigravity
+`--dangerously-skip-permissions`, Devin's `bypass` mode; pi has no prompts to lift), except on
+OpenCode, where it allows what the user's rules would ask and keeps what they deny (§6.3). Without
+it the session runs under the agent's own configuration, except on Devin, whose ACP interface
+starts every session in `accept-edits` (§6.7). Once given it is not taken back.
 
 ### Provenance and loops (best-effort)
 
@@ -514,7 +516,10 @@ The service reads the session's values at each step, so a change also covers the
 execution already running and the prompts queued behind it, and the user's TUI follows it (2.0.23);
 a permission request already pending is not re-evaluated. A changed toolset writes a `system` row
 into history and the model's context, and a model that was refused a tool earlier can go on treating
-it as missing (2.0.23).
+it as missing (2.0.23). `send --full-access` changes the toolset only by the tools of actions that
+were asks: with the user's rules on 2.2.0, `edit` brings back the write tools and a 0.5 KB row
+announcing one Code Mode tool (the allow-all rule used before added 45 browser tools in a 9 KB
+row); `new --full-access` writes no row.
 
 **Approvals.** `permission.asked` goes to every subscriber and is not replayed, so agent-talk also
 lists pending requests. An unanswered request blocks with no timeout. `reject` with a `message`
@@ -524,26 +529,30 @@ request gone records `resolved`. `always` would save a project-wide rule.
 
 A request is answered by the last rule matching action and resource in the agent's ruleset
 followed by the session's, and asks when none matches; the agent's ruleset already holds the
-user's configuration (read in source; verified live on 2.0.23). A session agent-talk starts
-therefore gets session rules at creation, so that the service itself refuses what would wait for
-an answer:
+user's configuration (read in source; verified live on 2.0.23 and 2.2.0). A session agent-talk
+starts therefore gets session rules at creation, and again at `send --full-access`, so that the
+service itself answers what would wait for an answer:
 
-- full access: one rule allowing every action on every resource, which overrides the user's
-  rules;
-- otherwise the default agent's rules from its first `ask` on, in order, with every `ask` turned
-  into `deny`. Allowed and denied requests keep their answer; one that would ask is refused with
-  nothing pending. The rules before the first `ask` are left out because sub-sessions of the
-  subagent tool inherit session rules, and a full copy (which starts with `* * allow`) overrode a
-  sub-agent's own denials;
-- in both cases the question tool is denied: nobody answers it in these sessions.
+- the default agent's rules from its first `ask` on, in order, with every `ask` turned into
+  `deny`, or into `allow` under full access. Allowed and denied requests keep their answer, the
+  user's denials included; one that would ask is refused, or allowed, with nothing pending. The
+  rules before the first `ask` are left out because sub-sessions of the subagent tool inherit
+  session rules, and a full copy (which starts with `* * allow`) overrode a sub-agent's own
+  denials. A sub-agent still gets the default agent's answer for what the copied rules match (§8);
+- the question tool is denied: nobody answers it in these sessions.
+
+Full access is not one rule allowing everything, which would also lift the denials: on 2.2.0 the
+browser plugin denies its 45 tools to every agent after the user's configuration and allows them
+for a session while the desktop app attaches a browser to it, by appending allow rules to the
+session's rules (read in source).
 
 The model sees a tool denied for every resource as absent from its toolset, and a denied call as
 a tool error; the turn continues (2.0.23). Requests that still reach agent-talk (a plugin hook can
 turn an answer into `ask`) get `reject` with a message, and only once agent-talk's own message was
 delivered (earlier requests belong to the execution ahead of it). A TUI with
 `session.permissions: "autoaccept"` answers `once` to every pending request of the session it
-displays and its sub-sessions (read in source, 2.0.23), so while such a TUI shows a session
-agent-talk started, its requests are approved.
+displays and its sub-sessions (read in source, 2.0.23 and 2.2.0), so while such a TUI shows a
+session agent-talk started, its requests are approved.
 
 **Identity.** Shell commands get `OPENCODE_SESSION_ID`. MCP `tools/call` carries
 `_meta["ai.opencode/sessionID"]` (read in source and docs, never observed live; the docs say it
@@ -927,10 +936,12 @@ Devin inherited, unless pinned with `--from` or `--caller` (§8).
   `session/prompt` response in Grok (for a steer message, the joined turn's
   `_x.ai/session/prompt_complete`) and in Devin. A generic event-loop driver would hide those differences
   behind mode flags.
-- **OpenCode asks become denials by copying the default agent's rules from the first `ask` on**,
-  not by appending a `deny` per `ask` rule, which would override a later, narrower `allow` in the
-  user's configuration, and not by copying them all, which would override sub-agents' rules
-  (§6.3).
+- **OpenCode asks become denials, or allows under full access, by copying the default agent's
+  rules from the first `ask` on**, not by appending a `deny` or `allow` per `ask` rule, which would
+  override a later, narrower rule in the user's configuration, and not by copying them all, which
+  would override sub-agents' rules (§6.3). Full access keeps the user's denials rather than
+  allowing everything: the user decided what the agent may not do, and agent-talk only stands in
+  for the person who would answer the asks.
 - **Explicit agent options, not a generic option map.** `--model`, `--effort` and `--full-access`
   with clap help, instead of `--opt k=v` with per-adapter parsing. Values pass through
   unvalidated, because the agent owns the enum (Codex rejects an unknown effort in the turn, not
@@ -971,9 +982,15 @@ Devin inherited, unless pinned with `--from` or `--caller` (§8).
   mid-step from a running step, a `shutdown` interrupt before the first step from steer batching,
   or a queued item delivered into a reloaded continuation from a successor execution.
   `session.execution.failed`, the restart resume and the MCP `_meta` session id were never
-  observed. The rules of a session agent-talk started are a copy taken at `new`: later changes to
-  the user's configuration, approvals saved with `always` and plugin permission hooks do not reach
-  them, and sub-sessions inherit them (§6.3).
+  observed. The rules of a session agent-talk started are a copy taken at `new` or `send
+  --full-access`: later changes to the user's configuration, approvals saved with `always` and
+  plugin permission hooks do not reach them, and sub-sessions inherit them (§6.3). A sub-agent, or
+  an agent the user switches the session to, therefore gets the default agent's answer for what the
+  copied rules match: its own denial of what the default agent allows after its first `ask` is
+  lifted in every session agent-talk started, and of what the default agent asks under full access
+  (read in source and checked against the user's rules on 2.2.0, where no agent's denial is
+  affected; not observed with such an agent). A `send --full-access` while the desktop app has a
+  browser attached to the session replaces the allow rules the attachment appended (source only).
 - Grok: a turn that continues in a leader after the sending command stopped observing waits for
   another client to answer a permission request it raises. A steer receipt whose outcome is
   unknown and that names no turn is not refused by `wait --receipt`: it polls the session to

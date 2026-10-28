@@ -64,8 +64,9 @@ agent-talk refuses a message more than three hops down an agent-to-agent chain w
 
 `new --model` and `--effort` choose a session's model and reasoning effort. Without
 `--full-access` the session runs under the agent's own permission settings; with it, the session
-has every permission and no approval prompts. `send` takes the same three options to change them
-from that message on, but only on sessions agent-talk started.
+has every permission and no approval prompts (on OpenCode, the user's deny rules still apply).
+`send` takes the same three options to change them from that message on, but only on sessions
+agent-talk started.
 
 agent-talk never approves tool calls. In a session it started, nobody is there to answer approval
 requests, so the agent is told not to ask, and anything that still needs approval is declined. In

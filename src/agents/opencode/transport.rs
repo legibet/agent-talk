@@ -484,18 +484,24 @@ impl Service {
 
     /// The rules of the agent a new session in `directory` runs: the default agent, which
     /// the service lists first (read as `Value`, so that no entry is skipped before it).
-    pub async fn default_agent_rules(&self, directory: &str) -> Result<Option<Vec<Value>>> {
+    pub async fn default_agent_rules(&self, directory: &str) -> Result<Vec<Value>> {
         let agents: List<Value> = self
             .get("/api/agent", &[("location[directory]", directory.into())])
             .await?;
-        Ok(agents
+        agents
             .data
             .into_iter()
             .next()
             .and_then(|mut a| match a["permissions"].take() {
                 Value::Array(rules) => Some(rules),
                 _ => None,
-            }))
+            })
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorCode::Transport,
+                    format!("agent.list returned no default agent rules for {directory}"),
+                )
+            })
     }
 
     /// `integration.list`, which returns once the location's plugins are active, and with
