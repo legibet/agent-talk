@@ -1,9 +1,9 @@
 # agent-talk
 
 Rust CLI and stdio MCP server that sends messages to agent sessions (Codex, Claude Code,
-OpenCode, Grok CLI, Antigravity CLI, pi) through each agent's official interface, and reads the
-replies. No daemon of its own; state lives with the agents, plus intents and receipts in
-`~/.agent-talk/store.db`.
+OpenCode, Grok CLI, Antigravity CLI, pi, Devin CLI) through each agent's official interface, and
+reads the replies. No daemon of its own; state lives with the agents, plus intents and receipts
+in `~/.agent-talk/store.db`.
 
 ## Where to read
 

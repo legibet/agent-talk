@@ -1,9 +1,9 @@
 [package]
 name = "agent-talk"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.89"
-description = "Send messages to other agent sessions (Codex, Claude Code, OpenCode, Grok CLI, Antigravity CLI, pi) through their official interfaces, from a shell or over MCP"
+description = "Send messages to other agent sessions (Codex, Claude Code, OpenCode, Grok CLI, Antigravity CLI, pi, Devin CLI) through their official interfaces, from a shell or over MCP"
 license = "MIT"
 repository = "https://github.com/legibet/agent-talk"
 readme = "README.md"
