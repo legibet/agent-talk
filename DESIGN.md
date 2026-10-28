@@ -843,9 +843,10 @@ file under `~/.local/share/devin/cli/logs/`.
   turn `unknown`: the process that took it died, or Devin answered both together (a prompt sent
   while a turn runs is inserted after the running tool result), and the chain does not tell
   which. Short of an end, `wait` polls the db once a second until the end, the deadline, or proof
-  that nothing will write it: the recorded child gone (own receipts: `interrupted`, or `unknown`
-  when its user node is missing), or no process holding the session (`session/list`, at most
-  every five seconds, and only an explicit `isLocked: false` counts): then `unknown`, since a
+  that nothing will write it: the recorded child gone, or not holding the session as far as
+  `session/list` says, since its pid may have been reused (own receipts: `interrupted`, or
+  `unknown` when its user node is missing); or no process holding the session (`session/list`, at
+  most every five seconds, and only an explicit `isLocked: false` counts): then `unknown`, since a
   killed turn and one that ended without a final reply (a `-p` run after a rejected permission)
   leave the same chain. The chain is read once more after that proof, in case the writer finished
   in between.
@@ -862,10 +863,11 @@ file under `~/.local/share/devin/cli/logs/`.
   turn is over, because the title Devin writes after the first prompt overrides an earlier rename;
   a failed rename is a note on the turn, not a failure.
 - `ls` is `session/list`, followed through `nextCursor`, newest `updatedAt` first; `name` is the
-  title, `preview` the chain's first prompt. A session is `running` while an agent-talk child runs
-  an unfinished turn on it, else `unknown` with `loaded: yes` while locked (an idle TUI holds the
-  lock too), `idle` when the listing says it is not, and `unknown` either way when it does not say. `origin` is `devin` for every session agent-talk did not start: TUI, `-p`
-  and ACP sessions look the same.
+  title, `preview` the chain's first prompt. A session is `running` while the listing names a child
+  agent-talk recorded for it as the lock holder and that child's turn has no end in the chain,
+  else `unknown` with `loaded: yes` while locked (an idle TUI holds the lock too), `idle` when the
+  listing says it is not, and `unknown` either way when it does not say. `origin` is `devin` for
+  every session agent-talk did not start: TUI, `-p` and ACP sessions look the same.
 
 **Writers and liveness.** A process holds `session_locks/<id>.lock` from opening a session until it
 exits, idle or not, and a second opener is refused: `session/load` fails `-32015` with
@@ -874,7 +876,9 @@ written. agent-talk maps it to `E_LOCKED` when the pid is a child it recorded fo
 else `E_FOREIGN_LIVE`, keeping the agent's error. It takes no lock of its own and never probes the
 lock file: a probe takes Devin's lock for an instant, and a Devin process opening the session at
 that moment would fail. `session/list` reports the holder (`_meta["cognition.ai/isLocked"]`,
-`lockHolderPid`). A second `session/prompt` on the holding connection joins the running turn, which
+`lockHolderPid`, which is `null` once the holder exited on 3000.11.228, while the lock file keeps
+its pid). That, not a recorded pid being alive, tells `ls` and `wait` whether agent-talk's child
+still holds the session: pids wrap and are reused. A second `session/prompt` on the holding connection joins the running turn, which
 no later command can reach, so steer is refused (`E_NO_STEER`).
 
 **Sending.** `send` checks the session row and its directory, runs `session/load` (whose history

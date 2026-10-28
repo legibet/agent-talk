@@ -69,6 +69,8 @@ struct Listed {
     /// Whether a process holds Devin's lock on the session (an idle TUI does too); `None`
     /// when the listing does not say, which proves nothing either way.
     locked: Option<bool>,
+    /// The pid of that process (`null` while unlocked on 3000.11.228).
+    holder: Option<u32>,
 }
 
 impl Listed {
@@ -81,7 +83,21 @@ impl Listed {
             title: row["title"].as_str().map(String::from),
             updated_at: row["updatedAt"].as_str().unwrap_or_default().to_string(),
             locked: row["_meta"]["cognition.ai/isLocked"].as_bool(),
+            holder: row["_meta"]["cognition.ai/lockHolderPid"]
+                .as_u64()
+                .and_then(|p| u32::try_from(p).ok()),
         })
+    }
+
+    /// Whether `pid` holds the session: `Some(false)` when the listing says it is unlocked
+    /// or names another holder, `None` when it does not say. A recorded child's pid alone
+    /// may since belong to another process (DESIGN.md §6.7).
+    fn held_by(&self, pid: u32) -> Option<bool> {
+        match (self.locked?, self.holder) {
+            (false, _) => Some(false),
+            (true, Some(h)) => Some(h == pid),
+            (true, None) => None,
+        }
     }
 }
 
@@ -222,22 +238,16 @@ impl<'a> Devin<'a> {
         res
     }
 
-    /// Whether a process holds Devin's lock on the session, per `session/list`; `None` when
-    /// the listing does not say (the session absent, or the field odd).
-    async fn held(&self, id: &str) -> Result<Option<bool>> {
-        Ok(self
-            .listed(None)
-            .await?
-            .iter()
-            .find(|l| l.id == id)
-            .and_then(|l| l.locked))
+    /// The session's `session/list` entry; `None` when it is not listed.
+    async fn entry(&self, id: &str) -> Result<Option<Listed>> {
+        Ok(self.listed(None).await?.into_iter().find(|l| l.id == id))
     }
 
-    /// Whether a recorded child of the session is still alive with its turn not ended in
-    /// the chain yet (a pid alone may have been reused).
-    fn own_run(&self, id: &str, history: &History) -> Result<bool> {
-        for (receipt_id, pid) in self.store.processes(&handle(id))? {
-            if !pid_alive(pid) {
+    /// Whether the listing names a child agent-talk recorded for the session as the holder
+    /// of its lock, with that child's turn not ended in the chain yet.
+    fn own_run(&self, l: &Listed, history: &History) -> Result<bool> {
+        for (receipt_id, pid) in self.store.processes(&handle(&l.id))? {
+            if l.held_by(pid) != Some(true) {
                 continue;
             }
             let ended = self.store.receipt(&receipt_id)?.is_some_and(|r| {
@@ -245,9 +255,7 @@ impl<'a> Devin<'a> {
                     .find(&r.client_msg_id)
                     .is_some_and(|s| history.spans[s].end.is_some())
             });
-            if !ended {
-                return Ok(true);
-            }
+            return Ok(!ended);
         }
         Ok(false)
     }
@@ -431,7 +439,7 @@ impl<'a> Devin<'a> {
             None => None,
         };
         let running = match &history {
-            Some(history) => self.own_run(&l.id, history)?,
+            Some(history) => self.own_run(&l, history)?,
             None => false,
         };
         let (state, loaded) = match (running, l.locked) {
@@ -764,16 +772,29 @@ impl Agent for Devin<'_> {
                         )),
                     });
                 }
-                // Proof that nothing will write the end: the recorded child gone, or for a
-                // turn no agent-talk child runs, no process holding the session. A listing
-                // that does not say proves nothing.
+                // Proof that nothing will write the end: the recorded child gone or, its pid
+                // being possibly reused, no longer holding the session; for a turn no
+                // agent-talk child runs, no process holding it. A listing that does not say
+                // proves nothing.
                 gone = match child {
-                    Some(pid) => (!pid_alive(pid)).then(|| format!("the devin acp agent-talk started for this prompt (pid {pid}) has exited")),
-                    None if Instant::now() >= next_holder_check => {
+                    Some(pid) if !pid_alive(pid) => Some(format!(
+                        "the devin acp agent-talk started for this prompt (pid {pid}) has exited"
+                    )),
+                    _ if Instant::now() < next_holder_check => None,
+                    _ => {
                         next_holder_check = Instant::now() + HOLDER_POLL;
-                        (self.held(id).await? == Some(false)).then(|| "no process holds the session (session/list)".to_string())
+                        let entry = self.entry(id).await?;
+                        let released = match child {
+                            Some(pid) => entry.and_then(|l| l.held_by(pid)) == Some(false),
+                            None => entry.and_then(|l| l.locked) == Some(false),
+                        };
+                        released.then(|| match child {
+                            Some(pid) => format!(
+                                "the devin acp agent-talk started for this prompt (pid {pid}) no longer holds the session (session/list)"
+                            ),
+                            None => "no process holds the session (session/list)".to_string(),
+                        })
                     }
-                    None => None,
                 };
                 if gone.is_none() {
                     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -803,13 +824,9 @@ mod tests {
     use super::*;
     use crate::model::AgentError;
 
-    /// `session_locked` names the holder: agent-talk's own recorded child is `E_LOCKED`,
-    /// any other process `E_FOREIGN_LIVE`; other refusals pass through. The agent's error is
-    /// kept either way.
-    #[test]
-    fn session_locked_maps_by_holder() {
+    /// A store that recorded child `pid` for a prompt on `devin:swanky-towel`.
+    fn store_with_child(pid: u32) -> Store {
         let store = Store::memory();
-        let devin = Devin::new(&store);
         let message = crate::agents::Outgoing {
             text: "x",
             delivered: "x",
@@ -825,8 +842,18 @@ mod tests {
             })
             .unwrap();
         store
-            .insert_process("r", "devin:swanky-towel", 4242)
+            .insert_process("r", "devin:swanky-towel", pid)
             .unwrap();
+        store
+    }
+
+    /// `session_locked` names the holder: agent-talk's own recorded child is `E_LOCKED`,
+    /// any other process `E_FOREIGN_LIVE`; other refusals pass through. The agent's error is
+    /// kept either way.
+    #[test]
+    fn session_locked_maps_by_holder() {
+        let store = store_with_child(4242);
+        let devin = Devin::new(&store);
         let refusal = |data: Value| {
             Error::from_agent(
                 ErrorCode::Precondition,
@@ -862,7 +889,35 @@ mod tests {
         let l = row(r#"{"sessionId":"a-b","cwd":7,"updatedAt":null,"_meta":{"cognition.ai/isLocked":"yes"}}"#).unwrap();
         assert!(l.id == "a-b" && l.cwd.is_none() && l.updated_at.is_empty() && l.locked.is_none());
         let l = row(r#"{"sessionId":"a-b","_meta":{"cognition.ai/isLocked":true}}"#).unwrap();
-        assert_eq!(l.locked, Some(true));
+        assert_eq!((l.locked, l.holder), (Some(true), None));
         assert!(row(r#"{"cwd":"/x"}"#).is_none());
+    }
+
+    /// Only the listed holder makes a recorded child's unended turn agent-talk's running
+    /// one, and only the listing proves the child gone while its pid is alive: the pid may
+    /// have been reused (this test's own pid stands for it).
+    #[test]
+    fn the_listed_holder_decides() {
+        let pid = std::process::id();
+        let store = store_with_child(pid);
+        let devin = Devin::new(&store);
+        let history = History::new(Vec::new());
+        let listed = |meta: Value| {
+            Listed::new(&json!({"sessionId": "swanky-towel", "_meta": meta})).unwrap()
+        };
+        let ours =
+            listed(json!({"cognition.ai/isLocked": true, "cognition.ai/lockHolderPid": pid}));
+        let other = listed(json!({"cognition.ai/isLocked": true, "cognition.ai/lockHolderPid": 1}));
+        let free =
+            listed(json!({"cognition.ai/isLocked": false, "cognition.ai/lockHolderPid": null}));
+        let unsaid = listed(json!({"cognition.ai/isLocked": true}));
+        assert!(devin.own_run(&ours, &history).unwrap());
+        for l in [&other, &free, &unsaid] {
+            assert!(!devin.own_run(l, &history).unwrap());
+        }
+        assert_eq!(
+            [&ours, &other, &free, &unsaid].map(|l| l.held_by(pid)),
+            [Some(true), Some(false), Some(false), None]
+        );
     }
 }
