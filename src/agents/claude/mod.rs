@@ -743,13 +743,13 @@ impl Agent for Claude<'_> {
         let entries = load(&self.require_transcript(id)?)?;
         let branch = live_branch(&entries);
         // (line index, message), oldest first.
-        let mut messages = transcript::messages(&entries, &branch);
-        for (i, m) in &mut messages {
+        let messages = transcript::messages(&entries, &branch);
+        let mut cut = cut(q, q.cursor.as_deref(), messages, entries.len(), false)?;
+        for (i, m) in &mut cut.messages {
             if m.from.is_none() && entries[*i].is_prompt() {
                 m.from = self.store.sender_of(&m.item_id)?;
             }
         }
-        let cut = cut(q, q.cursor.as_deref(), messages, entries.len(), false)?;
         Ok(ReadPage {
             messages: Page {
                 next_cursor: cut.cursor_item().map(|(_, m)| m.item_id.clone()),

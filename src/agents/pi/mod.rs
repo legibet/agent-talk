@@ -527,13 +527,13 @@ impl Agent for Pi<'_> {
         self.check_layout()?;
         let entries = load(&self.require_file(id)?)?;
         let branch = live_branch(&entries);
-        let mut messages = session::messages(&entries, &branch);
-        for (_, m) in &mut messages {
+        let messages = session::messages(&entries, &branch);
+        let mut cut = cut(q, q.cursor.as_deref(), messages, entries.len(), false)?;
+        for (_, m) in &mut cut.messages {
             if m.phase == Phase::Prompt {
                 m.from = self.store.sender_of(&m.item_id)?;
             }
         }
-        let cut = cut(q, q.cursor.as_deref(), messages, entries.len(), false)?;
         Ok(ReadPage {
             messages: Page {
                 next_cursor: cut.cursor_item().map(|(_, m)| m.item_id.clone()),

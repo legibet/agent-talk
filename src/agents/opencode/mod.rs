@@ -586,13 +586,14 @@ impl Agent for OpenCode<'_> {
         // Which messages the page shows does not depend on their turn.
         let history = RemoteHistory::fetch(q, fetch, |rows| Ok(messages(rows, None))).await?;
         let turn = turn_before(&svc, session_id, &history).await?;
-        let mut messages = messages(history.records(), turn);
-        for (_, m) in &mut messages {
+        let messages = messages(history.records(), turn);
+        let mut page = history.page(q, messages)?;
+        for m in &mut page.messages.items {
             if m.phase == Phase::Prompt {
                 m.from = self.store.sender_of(&m.item_id)?;
             }
         }
-        history.page(q, messages)
+        Ok(page)
     }
 
     async fn wait(

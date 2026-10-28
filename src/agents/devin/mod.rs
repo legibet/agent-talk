@@ -672,13 +672,13 @@ impl Agent for Devin<'_> {
         let db = self.db()?;
         self.session_row(&db, id)?;
         let history = History::new(db.chain(id)?);
-        let mut messages = history.messages();
-        for (_, m) in &mut messages {
+        let messages = history.messages();
+        let mut cut = cut(q, q.cursor.as_deref(), messages, history.nodes.len(), false)?;
+        for (_, m) in &mut cut.messages {
             if m.phase == model::Phase::Prompt {
                 m.from = self.store.sender_of(&m.turn_id)?;
             }
         }
-        let cut = cut(q, q.cursor.as_deref(), messages, history.nodes.len(), false)?;
         Ok(ReadPage {
             messages: Page {
                 next_cursor: cut.cursor_item().map(|(_, m)| m.item_id.clone()),

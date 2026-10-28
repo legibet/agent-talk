@@ -29,6 +29,8 @@ CREATE TABLE IF NOT EXISTS receipts (
     agent_error TEXT,
     updated_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
+-- Store::sender_of looks prompts up by their item id.
+CREATE INDEX IF NOT EXISTS receipts_item_id ON receipts (item_id);
 CREATE TABLE IF NOT EXISTS owned (
     handle     TEXT PRIMARY KEY,
     cwd        TEXT NOT NULL,
@@ -260,8 +262,12 @@ impl Store {
         let from: Option<String> = self
             .db
             .query_row(
-                r#"SELECT i."from" FROM intents i JOIN receipts r USING (receipt_id)
-                   WHERE i.client_msg_id = ?1 OR r.item_id = ?1 LIMIT 1"#,
+                // Two indexed lookups: an `OR` across the join scans every intent.
+                r#"SELECT "from" FROM intents WHERE client_msg_id = ?1
+                   UNION ALL
+                   SELECT i."from" FROM receipts r JOIN intents i USING (receipt_id)
+                   WHERE r.item_id = ?1
+                   LIMIT 1"#,
                 params![id],
                 |row| row.get(0),
             )
@@ -451,9 +457,11 @@ mod tests {
     fn sender_round_trips() {
         let s = Store::memory();
         intent(&s, "r0", "codex:b", &Caller::agent("claude:a"));
-        assert_eq!(
-            s.sender_of("c-r0").unwrap(),
-            Some(Caller::agent("claude:a"))
-        );
+        s.accept("r0", None, None, Some("item-0")).unwrap();
+        // By client message id and by user item id.
+        for id in ["c-r0", "item-0"] {
+            assert_eq!(s.sender_of(id).unwrap(), Some(Caller::agent("claude:a")));
+        }
+        assert_eq!(s.sender_of("nope").unwrap(), None);
     }
 }
