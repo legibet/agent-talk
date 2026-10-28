@@ -70,9 +70,10 @@ agent-talk started.
 
 agent-talk never approves tool calls. In a session it started, nobody is there to answer approval
 requests, so the agent is told not to ask, and anything that still needs approval is declined. In
-a session it did not start, approval requests are left to the user. `agent-talk status` prints
-what the installed CLIs and running daemons support, and [DESIGN.md](DESIGN.md) describes how
-each agent is handled.
+a session it did not start, approval requests are left to the user; only when agent-talk cancels
+a Grok or Devin turn at its deadline does it answer them `cancelled`, as ACP requires.
+`agent-talk status` prints what the installed CLIs and running daemons support, and
+[DESIGN.md](DESIGN.md) describes how each agent is handled.
 
 The exit code is one of:
 

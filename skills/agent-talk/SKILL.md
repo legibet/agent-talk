@@ -87,16 +87,18 @@ each command as a separate background job and keep `--wait` to include the reply
 
 Exit code 0 can still accompany a failed turn. The turn status reports `completed`, `failed`,
 `interrupted` or `unknown`; a reply from an unfinished or failed turn may be partial. Each
-`approval declined` or `approval denied` line identifies an action that did not run. On OpenCode,
-one reply can cover several queued messages; `read` shows the conversation containing them.
+`approval declined`, `approval denied` or `approval cancelled` line identifies an action that did
+not run. On OpenCode, one reply can cover several queued messages; `read` shows the conversation
+containing them.
 
 Exit code 3 means a timeout or an interrupt (Ctrl-C, or SIGTERM when a background job is
 stopped) left the outcome unknown. Use the receipt printed with the error to check the result
 with `wait`; resending may duplicate the message. If `new` did not print a handle, `ls`
 identifies sessions it created with `origin=agent-talk`. Grok without a leader and Devin cancel
-the turn when the command times out or is interrupted; `wait` reports how that turn ended and does
-not restart it. A Grok `--steer` receipt left before its turn was seen cannot be waited on; `read`
-the session to find the turn it joined.
+the turn when the command times out or is interrupted, and approval requests it left waiting for
+the user are then cancelled too (`approval cancelled`, `state: waiting`); `wait` reports how that
+turn ended and does not restart it. A Grok `--steer` receipt left before its turn was seen cannot
+be waited on; `read` the session to find the turn it joined.
 
 Exit code 2 reports a refused request with an `E_*` code and an explanation of the cause. Exit
 code 4 reports a transport failure, which can occur before or after delivery. If the error

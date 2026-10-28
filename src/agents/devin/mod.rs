@@ -40,7 +40,7 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 /// How long a command whose deadline passed keeps the child to end the turn cleanly
-/// (`session/cancel`, then the `cancelled` response, which came within 20 ms on 3000.11.92).
+/// (`session/cancel`, then the `cancelled` response, which came within 40 ms on 3000.11.228).
 const WIND_DOWN: Duration = Duration::from_secs(10);
 /// How long the rename after a first turn may take.
 const RENAME_TIMEOUT: Duration = Duration::from_secs(10);
@@ -129,7 +129,8 @@ async fn apply(conn: &Conn, id: &str, change: &Settings, settings: &Settings) ->
 
 /// The deadline or a signal ended observation. The child dies with this command and would
 /// take the turn down with nothing in the db; end it Devin's way instead, which leaves the
-/// cancelled tool call in the db when one ran (DESIGN.md §6.7).
+/// cancelled tool call in the db when one ran, and answer the permission requests still
+/// open `cancelled`, as ACP requires after a cancel (DESIGN.md §4, §6.7).
 async fn wind_down(w: &mut Watch<'_>, conn: &mut Conn, id: &str) {
     if w.ended() {
         return;
@@ -137,6 +138,7 @@ async fn wind_down(w: &mut Watch<'_>, conn: &mut Conn, id: &str) {
     let _ = conn
         .notify("session/cancel", json!({"sessionId": id}))
         .await;
+    w.cancel(conn).await;
     let _ = tokio::time::timeout(WIND_DOWN, w.finish(conn)).await;
 }
 

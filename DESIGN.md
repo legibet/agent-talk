@@ -132,7 +132,7 @@ or `--no-daemon` run; agent-talk proceeds through the daemon.
 session  { handle, agent, id, cwd?, name?, preview?, observations, state: idle|running|waiting|unknown, owned }
 turn     { handle, turn_id, status: completed|failed|interrupted|unknown, final_text?, error?, duration_ms?, basis? }
 message  { turn_id, item_id, role: user|assistant, phase: prompt|final|commentary|other, text, from?, timestamp? }
-approval { handle, turn_id?, item_id?, request_id, kind, summary, outcome: pending|declined|resolved|denied, raw }
+approval { handle, turn_id?, item_id?, request_id, kind, summary, outcome: pending|declined|resolved|denied|cancelled, raw }
 receipt  { receipt_id, handle, client_msg_id, state, queue_id?, turn_id?, item_id?, agent_error?, delivered_text? }
 caller   { kind: agent|unknown|runtime, session?, turn? }
 outcome  { handle, receipt?, turn?, approvals[], from? }            result of new / send / wait
@@ -150,8 +150,9 @@ the agent runtime injected (task notifications, system messages).
 an agent refusal marks it `rejected`. When observation ends without a result (deadline, Ctrl-C or
 SIGTERM, transport loss) a `pending` receipt becomes `unknown`, and the error carries the receipt,
 the approvals seen so far and how far the message got (`state`): `pending` (queued, not running),
-`running`, `waiting` (an approval is unanswered) or `unknown`. An `accepted` or `rejected`
-receipt never falls back to `unknown`, so a concurrent command's proof is not overwritten. An
+`running`, `waiting` (an approval was unanswered when observation ended, `pending` or
+`cancelled`) or `unknown`. An `accepted` or `rejected` receipt never falls back to `unknown`, so
+a concurrent command's proof is not overwritten. An
 `unknown` one is resolved by later proof: delivery seen in history, the queue or a run log moves
 it to `accepted`, a run log showing the message was never taken to `rejected`. `wait --receipt R`
 or `wait --turn T` looks for that proof.
@@ -164,15 +165,20 @@ for all. agent-talk never approves.
 - Sessions agent-talk started have nobody else to answer, so they must not wait on approvals.
   Where the agent allows it they never ask (Codex `approvalPolicy: never`, Claude
   `--permission-prompts none`, OpenCode session rules that deny what the user's rules would ask,
-  or allow it under full access;
-  headless Claude and Antigravity deny on their own), and what still reaches agent-talk is
-  declined (Codex `decline`, OpenCode `reject` with a message, Grok and Devin `reject_once`).
+  or allow it under full access; headless Claude and Antigravity deny on their own), and what
+  still reaches agent-talk is declined (Codex `decline`, OpenCode `reject` with a message, Grok
+  and Devin `reject_once`).
 - Sessions agent-talk did not start belong to the user: agent-talk never answers there and never
   changes their settings. It records pending requests and lets the deadline pass with
-  `state: waiting`.
+  `state: waiting`. The one exception is a turn agent-talk ends itself with ACP's
+  `session/cancel` (Grok in direct mode, Devin; §6.4, §6.7): ACP requires the client to answer
+  every pending `session/request_permission` of the cancelled turn with the `cancelled` outcome,
+  so agent-talk answers each request still pending, and any that arrives later, right after
+  the cancel, and records it `cancelled`. `cancelled` approves nothing: the tool does not run and
+  the turn ends `cancelled`.
 
 Requests answered by someone else become `resolved`; denials made by the agent CLI itself are
-recorded as `denied`.
+recorded as `denied`; requests withdrawn by agent-talk's cancel as `cancelled`.
 
 ### Settings
 
@@ -630,8 +636,8 @@ takes its own lock only in direct mode, since clients of one leader do not exclu
   with no `turn_completed`), and a `session/cancel` sent before the prompt is running is ignored.
   So agent-talk observes the turn to its end even without `--wait`, in the command or, over MCP,
   in the server (§4); when a deadline or signal ends observation, agent-talk waits briefly for the
-  prompt to run, cancels it and waits for the `cancelled` response. Through a leader the turn
-  continues after the command.
+  prompt to run, cancels it, answers its pending permission requests `cancelled` (§4) and waits
+  for the `cancelled` response. Through a leader the turn continues after the command.
 - `wait` on a turn agent-talk is not observing polls `updates.jsonl` for its `turn_completed`; a
   direct child that exited without one leaves the turn `interrupted` or `unknown`.
 
@@ -643,9 +649,17 @@ stored, so every direct-mode send passes it again. It has no effect on a session
 leader, so `send --full-access` there is refused (`E_UNSUPPORTED`). `session/request_permission`
 goes to every attached client with one id, and the first answer wins. An unanswered request was
 still pending after 25 s. Which commands prompt with yolo off varied between runs on 1.0.46 and
-later runs provoked none, so the deny and observe paths rest on frames captured earlier, replayed
-by unit tests. Grok has no session-level setting that stops it asking, so a request a leader-held
-turn raises after the command stopped observing waits for another client (§8).
+later runs provoked none; on 1.0.70, without a rule, requests were again resolved `allow` by Grok
+itself after up to 15 s without reaching the client, while an `ask` rule in the configuration
+(`[permission] ask = ["Bash(touch *)"]`) made it ask every time. In direct mode a request still
+pending at agent-talk's cancel is answered `cancelled` (§4); Grok then reports
+`interaction_resolved`, writes `permission_resolved {decision: cancelled}` to `events.jsonl` and
+ends the prompt `cancelled` within 70 ms (1.0.70). Unanswered, it resolves the request itself at
+the cancel, without a decision, and the `interaction_resolved` that follows would read as an
+answer from another client. A `cancelled` answer without a cancel ends the turn too
+(`cancellationCategory: PermissionCancelled`), and one after the turn ended is dropped silently.
+Grok has no session-level setting that stops it asking, so a request a leader-held turn raises
+after the command stopped observing waits for another client (§8).
 
 **Identity.** `GROK_SESSION_ID` is set in shell commands and in each MCP server's environment (one
 server per session); `tools/call` `_meta` carries no session. Grok also loads MCP servers from
@@ -829,9 +843,10 @@ file under `~/.local/share/devin/cli/logs/`.
 - Closing the child's stdin or SIGTERM ends it within 0.1 s; the lock is released and the running
   turn dies, leaving only its user node. So a command observes its turn to the end even without
   `--wait` (over MCP the server keeps it, §4), and at a deadline or signal ends it with
-  `session/cancel`: the response comes `cancelled` within 20 ms. A cancel during a tool call leaves
-  the assistant node and a `Canceled` tool node, which later readers see; one before the first step
-  leaves only the user node.
+  `session/cancel`, followed by a `cancelled` answer to each pending permission request (§4): the
+  response comes `cancelled` within 40 ms. A cancel during a tool call, or while its permission
+  request waits, leaves the assistant node and a `Canceled` tool node, which later readers see; one
+  before the first step leaves only the user node.
 - `new` is `session/new`, the settings, then the prompt. Devin writes the session row at the first
   prompt, so a refused setting leaves only a lock file, and the error says so. The session is
   recorded as owned at `session/new`. `--name` is `_cognition.ai/session/rename` once the first
@@ -869,7 +884,13 @@ and the user's `permissions.allow` rules apply. Sessions agent-talk starts there
 `session/request_permission` with `reject_once` (Devin offers no reject-always): the tool fails,
 the model goes on and the turn ends `end_turn`. On the user's sessions requests are recorded and
 left pending; the lock keeps every other client out, so nobody can answer them, and the turn waits
-until the deadline cancels it, or as long as the MCP server keeps it (§8). Full access is
+until the deadline cancels it, or as long as the MCP server keeps it (§8). The cancel is followed
+by a `cancelled` answer to each pending request (§4), and the order matters: Devin reads a
+`cancelled` answer that comes first as a skip ("User skipped this tool call"), and the model goes
+on. After the cancel the turn ends the same way with or without the answer (a `Canceled` tool
+node, the response `cancelled`); left unanswered, the request is dropped with a warning in Devin's
+log (`turn stopped with 1 pending root(s)`), and an answer after the response is accepted
+silently (3000.11.228). Full access is
 `session/set_mode {modeId: "bypass"}`, stored with the session and kept by every later load,
 including the user's TUI.
 
@@ -902,10 +923,12 @@ Devin inherited, unless pinned with `--from` or `--caller` (§8).
 - **The user configures the MCP server globally.** agent-talk never injects itself into a session
   or edits agent configuration, even where the agent's API allows per-thread servers.
 - **Never approve.** Decline or reject is the strongest answer; `once`, `always` and `accept` are
-  never sent.
+  never sent. ACP's `cancelled`, required for the pending requests of a turn the client cancels,
+  approves nothing either (§4).
 - **Sessions agent-talk did not start are the user's.** agent-talk never answers their approval
   requests and never changes their settings; declining would change a turn the user's TUI is
-  attached to.
+  attached to. The exception is a turn agent-talk itself cancels over ACP: its pending requests get
+  the `cancelled` answer ACP requires, since the turn ends either way (§4).
 - **Permissions: the agent's own, or full access.** Restricted levels (read-only, workspace write)
   were tested on 2026-10-06 and left out: only Claude could enforce one with web tools allowed,
   Codex loses the sandbox when a thread unloads and the queue path cannot carry it, OpenCode's
@@ -996,9 +1019,10 @@ Devin inherited, unless pinned with `--from` or `--caller` (§8).
   unknown and that names no turn is not refused by `wait --receipt`: it polls the session to
   the deadline. A model change through a model without efforts resets Grok's effort to the next
   model's default while agent-talk's stored effort keeps the old value, so a send asking for that
-  value again sees no change and passes nothing. `reject_once`, an unanswered request
-  and the `session/cancel` at the deadline rest on captured frames, not re-verified. Unverified:
-  whether a TUI renders live a turn another leader client ran; leader behaviour with a grok.com
+  value again sees no change and passes nothing. `reject_once` rests on frames captured on 1.0.46,
+  not re-verified. The cancel of a direct-mode turn with a pending request was verified on 1.0.70
+  with an `ask` rule; the live tier, which has no such rule, does not cover it. Unverified: whether
+  a TUI renders live a turn another leader client ran; leader behaviour with a grok.com
   subscription login (it may open a relay).
 - pi: a session open in a TUI cannot be detected, so `send` to it branches the conversation:
   the TUI shows neither the message nor its reply, its next message starts a branch beside them,

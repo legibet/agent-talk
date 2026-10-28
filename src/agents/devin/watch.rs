@@ -28,6 +28,8 @@ pub struct Watch<'s> {
     /// The `session/prompt` response until it arrives.
     response: Option<Response>,
     policy: ApprovalPolicy,
+    /// agent-talk sent `session/cancel`: every permission request is answered `cancelled`.
+    cancelling: bool,
     accepted: bool,
     /// Agent text since the last tool call.
     text: String,
@@ -50,6 +52,7 @@ impl<'s> Watch<'s> {
             turn_id: turn_id.to_string(),
             response: Some(response),
             policy,
+            cancelling: false,
             accepted: false,
             text: String::new(),
             approvals: Vec::new(),
@@ -90,6 +93,26 @@ impl<'s> Watch<'s> {
             self.accepted = true;
         }
         Ok(())
+    }
+
+    /// agent-talk sent `session/cancel`: answer each request still pending `cancelled`, as ACP
+    /// requires, and every later one too (DESIGN.md §4). Devin reads a `cancelled` answer
+    /// that comes before the cancel as a skip and lets the model go on (3000.11.228), so
+    /// this follows the cancel. An answer that cannot be written leaves the request pending.
+    pub async fn cancel(&mut self, conn: &Conn) {
+        self.cancelling = true;
+        for a in self
+            .approvals
+            .iter_mut()
+            .filter(|a| a.outcome == ApprovalOutcome::Pending)
+        {
+            if let Err(e) = conn.respond(&a.request_id, acp::cancelled()).await {
+                tracing::warn!("{e}");
+                return;
+            }
+            a.outcome = ApprovalOutcome::Cancelled;
+            record(self.store, a);
+        }
     }
 
     /// Events until the turn ends: the `session/prompt` result or error.
@@ -202,13 +225,14 @@ impl<'s> Watch<'s> {
     /// A permission request: the approval to record and the answer to send before it, if
     /// any; `None` for a request already recorded. Under `deny` the answer is the
     /// `reject_once` option (Devin offers no reject-always); the tool fails and the turn
-    /// goes on.
+    /// goes on. Once agent-talk cancelled the turn, the answer is `cancelled`.
     fn on_permission(&self, request_id: Value, params: Value) -> Option<(Approval, Option<Value>)> {
         if self.approvals.iter().any(|a| a.request_id == request_id) {
             return None;
         }
         let call = &params["toolCall"];
         let answer = match self.policy {
+            _ if self.cancelling => Some(acp::cancelled()),
             ApprovalPolicy::Deny => acp::reject_once(&params),
             ApprovalPolicy::Observe => None,
         };
@@ -223,10 +247,10 @@ impl<'s> Watch<'s> {
             request_id,
             kind: REQUEST_PERMISSION.into(),
             summary,
-            outcome: if answer.is_some() {
-                ApprovalOutcome::Declined
-            } else {
-                ApprovalOutcome::Pending
+            outcome: match answer {
+                None => ApprovalOutcome::Pending,
+                Some(_) if self.cancelling => ApprovalOutcome::Cancelled,
+                Some(_) => ApprovalOutcome::Declined,
             },
             raw: params,
         };
@@ -371,6 +395,7 @@ mod tests {
             turn_id: CLIENT.into(),
             response: None,
             policy: ApprovalPolicy::Deny,
+            cancelling: false,
             accepted: false,
             text: String::new(),
             approvals: Vec::new(),
@@ -429,6 +454,7 @@ mod tests {
             turn_id: CLIENT.into(),
             response: None,
             policy: ApprovalPolicy::Deny,
+            cancelling: false,
             accepted: false,
             text: String::new(),
             approvals: Vec::new(),
@@ -437,6 +463,71 @@ mod tests {
         assert_eq!(e.code, crate::model::ErrorCode::Transport);
         assert_eq!(w.approvals.len(), 1);
         assert_eq!(w.approvals[0].outcome, ApprovalOutcome::Pending);
+        conn.close().await;
+    }
+
+    /// After agent-talk's `session/cancel` the request left pending on the user's session, and
+    /// one that arrives later, are answered `cancelled`, each after the cancel (an answer
+    /// first is a skip, and the turn goes on) and recorded `cancelled`.
+    #[tokio::test]
+    async fn cancel_answers_pending_requests_cancelled() {
+        let _children = crate::agents::acp::SPAWN_LOCK.lock().await;
+        let store = store_with_intent();
+        let request = |id: &str| {
+            let mut r: Value = serde_json::from_str(PERMISSION).unwrap();
+            r["id"] = json!(id);
+            r["params"]["toolCall"]["toolCallId"] = json!(format!("exec:{id}"));
+            r
+        };
+        // Ends the turn only when the cancel comes first and each request then gets
+        // `cancelled`; anything else ends the connection.
+        let expect = |pattern: &str| {
+            format!("read l; case \"$l\" in *'{pattern}'*) ;; *) echo \"$l\" >&2; exit 1;; esac")
+        };
+        let cancelled = r#""outcome":{"outcome":"cancelled"}"#;
+        let script = [
+            "read l".into(),
+            format!(
+                "echo '{}'",
+                json!({"jsonrpc": "2.0", "id": 1, "result": {}})
+            ),
+            "read l".into(),
+            format!("echo '{}'", request("first")),
+            expect(r#""method":"session/cancel""#),
+            expect(cancelled),
+            format!("echo '{}'", request("second")),
+            expect(cancelled),
+            format!(
+                "echo '{}'",
+                json!({"jsonrpc": "2.0", "id": 2, "result": {"stopReason": "cancelled"}})
+            ),
+            "read l".into(),
+        ]
+        .join("; ");
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.args(["-c", &script]);
+        let mut conn = crate::agents::acp::spawn(cmd, "test agent").await.unwrap();
+        let mut w = watch(&store, &conn, ApprovalPolicy::Observe).await;
+        // The deadline passes while the request waits for the user.
+        let observed =
+            tokio::time::timeout(std::time::Duration::from_millis(200), w.finish(&mut conn)).await;
+        assert!(observed.is_err(), "the turn waits for the request");
+        assert_eq!(w.approvals[0].outcome, ApprovalOutcome::Pending);
+        conn.notify("session/cancel", json!({"sessionId": SESSION}))
+            .await
+            .unwrap();
+        w.cancel(&conn).await;
+        let end = tokio::time::timeout(std::time::Duration::from_secs(10), w.finish(&mut conn))
+            .await
+            .expect("the turn ends once both requests got `cancelled`")
+            .unwrap()
+            .unwrap();
+        assert_eq!(end["stopReason"], "cancelled");
+        let outcomes: Vec<_> = w.approvals.iter().map(|a| a.outcome).collect();
+        assert_eq!(
+            outcomes,
+            [ApprovalOutcome::Cancelled, ApprovalOutcome::Cancelled]
+        );
         conn.close().await;
     }
 

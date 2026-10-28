@@ -710,14 +710,16 @@ impl<'a> Grok<'a> {
 
 /// The deadline or a signal ended observation of a direct-mode prompt. The child dies
 /// with this command and would take the turn down mid-step; end it Grok's way instead,
-/// so updates.jsonl records turn_completed (stop_reason cancelled). A cancel sent before
-/// the prompt runs is ignored, hence the wait for it to start.
+/// so updates.jsonl records turn_completed (stop_reason cancelled), and answer the
+/// permission requests still open `cancelled`, as ACP requires after a cancel (DESIGN.md
+/// §4). A cancel sent before the prompt runs is ignored, hence the wait for it to start.
 async fn wind_down(w: &mut Watch<'_>, conn: &mut Conn, id: &str) {
     let ended = tokio::time::timeout(WIND_DOWN, w.until_running(conn)).await;
     if !matches!(ended, Ok(Ok(true))) {
         let _ = conn
             .notify("session/cancel", json!({"sessionId": id}))
             .await;
+        w.cancel(conn).await;
         let _ = tokio::time::timeout(WIND_DOWN, w.finish(conn)).await;
     }
 }

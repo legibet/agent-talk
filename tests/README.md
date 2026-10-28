@@ -26,8 +26,9 @@ after its last use).
 The script builds `target/release/agent-talk` first and runs a tier only when `agent-talk status`
 reports `new` and `send` available for its agent; otherwise it prints `SKIP <agent>: <reason>`.
 Approval checks on sessions agent-talk did not start create those sessions themselves, with
-approvals on, and end the request with `turn/interrupt` (Codex) or `reject` (OpenCode), never an
-approval. Grok leader cases are not covered: they need a leader, which the harness never starts.
+approvals on, and end the request with `turn/interrupt` (Codex), `reject` (OpenCode) or the
+deadline's `session/cancel` (Devin, whose session the harness's own `devin acp` child creates),
+never an approval. Grok leader cases are not covered: they need a leader, which the harness never starts.
 
 The Devin tier runs in the user's Devin store, whose hooks may report to herdr; run it with those
 variables unset: `env -u HERDR_ENV -u HERDR_SOCKET_PATH -u HERDR_PANE_ID uv run tests/live.py

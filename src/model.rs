@@ -217,7 +217,8 @@ pub struct Approval {
     pub kind: String,
     pub summary: String,
     /// pending (nobody answered yet), declined (by agent-talk), resolved (answered by
-    /// another client), denied (by the agent CLI's own permission handling).
+    /// another client), denied (by the agent CLI's own permission handling), cancelled
+    /// (unanswered when agent-talk cancelled the turn, which withdrew it).
     pub outcome: ApprovalOutcome,
     pub raw: Value,
 }
@@ -228,6 +229,7 @@ string_enum! {
         Declined = "declined",
         Resolved = "resolved",
         Denied = "denied",
+        Cancelled = "cancelled",
     }
 }
 

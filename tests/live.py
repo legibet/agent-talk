@@ -1340,6 +1340,29 @@ def devin_tier():
         expect(out["turn"]["status"] == "completed", f"the turn went on, got {out['turn']['status']}")
         expect(not probe.exists(), "the command did not run")
 
+    def foreign_approval():
+        # On a session agent-talk did not start the request is left to the user; the deadline's
+        # session/cancel then answers it `cancelled`, as ACP requires, and the command reports it.
+        with DevinAcp(DIR) as d:
+            sid = d.request("session/new", {"cwd": str(DIR), "mcpServers": []})["result"]["sessionId"]
+            track("devin", sid)
+            d.request("session/set_config_option", {"sessionId": sid, "configId": "model", "value": a.model})
+            d.request("session/set_config_option", {"sessionId": sid, "configId": "thought_level", "value": "medium"})
+            prompt = [{"type": "text", "text": "reply with the single word ok"}]
+            expect("result" in d.request("session/prompt", {"sessionId": sid, "prompt": prompt}), "devin acp prompt")
+        probe = DIR / "live-devin-foreign.txt"
+        probe.unlink(missing_ok=True)
+        prompt = "run `touch live-devin-foreign.txt` with your shell tool, then reply with the single word done"
+        out = cli("send", f"devin:{sid}", prompt, "--wait", "--timeout", "25", expect_exit=(0, 3))
+        approvals = err(out).get("approvals") or out.get("approvals")
+        if not approvals:
+            raise Inconclusive("no permission request (the model ran no command, or the user allows touch)")
+        expect(code(out) == "E_TIMEOUT" and err(out)["state"] == "waiting", "E_TIMEOUT, state waiting")
+        expect(approvals[0]["outcome"] == "cancelled", f"the request cancelled, got {approvals[0]['outcome']}")
+        out = cli("wait", f"devin:{sid}", "--receipt", err(out)["receipt"]["receipt_id"], "--timeout", "30")
+        expect(out["turn"]["status"] == "interrupted", f"interrupted, got {out['turn']['status']}")
+        expect(not probe.exists(), "the command did not run")
+
     def locked():
         # While an agent-talk child holds the session another send is E_LOCKED; SIGTERM ends
         # the first command, which cancels its turn.
@@ -1417,6 +1440,7 @@ def devin_tier():
         ("nowait", nowait),
         ("deadline", deadline),
         ("reject", reject),
+        ("foreign-approval", foreign_approval),
         ("locked", locked),
         ("foreign-live", foreign_live),
         ("normal-mode", normal_mode),

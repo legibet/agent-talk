@@ -18,7 +18,8 @@ use tokio::time::Instant;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApprovalPolicy {
     /// Never answer; record the request and report it as pending. Sessions agent-talk did
-    /// not start: the user answers in their own client.
+    /// not start: the user answers in their own client. The one answer is ACP's `cancelled`,
+    /// once agent-talk cancels the turn itself (Grok in direct mode, Devin).
     Observe,
     /// Decline, never accept: Codex answers `decline`, OpenCode `reject` with a message,
     /// Claude gets `--permission-prompts none`, Grok `reject_once`; Antigravity and pi have
@@ -103,8 +104,9 @@ pub fn wait_receipt(store: &Store, handle: &str, receipt_id: &str) -> Result<Rec
 
 /// Settle an observed turn. The receipt is reloaded; when the outcome is unknown
 /// (deadline, Ctrl-C, transport loss) a still-pending receipt becomes `unknown` and the
-/// error reports `progress` (`waiting` while an approval is unanswered). Approvals seen
-/// during the observation travel with the outcome either way.
+/// error reports `progress`, or `waiting` when an approval was unanswered as observation
+/// ended (still pending, or withdrawn by agent-talk's cancel). Approvals seen during the
+/// observation travel with the outcome either way.
 pub fn settle(
     store: &Store,
     handle: String,
@@ -132,9 +134,12 @@ pub fn settle(
         Err(mut e) => {
             e.receipt = e.receipt.or(receipt.map(Box::new));
             if unknown_outcome {
-                let waiting = approvals
-                    .iter()
-                    .any(|a| a.outcome == ApprovalOutcome::Pending);
+                let waiting = approvals.iter().any(|a| {
+                    matches!(
+                        a.outcome,
+                        ApprovalOutcome::Pending | ApprovalOutcome::Cancelled
+                    )
+                });
                 e.state = Some(if waiting { Progress::Waiting } else { progress });
             }
             e.approvals = approvals;
@@ -265,5 +270,42 @@ mod tests {
         s.settle_unaccepted("raced", ReceiptState::Unknown, None)
             .unwrap();
         assert_eq!(state(&s, "raced"), ReceiptState::Accepted);
+    }
+
+    /// A deadline that passed while an approval was unanswered reports `waiting`, also when
+    /// agent-talk's cancel then withdrew the request.
+    #[test]
+    fn unanswered_approval_at_the_deadline_is_waiting() {
+        let s = Store::memory();
+        let approval = |outcome| Approval {
+            handle: "devin:s".into(),
+            turn_id: None,
+            item_id: None,
+            request_id: serde_json::json!(0),
+            kind: "session/request_permission".into(),
+            summary: "touch x".into(),
+            outcome,
+            raw: serde_json::Value::Null,
+        };
+        let progress = |outcome| {
+            let deadline = Error::new(ErrorCode::Timeout, "deadline");
+            let approvals = vec![approval(outcome)];
+            settle(
+                &s,
+                "devin:s".into(),
+                Err(deadline),
+                None,
+                approvals,
+                Progress::Running,
+            )
+            .unwrap_err()
+            .state
+        };
+        assert_eq!(progress(ApprovalOutcome::Pending), Some(Progress::Waiting));
+        assert_eq!(
+            progress(ApprovalOutcome::Cancelled),
+            Some(Progress::Waiting)
+        );
+        assert_eq!(progress(ApprovalOutcome::Declined), Some(Progress::Running));
     }
 }

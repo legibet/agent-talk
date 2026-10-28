@@ -357,6 +357,13 @@ pub fn reject_once(params: &Value) -> Option<Value> {
     Some(json!({"outcome": {"outcome": "selected", "optionId": option}}))
 }
 
+/// The answer to a `session/request_permission` still open once the client sent
+/// `session/cancel`: ACP requires the `cancelled` outcome for every one (prompt turn,
+/// Cancellation). It approves nothing (DESIGN.md §4).
+pub fn cancelled() -> Value {
+    json!({"outcome": {"outcome": "cancelled"}})
+}
+
 /// Held by unit tests that spawn a fake agent, and by the test that drops a listening
 /// socket and expects it refused. macOS has no atomic `SOCK_CLOEXEC`: std creates the
 /// socket and then sets `FD_CLOEXEC`, and a child forked by another test thread in between

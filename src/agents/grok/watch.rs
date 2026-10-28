@@ -43,6 +43,9 @@ pub struct Watch<'s> {
     policy: ApprovalPolicy,
     /// Attached through a leader, where other clients' permission requests arrive too.
     shared: bool,
+    /// agent-talk sent `session/cancel` (direct mode): every permission request of the
+    /// prompt is answered `cancelled`.
+    cancelling: bool,
     /// The prompt the session runs now (`runningPromptId`).
     running_prompt: Option<String>,
     /// Agent text of the prompt since its last tool call.
@@ -113,6 +116,7 @@ impl<'s> Watch<'s> {
             kind,
             policy,
             shared,
+            cancelling: false,
             running_prompt,
             text: String::new(),
             tools: HashSet::new(),
@@ -181,6 +185,26 @@ impl<'s> Watch<'s> {
             *joined = Some(prompt_id);
         }
         Ok(())
+    }
+
+    /// agent-talk sent `session/cancel`: answer each request still pending `cancelled`, as ACP
+    /// requires, and every later one of the prompt too (DESIGN.md §4). Unanswered, Grok
+    /// resolves it itself at the cancel (`interaction_resolved`) without a decision (1.0.70).
+    /// An answer that cannot be written leaves the request pending.
+    pub async fn cancel(&mut self, conn: &Conn) {
+        self.cancelling = true;
+        for a in self
+            .approvals
+            .iter_mut()
+            .filter(|a| a.outcome == ApprovalOutcome::Pending)
+        {
+            if let Err(e) = conn.respond(&a.request_id, acp::cancelled()).await {
+                tracing::warn!("{e}");
+                return;
+            }
+            a.outcome = ApprovalOutcome::Cancelled;
+            record(self.store, a);
+        }
     }
 
     /// Events until the turn ends.
@@ -392,7 +416,8 @@ impl<'s> Watch<'s> {
     /// A permission request: the approval to record and the answer to send before it, if
     /// any; `None` for a request already recorded. Under `deny` the ones for this prompt's
     /// tool calls (matched by `toolCallId`; through a leader, other clients' turns raise
-    /// them too) get the `reject_once` option.
+    /// them too) get the `reject_once` option. Once agent-talk cancelled the turn, the
+    /// prompt's requests get `cancelled`.
     fn on_permission(&self, request_id: Value, params: Value) -> Option<(Approval, Option<Value>)> {
         let call = &params["toolCall"];
         let call_id = call["toolCallId"].as_str().map(String::from);
@@ -407,8 +432,10 @@ impl<'s> Watch<'s> {
         }
         let ours = !self.shared || call_id.as_ref().is_some_and(|c| self.tools.contains(c));
         let answer = match self.policy {
-            ApprovalPolicy::Deny if ours => acp::reject_once(&params),
-            _ => None,
+            _ if !ours => None,
+            _ if self.cancelling => Some(acp::cancelled()),
+            ApprovalPolicy::Deny => acp::reject_once(&params),
+            ApprovalPolicy::Observe => None,
         };
         // As `read` shows the tool call: name and main argument.
         let summary = match updates::tool_name(call) {
@@ -426,10 +453,10 @@ impl<'s> Watch<'s> {
             request_id,
             kind: REQUEST_PERMISSION.into(),
             summary,
-            outcome: if answer.is_some() {
-                ApprovalOutcome::Declined
-            } else {
-                ApprovalOutcome::Pending
+            outcome: match answer {
+                None => ApprovalOutcome::Pending,
+                Some(_) if self.cancelling => ApprovalOutcome::Cancelled,
+                Some(_) => ApprovalOutcome::Declined,
             },
             raw: params,
         };
@@ -795,6 +822,72 @@ mod tests {
         assert!(end.result.is_ok());
         assert_eq!(w.approvals.len(), 1);
         assert_eq!(w.approvals[0].outcome, ApprovalOutcome::Declined);
+        conn.close().await;
+    }
+
+    /// In direct mode, after agent-talk's `session/cancel` the request left pending on the
+    /// user's session is answered `cancelled`, after the cancel, and stays `cancelled` when
+    /// Grok then reports the interaction resolved (1.0.70).
+    #[tokio::test]
+    async fn cancel_answers_the_pending_request_cancelled() {
+        let _children = crate::agents::acp::SPAWN_LOCK.lock().await;
+        let store = store_with_intent("p");
+        let request = format!(
+            r#"{{"jsonrpc":"2.0","id":0,"method":"session/request_permission","params":{}}}"#,
+            PERMISSION.replace("$S", SESSION).replace('\'', "")
+        );
+        let resolved = json!({"jsonrpc": "2.0", "method": "_x.ai/session_notification", "params": {"sessionId": SESSION, "update": {"sessionUpdate": "interaction_resolved", "tool_call_id": "call-f3cb…-0"}}});
+        let expect = |pattern: &str| {
+            format!("read l; case \"$l\" in *'{pattern}'*) ;; *) echo \"$l\" >&2; exit 1;; esac")
+        };
+        // Ends the turn only when the cancel comes first and the request then gets
+        // `cancelled`; anything else ends the connection.
+        let script = [
+            "read l".into(),
+            format!(
+                "echo '{}'",
+                json!({"jsonrpc": "2.0", "id": 1, "result": {}})
+            ),
+            "read l".into(),
+            format!("echo '{request}'"),
+            expect(r#""method":"session/cancel""#),
+            expect(r#""outcome":{"outcome":"cancelled"}"#),
+            format!("echo '{resolved}'"),
+            format!(
+                "echo '{}'",
+                json!({"jsonrpc": "2.0", "id": 2, "result": {"stopReason": "cancelled"}})
+            ),
+            "read l".into(),
+        ]
+        .join("; ");
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.args(["-c", &script]);
+        let mut conn = crate::agents::acp::spawn(cmd, "test agent").await.unwrap();
+        let response = conn.submit("session/prompt", json!({})).await.unwrap();
+        let mut w = Watch::prompt(
+            &store,
+            SESSION,
+            "r",
+            "p",
+            response,
+            ApprovalPolicy::Observe,
+            false,
+        );
+        // The deadline passes while the request waits for the user.
+        let observed =
+            tokio::time::timeout(std::time::Duration::from_millis(200), w.finish(&mut conn)).await;
+        assert!(observed.is_err(), "the turn waits for the request");
+        assert_eq!(w.approvals[0].outcome, ApprovalOutcome::Pending);
+        conn.notify("session/cancel", json!({"sessionId": SESSION}))
+            .await
+            .unwrap();
+        w.cancel(&conn).await;
+        let end = tokio::time::timeout(std::time::Duration::from_secs(10), w.finish(&mut conn))
+            .await
+            .expect("the turn ends once the request got `cancelled`")
+            .unwrap();
+        assert_eq!(end.result.unwrap()["stopReason"], "cancelled");
+        assert_eq!(w.approvals[0].outcome, ApprovalOutcome::Cancelled);
         conn.close().await;
     }
 
