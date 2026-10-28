@@ -968,12 +968,21 @@ def grok_tier():
     shared(a)
 
     def settings():
-        # Effort is stored with the session; full access passes again on every direct-mode load.
+        # A model Grok does not offer is refused before the prompt; the empty session it leaves
+        # is the run's to clean up.
+        before = {p.parent.name for p in GROK_HOME.glob("sessions/*/*/summary.json")}
+        out = cli("new", "grok", "--cwd", str(DIR), "--model", "nonexistent-model", "x", env=a.env, expect_exit=2)
+        for sid in {p.parent.name for p in GROK_HOME.glob("sessions/*/*/summary.json")} - before:
+            track("grok", sid, a.env)
+        expect(code(out) == "E_PRECONDITION", "new --model nonexistent-model: E_PRECONDITION")
+        # Model and effort are stored with the session; full access passes again on every
+        # direct-mode load.
         out = new(a, "reply with the single word one", "--wait")
         h = st["grok_settings"] = out["handle"]
         sid = native(h)
         cli("send", h, "reply with the single word two", "--effort", "low", "--full-access", "--wait", env=a.env)
         summary = json.loads(grok_session_file(sid, "summary.json").read_text())
+        expect(summary.get("current_model_id") == a.model, f"model {a.model}, got {summary.get('current_model_id')}")
         expect(summary.get("reasoning_effort") == "low", f"effort low, got {summary.get('reasoning_effort')}")
         cli("send", h, "reply with the single word three", "--wait", env=a.env)
         yolo = grok_yolo(sid)

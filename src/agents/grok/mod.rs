@@ -28,8 +28,8 @@ use crate::agents::lifecycle::{
     wait_receipt,
 };
 use crate::agents::{
-    Agent, AgentStatus, Check, ListFilter, Operation, SendRequest, StartRequest, Wait, WaitTarget,
-    strip_provenance,
+    Agent, AgentStatus, Check, ListFilter, Operation, SendRequest, Settings, StartRequest, Wait,
+    WaitTarget, strip_provenance,
 };
 use crate::model::{
     self, Error, ErrorCode, Loaded, Model, Observations, Outcome, Page, Progress, ReceiptState,
@@ -93,6 +93,20 @@ async fn set_config(conn: &Conn, id: &str, config: &str, value: &str) -> Result<
     }
 }
 
+/// Set the model, then the effort, of `settings` on the session (DESIGN.md §6.4). The
+/// model goes first: Grok refuses an effort the session's current model does not offer,
+/// and a model change keeps the effort. A value set here stays stored even when the next
+/// one is refused.
+async fn configure(conn: &Conn, id: &str, settings: &Settings) -> Result<()> {
+    if let Some(m) = &settings.model {
+        set_config(conn, id, "model", m).await?;
+    }
+    if let Some(e) = &settings.effort {
+        set_config(conn, id, "reasoning_effort", e).await?;
+    }
+    Ok(())
+}
+
 /// A session as `_x.ai/sessions/list` describes it. `resident` and `activity` describe
 /// the process that answers, so they mean something only through a leader (DESIGN.md
 /// §6.4).
@@ -122,7 +136,6 @@ struct Spawn<'a> {
     leader: bool,
     /// `--leader-socket`, passed only when `GROK_LEADER_SOCKET` is set.
     leader_socket: Option<&'a Path>,
-    model: Option<&'a str>,
 }
 
 impl Spawn<'_> {
@@ -141,9 +154,6 @@ impl Spawn<'_> {
         });
         if let Some(p) = self.leader_socket {
             cmd.arg("--leader-socket").arg(p);
-        }
-        if let Some(m) = self.model {
-            cmd.args(["-m", m]);
         }
         cmd.arg("stdio").current_dir(cwd);
         cmd
@@ -240,11 +250,10 @@ impl<'a> Grok<'a> {
 
     /// A `grok agent` child in `cwd`, initialized: `--leader` (only after `leader()`
     /// found a live socket) or `--no-leader`.
-    async fn connect(&self, cwd: &Path, leader: bool, model: Option<&str>) -> Result<Conn> {
+    async fn connect(&self, cwd: &Path, leader: bool) -> Result<Conn> {
         let opts = Spawn {
             leader,
             leader_socket: self.leader_socket.as_deref(),
-            model,
         };
         acp::spawn(opts.command(cwd), "grok agent").await
     }
@@ -274,7 +283,7 @@ impl<'a> Grok<'a> {
             }
         }
         // The client process needs some cwd; `_x.ai/sessions/list` covers all.
-        let conn = match self.connect(&std::env::temp_dir(), true, None).await {
+        let conn = match self.connect(&std::env::temp_dir(), true).await {
             Ok(conn) => conn,
             Err(e) => {
                 tracing::warn!("leader client: {e}");
@@ -352,7 +361,7 @@ impl<'a> Grok<'a> {
     /// while no other process holds the session.
     async fn route(&self, id: &str, dir: &Path, cwd: &Path) -> Result<(Route, Conn)> {
         if let Some(leader) = self.leader()? {
-            let conn = self.connect(cwd, true, None).await?;
+            let conn = self.connect(cwd, true).await?;
             let resident = self.listed(&conn).await.map(|l| {
                 l.iter()
                     .find(|s| s.session_id == id)
@@ -369,7 +378,7 @@ impl<'a> Grok<'a> {
         }
         let lock = lock(&handle(id), SECOND_WRITER)?;
         self.refuse_live(id, dir)?;
-        let conn = self.connect(cwd, false, None).await?;
+        let conn = self.connect(cwd, false).await?;
         Ok((Route::Direct { _lock: lock }, conn))
     }
 
@@ -551,7 +560,7 @@ impl<'a> Grok<'a> {
                 ),
             ));
         };
-        let mut conn = self.connect(Path::new(cwd), true, None).await?;
+        let mut conn = self.connect(Path::new(cwd), true).await?;
         let res = async {
             let listed = self.listed(&conn).await?;
             match listed.iter().find(|s| s.session_id == id) {
@@ -717,7 +726,7 @@ impl Agent for Grok<'_> {
     async fn models(&self) -> Result<Vec<Model>> {
         // A direct child's `initialize` response lists the account's models with their
         // effort choices; no session is opened (DESIGN.md §6.4).
-        let conn = self.connect(&self.home, false, None).await?;
+        let conn = self.connect(&self.home, false).await?;
         let models = conn.init["_meta"]["modelState"]["availableModels"]
             .as_array()
             .into_iter()
@@ -819,13 +828,7 @@ impl Agent for Grok<'_> {
 
     async fn start(&self, req: &StartRequest<'_>, wait: Wait) -> Result<Outcome> {
         let leader = self.leader()?;
-        let mut conn = self
-            .connect(
-                Path::new(req.cwd),
-                leader.is_some(),
-                req.settings.model.as_deref(),
-            )
-            .await?;
+        let mut conn = self.connect(Path::new(req.cwd), leader.is_some()).await?;
         let res = async {
             let params = with_yolo(
                 json!({"cwd": req.cwd, "mcpServers": []}),
@@ -838,20 +841,19 @@ impl Agent for Grok<'_> {
                     format!("session/new returned no sessionId: {created}"),
                 )
             })?;
-            // Set on the session, not as `--reasoning-effort`, which a leader proxy
-            // ignores (DESIGN.md §6.4). A refusal leaves the new session empty and
-            // unrecorded; agent-talk deletes nothing, so the error names it.
-            if let Some(e) = &req.settings.effort {
-                set_config(&conn, id, "reasoning_effort", e)
-                    .await
-                    .map_err(|mut err| {
-                        let _ = write!(
-                            err.message,
-                            "; the new session {id} has no messages and is not used (`grok sessions delete {id}` removes it)"
-                        );
-                        err
-                    })?;
-            }
+            // Set on the session, not as `grok agent -m` or `--reasoning-effort`: an
+            // unknown `-m` silently runs the default model, and a leader proxy ignores
+            // `--reasoning-effort` (DESIGN.md §6.4). A refusal leaves the new session empty
+            // and unrecorded; agent-talk deletes nothing, so the error names it.
+            configure(&conn, id, req.settings)
+                .await
+                .map_err(|mut err| {
+                    let _ = write!(
+                        err.message,
+                        "; the new session {id} has no messages and is not used (`grok sessions delete {id}` removes it)"
+                    );
+                    err
+                })?;
             let h = handle(id);
             let route = match leader {
                 Some(leader) => Route::Leader(leader),
@@ -916,14 +918,8 @@ impl Agent for Grok<'_> {
             // Model and effort are set on the session, which Grok stores at once for
             // every later load and, in a leader, every attached client (DESIGN.md §6.4).
             // A refusal fails the send before anything is recorded, as in `start`. A
-            // value set here stays stored even if the prompt below, or the second value,
-            // is then refused.
-            if let Some(m) = &req.change.model {
-                set_config(&conn, id, "model", m).await?;
-            }
-            if let Some(e) = &req.change.effort {
-                set_config(&conn, id, "reasoning_effort", e).await?;
-            }
+            // value set here stays stored even if the prompt below is then refused.
+            configure(&conn, id, req.change).await?;
             let receipt_id = uuid::Uuid::new_v4().to_string();
             let prompt_id = uuid::Uuid::new_v4().to_string();
             let intent = NewIntent {

@@ -592,14 +592,17 @@ takes its own lock only in direct mode, since clients of one leader do not exclu
 
 **Turns and sending.**
 
-- `new` is `session/new`, effort and name set on the session, then `session/prompt` with the
-  client's `_meta.promptId`, which Grok persists as `turn_completed.prompt_id`: the turn id.
-- Model and effort are set with `session/set_config_option` (a leader proxy ignores `grok agent
-  --reasoning-effort`; 1.0.46). Grok writes the value to `summary.json` at once, and every later
-  load, by any process or client, runs with it, so later sends pass neither again; through a
-  leader a change applies to the next prompt of every attached client. A refused value fails with
-  `E_PRECONDITION` before anything is recorded; on `new` the empty session stays on disk and the
-  error names it.
+- `new` is `session/new`, model, effort and name set on the session, then `session/prompt` with
+  the client's `_meta.promptId`, which Grok persists as `turn_completed.prompt_id`: the turn id.
+- Model and effort are set with `session/set_config_option`, never as `grok agent -m` or
+  `--reasoning-effort`: an unknown `-m` silently runs the default model, and a leader proxy
+  ignores `--reasoning-effort` (1.0.70). Grok refuses a model it does not list and an effort the
+  session's current model does not offer (`-32602`), so the model goes first. A model change keeps
+  the effort; a model without efforts drops it, and the next model starts at its default. Grok
+  writes the value to `summary.json` at once, and every later load, by any process or client,
+  runs with it, so later sends pass neither again; through a leader a change applies to the next
+  prompt of every attached client. A refused value fails with `E_PRECONDITION` before anything is
+  recorded; on `new` the empty session stays on disk and the error names it.
 - Queue: `session/load` plus `session/prompt`, through a leader only when its list shows the
   session `resident` (a listed but dormant session may be held in-process by a TUI). The list's
   `activity` and `resident` describe the answering process, so they mean something only through a
@@ -974,7 +977,9 @@ Devin inherited, unless pinned with `--from` or `--caller` (§8).
 - Grok: a turn that continues in a leader after the sending command stopped observing waits for
   another client to answer a permission request it raises. A steer receipt whose outcome is
   unknown and that names no turn is not refused by `wait --receipt`: it polls the session to
-  the deadline. `reject_once`, an unanswered request
+  the deadline. A model change through a model without efforts resets Grok's effort to the next
+  model's default while agent-talk's stored effort keeps the old value, so a send asking for that
+  value again sees no change and passes nothing. `reject_once`, an unanswered request
   and the `session/cancel` at the deadline rest on captured frames, not re-verified. Unverified:
   whether a TUI renders live a turn another leader client ran; leader behaviour with a grok.com
   subscription login (it may open a relay).
