@@ -365,7 +365,7 @@ intent is recorded.
   the window as an empty history.
 - `thread/resume` on a loaded thread rejoins without replaying earlier notifications, except
   pending server requests. An idle thread unloads `thread_unload_delay_secs` after its last
-  subscriber leaves (60 s up to 0.162, 30 minutes on 0.163 and 0.164); a connected subscriber
+  subscriber leaves (60 s up to 0.162, 30 minutes on 0.163 to 0.165); a connected subscriber
   holds it loaded; a running thread keeps running and drains its queue with nobody subscribed.
 - `thread/list` returns only interactive sources unless source kinds are named (`ls --all` adds
   sub-agent and unknown kinds). It has one row per rollout file, so a thread resumed into a new
@@ -995,8 +995,7 @@ Devin inherited, unless pinned with `--from` or `--caller` (§8).
   method unavailable only when the daemon reports it missing. Unverified: how a terminal TUI
   renders a decline from agent-talk; `send` changing the model (effort and full access were
   exercised). The unload delay follows the daemon's `thread_unload_delay_secs` default, 30
-  minutes on 0.163 and 0.164; the live `foreign-writer` check waits 180 s for an unload and
-  fails on those versions.
+  minutes on 0.163 to 0.165.
 - Claude: `control_request` approvals would need an answerer (`--permission-prompt-tool stdio`);
   agent-talk relies on the agent's own denial. Unverified: whether `CLAUDE_CODE_SESSION_ID`
   reaches a globally registered MCP server the same way, and whether attribution through a TUI's

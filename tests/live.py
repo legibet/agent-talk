@@ -620,6 +620,21 @@ def codex_turn_context(thread_id: str, turn_id: str) -> dict:
     raise Fail(f"no turn_context for turn {turn_id} in the rollout of {thread_id}")
 
 
+def codex_thread(d: CodexDaemon, **params) -> str:
+    """A thread the run starts over the daemon, as a client other than agent-talk would, with a
+    first turn: a thread without a turn has no rollout and cannot be resumed."""
+    resp = d.call("thread/start", {"cwd": str(DIR), "model": CODEX_MODEL, **params})
+    expect("error" not in resp, "thread/start over the daemon")
+    tid = resp["result"]["thread"]["id"]
+    track("codex", tid)
+    first = [{"type": "text", "text": "reply with the single word ok", "text_elements": []}]
+    expect("error" not in d.call("turn/start", {"threadId": tid, "input": first}), "turn/start")
+    end = time.monotonic() + 120
+    while not any(m.get("method") == "turn/completed" for m in d.seen) and time.monotonic() < end:
+        d.drain(1)
+    return tid
+
+
 def codex_tier():
     a = AGENTS["codex"]
     shared(a)
@@ -686,17 +701,7 @@ def codex_tier():
         # A thread agent-talk did not start, with approvals on: its approval request is left
         # pending, on send and on wait.
         with CodexDaemon() as d:
-            params = {"cwd": str(DIR), "model": a.model, "approvalPolicy": "on-request", "sandbox": "read-only"}
-            resp = d.call("thread/start", {**params, "approvalsReviewer": "user"})
-            expect("error" not in resp, "thread/start over the daemon")
-            tid = resp["result"]["thread"]["id"]
-            track("codex", tid)
-            # A thread without a turn cannot be resumed; give it one.
-            first = [{"type": "text", "text": "reply with the single word ok", "text_elements": []}]
-            expect("error" not in d.call("turn/start", {"threadId": tid, "input": first}), "turn/start")
-            end = time.monotonic() + 120
-            while not any(m.get("method") == "turn/completed" for m in d.seen) and time.monotonic() < end:
-                d.drain(1)
+            tid = codex_thread(d, approvalPolicy="on-request", approvalsReviewer="user", sandbox="read-only")
             prompt = (
                 "run `echo approval-test` with your shell tool using sandbox_permissions=require_escalated and "
                 "justification='agent-talk live check', then reply done. If the request is declined, reply declined."
@@ -717,34 +722,15 @@ def codex_tier():
             expect(not resolved, "nobody answered it")
             d.call("turn/interrupt", {"threadId": tid, "turnId": requests[0]["params"]["turnId"]})
 
-    def ls_pages():
-        need("codex")
-        args = ("ls", "--agent", "codex", "--cwd", str(DIR), "--limit", "2")
-        p1 = cli(*args)
-        cursor = p1["next_cursors"].get("codex")
-        expect(cursor, "the first page has a cursor")
-        p2 = cli(*args, "--cursor", cursor)
-        h1, h2 = {s["handle"] for s in p1["sessions"]}, {s["handle"] for s in p2["sessions"]}
-        expect(h2 and not h1 & h2, f"pages are disjoint: {h1} / {h2}")
-
-    for name, fn in (
-        ("busy", busy),
-        ("dormant", dormant),
-        ("settings", settings),
-        ("foreign-approval", foreign_approval),
-        ("ls-pages", ls_pages),
-    ):
-        check("codex", name, fn)
-
-
-def codex_unloaded():
-    """Run last: thread A unloads about 60 s after its last subscriber left. Another app-server
-    process that holds it makes send refuse before recording anything; once that process is gone,
-    send resumes the unloaded thread."""
-
     def foreign_writer():
-        h = need("codex")
-        wait_for(lambda: ls_row("codex", h)["observations"]["loaded"] == "no", 180, "thread unloaded", step=10)
+        # Another app-server process that holds a thread makes send refuse before recording
+        # anything; once that process is gone, send resumes the thread. That process can resume
+        # only a thread the daemon unloaded: this one unloads 5 s after its last subscriber
+        # left, not after the daemon's default (30 minutes on codex 0.163 to 0.165).
+        with CodexDaemon() as d:
+            tid = codex_thread(d, approvalPolicy="never", config={"thread_unload_delay_secs": 5})
+        h = f"codex:{tid}"
+        wait_for(lambda: ls_row("codex", h)["observations"]["loaded"] == "no", 60, "thread unloaded", step=2)
         # `codex` may be a launcher whose child is the server: kill the process group.
         proc = st["codex_proc"] = subprocess.Popen(
             ["codex", "app-server"],
@@ -766,7 +752,7 @@ def codex_unloaded():
         call(1, "initialize", {"clientInfo": Mcp.CLIENT, "capabilities": {"experimentalApi": True}})
         proc.stdin.write(json.dumps({"method": "initialized", "params": {}}) + "\n")
         proc.stdin.flush()
-        resp = call(2, "thread/resume", {"threadId": native(h), "excludeTurns": True})
+        resp = call(2, "thread/resume", {"threadId": tid, "excludeTurns": True})
         expect("error" not in resp, "a standalone app-server resumed the thread")
         out = cli("send", h, "x", expect_exit=2)
         expect(code(out) == "E_FOREIGN_LIVE", "E_FOREIGN_LIVE")
@@ -777,7 +763,25 @@ def codex_unloaded():
         out = cli("wait", h, "--receipt", r["receipt_id"], "--timeout", "120")
         expect(out["turn"]["status"] == "completed" and "plum" in final(out), "send resumes the thread ~ plum")
 
-    check("codex", "foreign-writer", foreign_writer)
+    def ls_pages():
+        need("codex")
+        args = ("ls", "--agent", "codex", "--cwd", str(DIR), "--limit", "2")
+        p1 = cli(*args)
+        cursor = p1["next_cursors"].get("codex")
+        expect(cursor, "the first page has a cursor")
+        p2 = cli(*args, "--cursor", cursor)
+        h1, h2 = {s["handle"] for s in p1["sessions"]}, {s["handle"] for s in p2["sessions"]}
+        expect(h2 and not h1 & h2, f"pages are disjoint: {h1} / {h2}")
+
+    for name, fn in (
+        ("busy", busy),
+        ("dormant", dormant),
+        ("settings", settings),
+        ("foreign-approval", foreign_approval),
+        ("foreign-writer", foreign_writer),
+        ("ls-pages", ls_pages),
+    ):
+        check("codex", name, fn)
 
 
 # ---------------------------------------------------------------- claude
@@ -1575,8 +1579,6 @@ def main():
     try:
         for tier in run:
             TIERS[tier]()
-        if "codex" in run:  # last, so that the thread has unloaded meanwhile
-            codex_unloaded()
     finally:
         stop_helpers()
         if keep:
