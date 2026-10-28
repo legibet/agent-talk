@@ -237,7 +237,7 @@ impl<'a> Pi<'a> {
             self.runs
                 .deliver(&mut child, message.delivered.as_bytes())
                 .await?;
-            let Some(status) = tail(&mut child, &log, deadline.is_none(), |l| {
+            let Some(status) = tail(&mut child, &log, deadline, |l| {
                 watch.on_line(self.store, &self.sessions, l)
             })
             .await?

@@ -58,17 +58,18 @@ pub fn cut(
     records: usize,
     older: bool,
 ) -> Result<Cut> {
-    let end = match before {
+    // The cursor's position in `messages`, the end when there is none.
+    let cursor = match before {
         Some(c) => messages
             .iter()
             .position(|(_, m)| m.item_id == c)
             .ok_or_else(|| Error::new(ErrorCode::Precondition, format!("unknown cursor {c}")))?,
         None => messages.len(),
     };
-    let cursor_record = messages.get(end).map_or(records, |(i, _)| *i);
+    let cursor_record = messages.get(cursor).map_or(records, |(i, _)| *i);
     let mut shown: Vec<_> = messages
         .into_iter()
-        .take(end)
+        .take(cursor)
         .filter(|(_, m)| q.shows(m))
         .collect();
     let page = shown.split_off(shown.len().saturating_sub(q.limit));

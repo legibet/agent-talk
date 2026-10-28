@@ -9,6 +9,7 @@ use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
+use tokio::time::Instant;
 
 /// The environment variables naming the session an agent-talk command runs in, with
 /// the agent each one belongs to, in the order the CLI derives its sender from them (DESIGN.md §4).
@@ -217,15 +218,16 @@ impl Runs {
 
 /// Feed each line of a child's run log (its stdout, redirected to `log`) to `on_line` as it
 /// is written; `on_line` says whether the child has taken the message (Claude, Antigravity
-/// and pi runs). Returns the exit status once the process exits, or `None` as soon as the
-/// message is taken when `until_accepted`: the run then goes on without this command,
-/// tracked by its pid (DESIGN.md §3).
+/// and pi runs). Returns the exit status once the process exits, or, when the command has no
+/// `deadline`, `None` as soon as the message is taken: the run then goes on without this
+/// command, tracked by its pid (DESIGN.md §3). The caller bounds the tail by the deadline.
 pub async fn tail(
     child: &mut Child,
     log: &Path,
-    until_accepted: bool,
+    deadline: Option<Instant>,
     mut on_line: impl FnMut(&str) -> Result<bool>,
 ) -> Result<Option<ExitStatus>> {
+    let until_accepted = deadline.is_none();
     let file = tokio::fs::File::open(log)
         .await
         .map_err(|e| Error::transport(log.display(), e))?;

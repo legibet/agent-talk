@@ -476,7 +476,7 @@ impl<'a> Claude<'a> {
             self.runs
                 .deliver(&mut child, format!("{line}\n").as_bytes())
                 .await?;
-            let Some(status) = tail(&mut child, &log, deadline.is_none(), |l| {
+            let Some(status) = tail(&mut child, &log, deadline, |l| {
                 watch.on_event(self.store, l)
             })
             .await?
