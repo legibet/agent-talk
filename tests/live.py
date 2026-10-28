@@ -974,6 +974,9 @@ def grok_yolo(session_id: str) -> list:
 def grok_tier():
     a = AGENTS["grok"]
     GROK_HOME.mkdir(exist_ok=True)
+    # Without a rule Grok resolves requests itself; this makes `touch`, which only
+    # foreign-approval runs, ask every time.
+    (GROK_HOME / "config.toml").write_text('[permission]\nask = ["Bash(touch *)"]\n')
     shared(a)
 
     def settings():
@@ -1033,7 +1036,40 @@ def grok_tier():
         out = cli("wait", h, "--receipt", r["receipt_id"], "--timeout", "10", env=a.env)
         expect(out["turn"]["status"] == "completed", f"completed, got {out['turn']['status']}")
 
-    for name, fn in (("settings", settings), ("foreign-tui", foreign_tui), ("kept", kept)):
+    def foreign_approval():
+        # On a session agent-talk did not start (here one `grok -p` made) the request is left to
+        # the user; the deadline's session/cancel then answers it `cancelled`, as ACP requires.
+        p = subprocess.run(
+            ["grok", "-p", "reply with the single word ok", "-m", a.model, "--output-format", "json"],
+            cwd=DIR,
+            env=env_with(a.env),
+            capture_output=True,
+            text=True,
+            timeout=CMD_TIMEOUT,
+        )
+        LAST.update(cmd="grok -p", exit=p.returncode, out={"stdout": p.stdout[-1000:], "stderr": p.stderr[-500:]})
+        expect(p.returncode == 0, "grok -p")
+        sid = json.loads(p.stdout)["sessionId"]
+        track("grok", sid, a.env)
+        probe = DIR / "live-grok-foreign.txt"
+        probe.unlink(missing_ok=True)
+        prompt = "run `touch live-grok-foreign.txt` with your shell tool, then reply with the single word done"
+        out = cli("send", f"grok:{sid}", prompt, "--wait", "--timeout", "25", env=a.env, expect_exit=(0, 3))
+        approvals = err(out).get("approvals") or out.get("approvals")
+        if not approvals:
+            raise Inconclusive("no permission request (the model ran no command)")
+        expect(code(out) == "E_TIMEOUT" and err(out)["state"] == "waiting", "E_TIMEOUT, state waiting")
+        expect(approvals[0]["outcome"] == "cancelled", f"the request cancelled, got {approvals[0]['outcome']}")
+        out = cli("wait", f"grok:{sid}", "--receipt", err(out)["receipt"]["receipt_id"], "--timeout", "30", env=a.env)
+        expect(out["turn"]["status"] == "interrupted", f"interrupted, got {out['turn']['status']}")
+        expect(not probe.exists(), "the command did not run")
+
+    for name, fn in (
+        ("settings", settings),
+        ("foreign-tui", foreign_tui),
+        ("kept", kept),
+        ("foreign-approval", foreign_approval),
+    ):
         check("grok", name, fn)
 
 

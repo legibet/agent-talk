@@ -12,7 +12,7 @@ Every agent runs the same three checks, `start`, `converse` and `recover`, drive
 covers behaviour of agent-talk that can break, through the CLI or MCP, and passes or fails the
 same way on any machine with the agent installed and logged in: no dependence on the user's
 permission rules, sandbox or other configuration. Grok runs in a `GROK_HOME` of its own for that
-reason; prompts that must outlast a deadline count numbers instead of calling tools, except on
+reason, with an `ask` rule for `touch` in its `config.toml`; prompts that must outlast a deadline count numbers instead of calling tools, except on
 Codex, where `sleep` runs under any sandbox.
 
 Every tier but `offline` makes real model calls, so name the tiers you need: the one for the
@@ -27,8 +27,8 @@ The script builds `target/release/agent-talk` first and runs a tier only when `a
 reports `new` and `send` available for its agent; otherwise it prints `SKIP <agent>: <reason>`.
 Approval checks on sessions agent-talk did not start create those sessions themselves, with
 approvals on, and end the request with `turn/interrupt` (Codex), `reject` (OpenCode) or the
-deadline's `session/cancel` (Devin, whose session the harness's own `devin acp` child creates),
-never an approval. Grok leader cases are not covered: they need a leader, which the harness never starts.
+deadline's `session/cancel` (Devin, whose session the harness's own `devin acp` child creates;
+Grok, whose session `grok -p` creates in the tier's `GROK_HOME`), never an approval. Grok leader cases are not covered: they need a leader, which the harness never starts.
 
 The Devin tier runs in the user's Devin store, whose hooks may report to herdr; run it with those
 variables unset: `env -u HERDR_ENV -u HERDR_SOCKET_PATH -u HERDR_PANE_ID uv run tests/live.py

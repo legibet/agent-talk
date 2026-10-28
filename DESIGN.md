@@ -1025,9 +1025,8 @@ Devin inherited, unless pinned with `--from` or `--caller` (§8).
 - Grok: a turn that continues in a leader after the sending command stopped observing waits for
   another client to answer a permission request it raises. A steer receipt whose outcome is
   unknown and that names no turn is not refused by `wait --receipt`: it polls the session to
-  the deadline. `reject_once` rests on frames captured on 1.0.46, not re-verified. The cancel of a
-  direct-mode turn with a pending request was verified on 1.0.70 with an `ask` rule; the live
-  tier, which has no such rule, does not cover it. Unverified: whether a TUI renders live a turn
+  the deadline. `reject_once` rests on frames captured on 1.0.46, not re-verified; the live tier
+  covers only the `cancelled` answer at the deadline. Unverified: whether a TUI renders live a turn
   another leader client ran; leader behaviour with a grok.com subscription login (it may open a
   relay).
 - pi: a session open in a TUI cannot be detected, so `send` to it branches the conversation:
