@@ -321,8 +321,8 @@ E_FOREIGN_LIVE  held by a process agent-talk cannot talk to (Claude TUI, Grok TU
                 a Devin session another process holds)
 E_NO_STEER      agent cannot steer (Claude, Antigravity, pi, Devin, Grok without a live leader)
 E_MAX_HOPS      hop depth exceeded
-E_TIMEOUT       deadline passed; outcome unknown, receipt retained
-E_INTERRUPTED   Ctrl-C or SIGTERM while observing; outcome unknown, receipt retained
+E_TIMEOUT       deadline passed before the turn ended; outcome unknown until wait reports it
+E_INTERRUPTED   Ctrl-C or SIGTERM while observing; outcome unknown until wait reports it
 E_TRANSPORT     connection failed or dropped, or a live service unreachable (sandbox); outcome
                 unknown if an intent was sent
 E_UNSUPPORTED   option or method absent in this agent, or a Devin session in a permission mode

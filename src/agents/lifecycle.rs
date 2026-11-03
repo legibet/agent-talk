@@ -194,11 +194,11 @@ pub async fn bounded<T>(
         r = fut => r,
         () = until => Err(Error::new(
             ErrorCode::Timeout,
-            "deadline passed before the turn completed; outcome unknown, receipt retained",
+            "deadline passed before the turn ended; wait can still report the outcome",
         )),
         () = interrupted() => Err(Error::new(
             ErrorCode::Interrupted,
-            "interrupted; outcome unknown, receipt retained",
+            "interrupted before the turn ended; wait can still report the outcome",
         )),
     }
 }
