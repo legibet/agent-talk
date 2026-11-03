@@ -17,7 +17,6 @@ CREATE TABLE IF NOT EXISTS intents (
     text          TEXT NOT NULL,
     "from"        TEXT,                       -- JSON model::Caller
     depth         INTEGER NOT NULL DEFAULT 0, -- hop depth, see Store::hop_depth
-    delivered_text TEXT,                      -- what reached the agent, when not `text`
     created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 CREATE TABLE IF NOT EXISTS receipts (
@@ -97,16 +96,13 @@ impl Store {
         Store::init(Connection::open_in_memory().unwrap()).unwrap()
     }
 
-    /// Persist an intent and its pending receipt. Called before anything is sent. The
-    /// delivered text is kept only when the agent got something other than the caller's
-    /// text (the provenance header).
+    /// Persist an intent and its pending receipt. Called before anything is sent.
     pub fn insert_intent(&self, i: &NewIntent<'_>) -> Result<()> {
         let m = i.message;
         let tx = self.db.unchecked_transaction()?;
         tx.execute(
-            r#"INSERT INTO intents (receipt_id, handle, client_msg_id, text, "from", depth,
-                                    delivered_text)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"#,
+            r#"INSERT INTO intents (receipt_id, handle, client_msg_id, text, "from", depth)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6)"#,
             params![
                 i.receipt_id,
                 i.handle,
@@ -114,7 +110,6 @@ impl Store {
                 m.text,
                 serde_json::to_string(m.from).expect("serializable"),
                 m.depth,
-                (m.delivered != m.text).then_some(m.delivered)
             ],
         )?;
         tx.execute(
@@ -171,7 +166,7 @@ impl Store {
             .db
             .query_row(
                 "SELECT i.receipt_id, i.handle, i.client_msg_id, r.state, r.queue_id, r.turn_id,
-                        r.item_id, r.agent_error, i.delivered_text
+                        r.item_id, r.agent_error
                  FROM intents i JOIN receipts r USING (receipt_id) WHERE i.receipt_id = ?1",
                 params![receipt_id],
                 |row| {
@@ -185,7 +180,6 @@ impl Store {
                         turn_id: row.get(5)?,
                         item_id: row.get(6)?,
                         agent_error: agent_error.and_then(|v| serde_json::from_str(&v).ok()),
-                        delivered_text: row.get(8)?,
                     })
                 },
             )

@@ -202,9 +202,6 @@ pub struct Receipt {
     pub turn_id: Option<String>,
     pub item_id: Option<String>,
     pub agent_error: Option<AgentError>,
-    /// The text the agent received, when it differs from the caller's (provenance header).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub delivered_text: Option<String>,
 }
 
 /// A permission or input request raised by a session, and what happened to it.

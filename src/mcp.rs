@@ -32,12 +32,22 @@ use tokio_util::task::TaskTracker;
 const INSTRUCTIONS: &str = "Tools for sending messages to sessions of other agents on this \
 machine and reading their replies. The agents are codex (Codex), claude (Claude Code), opencode \
 (OpenCode), grok (Grok CLI), antigravity (Antigravity CLI), pi and devin (Devin CLI). A session \
-is identified by a handle, <agent>:<id>, which new and ls return. A turn can take minutes. If new \
-or send times out or loses its connection, the message may already have been delivered. \
-Resending can duplicate it. When the error includes a receipt, use its receipt_id with wait to \
-check the outcome. Without a receipt, use ls to locate the session and read to inspect its history. \
-A successful tool call can return a failed or interrupted turn. turn.status reports the \
-outcome, and approvals records permission requests and denials.";
+is identified by a handle, <agent>:<id>, which new and ls return.
+
+A turn can take minutes, and new or send with wait=true holds the call until it ends. When a \
+turn may outlast the client's tool-call time limit, call new or send with wait=false, which \
+returns the handle and receipt once the message is accepted, then call wait with the receipt. A \
+client may move a long call to the background and deliver its result when it returns; keep one \
+wait running per receipt.
+
+If new or send times out or loses its connection, the message may already have been delivered, \
+and resending can duplicate it. When the error includes a receipt, use its receipt_id with wait \
+to check the outcome. Without a receipt, use ls to locate the session and read to inspect its \
+history.
+
+A successful tool call can return a failed or interrupted turn: turn.status reports the outcome, \
+and approvals records permission requests and denials. A completed turn can have final_text \
+null when a declined or denied action stopped the agent.";
 
 #[derive(Clone)]
 pub struct Server {
@@ -56,6 +66,7 @@ pub struct Server {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ModelsParams {
     /// `codex`, `claude`, `opencode`, `grok`, `antigravity`, `pi` or `devin`.
     agent: String,
@@ -68,6 +79,7 @@ struct ModelsParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct LsParams {
     /// Filter by agent: `codex`, `claude`, `opencode`, `grok`, `antigravity`, `pi` or `devin`. Lists all agents when omitted.
     agent: Option<String>,
@@ -80,6 +92,7 @@ struct LsParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct NewParams {
     /// `codex`, `claude`, `opencode`, `grok`, `antigravity`, `pi` or `devin`.
     agent: String,
@@ -117,6 +130,7 @@ fn wait_for(wait: Option<bool>, timeout_s: Option<u64>) -> (Wait, oneshot::Recei
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct SendParams {
     /// Session handle from ls or new.
     handle: String,
@@ -137,6 +151,7 @@ struct SendParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ReadParams {
     /// Session handle.
     handle: String,
@@ -149,10 +164,11 @@ struct ReadParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct WaitParams {
     /// Session handle.
     handle: String,
-    /// The turn ID. Mutually exclusive with receipt.
+    /// The turn_id of a returned turn or of a message from read. Mutually exclusive with receipt.
     turn: Option<String>,
     /// The receipt_id returned by new or send. Mutually exclusive with turn.
     receipt: Option<String>,
@@ -411,13 +427,17 @@ impl Server {
         title = "Wait for turn",
         output_schema = schema_for_type::<Outcome>(),
         annotations(read_only_hint = true, open_world_hint = false),
-        description = "Retrieve the result of a turn, waiting if it is still running or queued. Provide exactly one of receipt or turn, together with the session handle. Returns the turn with its reply in turn.final_text. A turn that has already ended returns immediately. After E_TIMEOUT, call wait again with the same arguments to continue observing."
+        description = "Retrieve the result of a turn, waiting if it is still running or queued. Identify the turn by exactly one of receipt (the receipt_id from new or send) or turn (a turn_id), together with the session handle. Returns the turn with its reply in turn.final_text. A turn that has already ended returns immediately. After E_TIMEOUT, call wait again with the same arguments to continue observing."
     )]
     async fn wait(&self, Parameters(p): Parameters<WaitParams>) -> CallToolResult {
         let target = match (p.turn, p.receipt) {
             (Some(t), None) => WaitTarget::Turn(t),
             (None, Some(r)) => WaitTarget::Receipt(r),
-            _ => return invalid("pass exactly one of turn or receipt"),
+            _ => {
+                return invalid(
+                    "pass exactly one of receipt (the receipt_id from new or send) or turn (a turn_id from a returned turn or read)",
+                );
+            }
         };
         let args = WaitArgs {
             handle: p.handle,

@@ -88,7 +88,8 @@ each command as a separate background job and keep `--wait` to include the reply
 Exit code 0 can still accompany a failed turn. The turn status reports `completed`, `failed`,
 `interrupted` or `unknown`; a reply from an unfinished or failed turn may be partial. Each
 `approval declined`, `approval denied` or `approval cancelled` line identifies an action that did
-not run. On OpenCode, one reply can cover several queued messages; `read` shows the conversation
+not run. When such an action stopped the agent, the turn can report `completed` with no reply.
+On OpenCode, one reply can cover several queued messages; `read` shows the conversation
 containing them.
 
 Exit code 3 means a timeout or an interrupt (Ctrl-C, or SIGTERM when a background job is

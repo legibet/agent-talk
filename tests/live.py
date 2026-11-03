@@ -420,7 +420,6 @@ def converse(a: Agent):
     pin = caller if a.caller_var == "AGENT_TALK_CALLER" else native(caller)
     out = cli("send", h, "reply with the single word kiwi", "--wait", env={**a.env, a.caller_var: pin})
     expect(out["from"].get("session") == caller, f"from.session == {caller}")
-    expect((out["receipt"].get("delivered_text") or "").startswith(header), "delivered_text carries the header")
     expect(out["turn"]["status"] == "completed" and "kiwi" in final(out), "completed ~ kiwi")
     turn = out["turn"]["turn_id"]
     msgs = cli("read", h, "--limit", "2", env=a.env)["messages"]

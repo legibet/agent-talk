@@ -71,10 +71,7 @@ impl SettingsOpts {
 
 #[derive(Args)]
 struct WaitOpts {
-    /// Wait for the reply and print the finished turn; the reply is its final_text (on
-    /// OpenCode the reply of the run that took the message, which may also cover other
-    /// queued messages; read shows them). Without it the command returns once the agent
-    /// took the message, except on Grok and Devin, which run the whole turn either way.
+    /// Wait for the turn to end and print it; the reply is its final_text.
     #[arg(long)]
     wait: bool,
     /// Seconds to wait with --wait.
@@ -147,9 +144,7 @@ enum Cmd {
         #[command(flatten)]
         sender: SenderOpts,
     },
-    /// Send a message to a session; returns once it is accepted, or with --wait once the
-    /// reply is in. --model, --effort and --full-access change the session's settings
-    /// from this message on, only on sessions agent-talk started.
+    /// Send a message to a session; prints a receipt, or with --wait the finished turn.
     Send {
         /// Session handle from ls or new.
         handle: String,

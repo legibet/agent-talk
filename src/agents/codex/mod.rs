@@ -12,7 +12,7 @@ use self::protocol::{
 };
 use self::transport::{Conn, Event, ServerRequest, decode};
 use crate::agents::child::{agent_cmd, cli_version};
-use crate::agents::history::{ReadPage, ReadQuery, RemoteHistory};
+use crate::agents::history::{ReadPage, ReadQuery, RemoteHistory, first_line};
 use crate::agents::lifecycle::{
     ApprovalPolicy, approval_policy, bounded, record, reject, resolve, settle, wait_receipt,
 };
@@ -739,7 +739,7 @@ impl Agent for Codex<'_> {
                 preview: t
                     .preview
                     .as_deref()
-                    .map(|p| strip_provenance(p).to_string()),
+                    .map(|p| first_line(strip_provenance(p), 200)),
                 observations: Observations {
                     history: History::Visible,
                     loaded: if loaded.contains(&t.id) {

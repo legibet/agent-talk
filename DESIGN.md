@@ -133,7 +133,7 @@ session  { handle, agent, id, cwd?, name?, preview?, observations, state: idle|r
 turn     { handle, turn_id, status: completed|failed|interrupted|unknown, final_text?, error?, duration_ms?, basis? }
 message  { turn_id, item_id, role: user|assistant, phase: prompt|final|commentary|other, text, from?, timestamp? }
 approval { handle, turn_id?, item_id?, request_id, kind, summary, outcome: pending|declined|resolved|denied|cancelled, raw }
-receipt  { receipt_id, handle, client_msg_id, state, queue_id?, turn_id?, item_id?, agent_error?, delivered_text? }
+receipt  { receipt_id, handle, client_msg_id, state, queue_id?, turn_id?, item_id?, agent_error? }
 caller   { kind: agent|unknown|runtime, session?, turn? }
 outcome  { handle, receipt?, turn?, approvals[], from? }            result of new / send / wait
 sessions { sessions[], next_cursors{agent: cursor?}, errors[] }     result of ls
@@ -206,8 +206,8 @@ A message from another agent is answered in the receiving turn's final response,
 sender gets through `send --wait`, `wait` or `read`. An agent sender's message is delivered with
 the first line `[from <handle> via agent-talk; answer in your final response]`, so the receiving
 model, and a person watching the session, sees who is talking and where the answer goes. The
-intent keeps the original text and records the delivered one. All of this is attribution, not
-authenticated identity.
+intent keeps the caller's text and sender, from which the header follows. All of this is
+attribution, not authenticated identity.
 
 Each intent records its sender and a hop depth: for an agent sender, one more than the depth of
 the intent that started the caller's current turn (or of the newest non-rejected intent
@@ -296,8 +296,9 @@ agent-talk mcp [--caller H]
   from the agent each time. Claude Code has no listing interface; its rows are the aliases and
   effort levels `claude --help` names, the one model list agent-talk carries itself.
 - `new --name N` stores a title at the agent (Antigravity has no interface for it and refuses).
-  `ls` shows `name` and strips the provenance header from `preview`, so a session an agent
-  created is recognizable without reading its history.
+  `ls` shows `name`, and as `preview` the first line of the first prompt without the
+  provenance header, cut to 200 characters, so a session an agent created is recognizable
+  without reading its history.
 - `read` returns the newest N messages, oldest first, and `next_cursor` names the page of older
   ones. By default a page holds `prompt` and `final` messages, the conversation itself; `--all`
   adds `commentary` and `other`, each tool call being one `other` message (`[tool name] status
