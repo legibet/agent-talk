@@ -1,4 +1,4 @@
-//! pi adapter (DESIGN.md §6.6).
+//! pi adapter (docs/agents/pi.md).
 //!
 //! Each mutation runs one `pi --mode json` process (`new` with `--session-id`, `send` with
 //! `--session <file>`), writes the prompt to its stdin and closes it. The process's stdout
@@ -9,9 +9,9 @@
 //! learned when pi reports the message taken. History, turn boundaries and listings come
 //! from the session files under pi's agent dir.
 //!
-//! pi has no permission prompts (tools run with the process's rights) and no marker of a
-//! live process, so there are no approvals to record and a session open in a TUI cannot be
-//! told from an idle one (DESIGN.md §8).
+//! pi has no permission prompts and no marker of a live process, so there are no approvals
+//! to record and a session open in a TUI cannot be told from an idle one
+//! (docs/agents/pi.md#writers-and-liveness).
 
 mod run;
 mod session;
@@ -35,10 +35,10 @@ use std::process::ExitStatus;
 use std::time::{Duration, SystemTime};
 use tokio::time::Instant;
 
-/// Why agent-talk refuses a second writer of its own (DESIGN.md §6.6).
+/// Why agent-talk refuses a second writer of its own (docs/agents/pi.md#writers-and-liveness).
 const SECOND_WRITER: &str = "a second pi process appending to the session file would branch the conversation, and the next load follows only the newest branch";
 
-/// pi's thinking levels (`pi --help`), what `--effort` takes on a reasoning model.
+/// pi's thinking levels (`pi --help`, pi 1.0.3), what `--effort` takes on a reasoning model.
 const EFFORTS: [&str; 7] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 pub struct Pi<'a> {
@@ -69,7 +69,7 @@ struct RunWatch {
 
 impl RunWatch {
     /// Apply one run-log line: accept the receipt when pi reports the user message taken,
-    /// with the entry id the session file gives it. Whether pi has taken the message.
+    /// with the entry id the session file gives it. Returns whether pi has taken the message.
     fn on_line(&mut self, store: &Store, sessions: &Path, line: &str) -> Result<bool> {
         let unaccepted = self.run.user.is_none();
         self.run.apply(line);
@@ -125,7 +125,8 @@ impl<'a> Pi<'a> {
     }
 
     /// Refuse while pi is configured to keep its sessions in a flat custom directory, which
-    /// agent-talk does not read (DESIGN.md §8). Checked by every pi operation but `models`.
+    /// agent-talk does not read (docs/agents/pi.md#sessions-and-history). Checked by every pi
+    /// operation but `models`; a `--session-dir` given to another pi process is not visible.
     fn check_layout(&self) -> Result<()> {
         let custom = match std::env::var("PI_CODING_AGENT_SESSION_DIR") {
             Ok(d) if !d.is_empty() => Some(format!("PI_CODING_AGENT_SESSION_DIR={d}")),
@@ -148,7 +149,7 @@ impl<'a> Pi<'a> {
     }
 
     /// A run pi left before taking the message: the receipt is rejected with pi's stderr as
-    /// the reason (DESIGN.md §3).
+    /// the reason (docs/architecture.md#adapters).
     fn reject_startup(&self, receipt_id: &str, status: Option<ExitStatus>) -> Error {
         let e = self.runs.startup_error(receipt_id, status);
         reject_unstarted(
@@ -165,7 +166,8 @@ impl<'a> Pi<'a> {
     }
 
     /// Refuse while a pi process agent-talk started still runs the session. pi has no lock
-    /// and no liveness marker, so a foreign process cannot be detected (DESIGN.md §8).
+    /// and no liveness marker, so a foreign process cannot be detected
+    /// (docs/agents/pi.md#writers-and-liveness).
     fn refuse_own_live(&self, id: &str) -> Result<()> {
         let h = handle(id);
         match self.own_run(&self.store.processes(&h)?) {
@@ -233,7 +235,7 @@ impl<'a> Pi<'a> {
         };
         let work = async {
             // pi reads piped stdin to EOF as the prompt, which keeps `@file` and option
-            // parsing away from the text (DESIGN.md §6.6).
+            // parsing away from the text (docs/agents/pi.md#interface).
             self.runs
                 .deliver(&mut child, message.delivered.as_bytes())
                 .await?;
@@ -266,8 +268,9 @@ impl<'a> Pi<'a> {
     }
 
     /// The turn of a run that took the message and exited without `agent_settled` (killed,
-    /// crashed): what the session file holds of it, else how the process exited (DESIGN.md
-    /// §6.6). `status` is `None` when this command did not see the exit.
+    /// crashed): what the session file holds of it, else how the process exited
+    /// (docs/agents/pi.md#sending-and-turn-end). `status` is `None` when this command did not
+    /// see the exit.
     fn exited_run(
         &self,
         h: &str,
@@ -527,8 +530,9 @@ impl Agent for Pi<'_> {
                 ));
             }
         };
-        // pi restores the model from the session file, so only a change passes it; the
-        // thinking level is not restored and comes from the session's settings.
+        // pi restores the model from the session file, so only a change passes it; it
+        // restores only the thinking level the session was created with, so the effort of a
+        // session agent-talk started is passed on every run (docs/agents/pi.md#settings).
         let effort = req.settings.and_then(|s| s.effort.as_deref());
         let args = run::args(
             ["--session", &path.display().to_string()],

@@ -1,9 +1,9 @@
-//! What one command observes of its prompt on the `devin acp` connection (DESIGN.md §6.7):
-//! its acceptance (the `user_message_chunk` echoing agent-talk's client message id), the
-//! agent text, the tool calls, the permission requests, and the end of the turn. The
-//! authority for the end is the `session/prompt` response (DESIGN.md §7). Devin's session
-//! lock keeps every other process out while the child runs, so every event on the
-//! connection belongs to this prompt.
+//! What one command observes of its prompt on the `devin acp` connection
+//! (docs/agents/devin.md#sending-and-turn-end): its acceptance (the `user_message_chunk`
+//! echoing agent-talk's client message id), the agent text, the tool calls, the permission
+//! requests, and the end of the turn, whose authority is the `session/prompt` response
+//! (docs/architecture.md#adapters). Devin's session lock keeps every other process out while
+//! the child runs, so every event on the connection belongs to this prompt.
 
 use super::handle;
 use crate::agents::acp::{self, Conn, Event, Response};
@@ -96,9 +96,10 @@ impl<'s> Watch<'s> {
     }
 
     /// agent-talk sent `session/cancel`: answer each request still pending `cancelled`, as ACP
-    /// requires, and every later one too (DESIGN.md §4). Devin reads a `cancelled` answer
-    /// that comes before the cancel as a skip and lets the model go on (3000.11.228), so
-    /// this follows the cancel. An answer that cannot be written leaves the request pending.
+    /// requires, and every later one too (docs/behaviour.md#approvals). Devin reads a
+    /// `cancelled` answer that comes before the cancel as a skip and lets the model go on, so
+    /// this follows the cancel (docs/agents/devin.md#approvals). An answer that cannot be
+    /// written leaves the request pending.
     pub async fn cancel(&mut self, conn: &Conn) {
         self.cancelling = true;
         for a in self
@@ -176,7 +177,8 @@ impl<'s> Watch<'s> {
             Event::Request(r) if r.method == REQUEST_PERMISSION => {
                 if let Some((mut a, answer)) = self.on_permission(r.id, r.params) {
                     // Declined only once the answer is written; one that could not be
-                    // written leaves the request pending, recorded as such (DESIGN.md §4).
+                    // written leaves the request pending, recorded as such
+                    // (docs/behaviour.md#approvals).
                     let sent = match answer {
                         Some(answer) => conn.respond(&a.request_id, answer).await,
                         None => Ok(()),
@@ -293,7 +295,8 @@ mod tests {
     use crate::store::NewIntent;
     use serde_json::json;
 
-    // Frames in the shape Devin 3000.11.92 sends them (.agents/findings/devin.md §5, §8).
+    // Frames in the shape Devin 3000.11.92 sends them (.agents/findings/devin.md, "Sending
+    // and turn end" and "Approvals").
 
     const SESSION: &str = "swanky-towel";
     const CLIENT: &str = "7f0c3c9e-2f4b-4a43-9a43-2b1f1c0d9a11";
@@ -383,7 +386,7 @@ mod tests {
         conn.close().await;
     }
 
-    // As 3000.11.228 sends it: no `title` or `rawInput` (findings §12).
+    // As 3000.11.228 sends it: no `title` or `rawInput` (findings, "Approvals").
     const PERMISSION: &str = r#"{"jsonrpc":"2.0","id":"5b1f0c52-0d55-4d8e-a0f3-4b1d9e7f5a10","method":"session/request_permission","params":{"sessionId":"swanky-towel","toolCall":{"toolCallId":"exec:1#9f","_meta":{"cognition.ai/editableCommand":"touch probe.txt","cognition.ai/permissionRule":"Exec(touch)"}},"options":[{"optionId":"allow_once","kind":"allow_once","name":"Allow once"},{"optionId":"allow_session","kind":"allow_always","name":"Allow for this session"},{"optionId":"switch_bypass","kind":"allow_always","name":"Switch to bypass"},{"optionId":"reject_once","kind":"reject_once","name":"Reject"}]}}"#;
 
     /// `deny` answers `reject_once` and the turn goes on to its end; `observe` leaves the

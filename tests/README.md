@@ -3,7 +3,7 @@
 `tests/live.py` runs the release `agent-talk` against the real agents and checks agent-talk's own
 end-to-end behaviour: receipts and their recovery, turn correlation, queue and steer, refusals,
 foreign holders, approvals, settings, paging and MCP. Facts about the agents themselves belong
-in the findings, and the parsing rules in the unit tests (`cargo test`).
+in `docs/agents/`, and the parsing rules in the unit tests (`cargo test`).
 
     uv run tests/live.py (offline|codex|claude|opencode|grok|antigravity|pi|devin ... | all) [--keep]
 

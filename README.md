@@ -74,7 +74,7 @@ a session it did not start, approval requests are left to the user; only when ag
 a Grok or Devin turn, at its deadline or on an interrupt, does it answer them `cancelled`, as ACP
 requires.
 `agent-talk status` prints what the installed CLIs and running daemons support, and
-[DESIGN.md](DESIGN.md) describes how each agent is handled.
+[docs/agents/](docs/agents/) describes how each agent is handled.
 
 The exit code is one of:
 

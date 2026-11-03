@@ -266,7 +266,7 @@ fn main() -> ExitCode {
     }
 }
 
-/// Sender of a CLI mutation (DESIGN.md §4).
+/// Sender of a CLI mutation (docs/behaviour.md#provenance-and-hops).
 fn cli_caller(explicit: Option<&str>) -> model::Result<Caller> {
     if let Some(h) = explicit
         .map(String::from)

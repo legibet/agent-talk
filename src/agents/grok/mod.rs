@@ -1,13 +1,10 @@
-//! Grok CLI adapter (DESIGN.md §6.4).
+//! Grok CLI adapter (docs/agents/grok.md).
 //!
-//! Every mutation runs one `grok agent … stdio` child speaking ACP. When the leader
-//! socket (`$GROK_LEADER_SOCKET`, default `<GROK_HOME>/leader.sock`) answers a connect,
-//! the child is `grok agent --leader stdio`, a proxy into the user's shared leader,
-//! where sessions behave like Codex threads in the daemon; otherwise it is `grok agent
-//! --no-leader stdio`, an in-process agent that holds the session only while the
-//! command runs (closing its stdin ends it within about two seconds, and a running
-//! turn dies with it). `--leader` is never passed without a live socket: it spawns a
-//! persistent leader when none listens.
+//! Every mutation runs one `grok agent … stdio` child speaking ACP: `--leader`, a proxy
+//! into the user's shared leader, when the leader socket answers a connect, else
+//! `--no-leader`, an in-process agent that holds the session only while the command runs.
+//! `--leader` is never passed without a live socket, since it spawns a persistent leader
+//! when none listens (docs/agents/grok.md#interface).
 //!
 //! agent-talk's `promptId` (the intent's client message id) becomes the persisted
 //! `turn_completed.prompt_id`, so it is the turn id. History, turn ends after the
@@ -44,7 +41,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::time::Instant;
 
-/// Why agent-talk refuses a second writer (DESIGN.md §6.4).
+/// Why agent-talk refuses a second writer (docs/agents/grok.md#writers-and-liveness).
 const SECOND_WRITER: &str = "Grok has no lock between processes: a second writer marks the running turn interrupted and the two processes' memories of the session diverge";
 /// How long a command whose deadline passed keeps the direct-mode child to end the
 /// turn cleanly (wait for it to start, `session/cancel`, wait for its response).
@@ -73,7 +70,8 @@ fn check_id(id: &str) -> Result<()> {
 }
 
 /// `params` with `_meta.yoloMode: true` when the session gets full access: on `session/new`
-/// and on a direct-mode `session/load`, for this process's session only (DESIGN.md §6.4).
+/// and on a direct-mode `session/load`, for this process's session only
+/// (docs/agents/grok.md#settings).
 fn with_yolo(mut params: Value, full_access: bool) -> Value {
     if full_access {
         params["_meta"] = json!({"yoloMode": true});
@@ -82,7 +80,7 @@ fn with_yolo(mut params: Value, full_access: bool) -> Value {
 }
 
 /// `session/set_config_option`: `config` (`model`, `reasoning_effort`) of the session,
-/// which Grok stores in `summary.json` at once (DESIGN.md §6.4). Returns the session's effort
+/// which Grok stores at once (docs/agents/grok.md#settings). Returns the session's effort
 /// after the change as Grok reports it, `None` when its model has no efforts.
 async fn set_config(conn: &Conn, id: &str, config: &str, value: &str) -> Result<Option<String>> {
     let params = json!({"sessionId": id, "configId": config, "value": value});
@@ -99,9 +97,9 @@ async fn set_config(conn: &Conn, id: &str, config: &str, value: &str) -> Result<
     }
 }
 
-/// Set the model, then the effort, of `settings` on the session (DESIGN.md §6.4). The
-/// model goes first: Grok refuses an effort the session's current model does not offer,
-/// and a model change keeps the effort. A value set here stays stored even when the next
+/// Set the model, then the effort, of `settings` on the session: Grok refuses an effort the
+/// current model does not offer, and a model change keeps the effort
+/// (docs/agents/grok.md#settings). A value set here stays stored even when the next
 /// one is refused. Returns the session's effort as Grok reports it after the last value set
 /// (`None` when nothing was set).
 async fn configure(conn: &Conn, id: &str, settings: &Settings) -> Result<Option<String>> {
@@ -116,8 +114,8 @@ async fn configure(conn: &Conn, id: &str, settings: &Settings) -> Result<Option<
 }
 
 /// A session as `_x.ai/sessions/list` describes it. `resident` and `activity` describe
-/// the process that answers, so they mean something only through a leader (DESIGN.md
-/// §6.4).
+/// the process that answers, so they mean something only through a leader
+/// (docs/agents/grok.md#writers-and-liveness).
 struct Listed {
     session_id: String,
     resident: bool,
@@ -151,9 +149,8 @@ impl Spawn<'_> {
     /// child as by agent-talk.
     fn command(&self, cwd: &Path) -> tokio::process::Command {
         let mut cmd = agent_cmd("grok");
-        // `grok agent` has no --no-auto-update (only `grok agent leader` does); the
-        // binary's GROK_DISABLE_AUTOUPDATER is set instead (its effect on a stdio agent
-        // was not observed; grok 1.0.46).
+        // `grok agent` has no --no-auto-update (only `grok agent leader` does), so the
+        // environment switch instead (docs/agents/grok.md#interface).
         cmd.env("GROK_DISABLE_AUTOUPDATER", "1").arg("agent");
         cmd.arg(if self.leader {
             "--leader"
@@ -174,7 +171,7 @@ struct Leader {
     pid: Option<u32>,
 }
 
-/// How this command reaches a session (DESIGN.md §6.4).
+/// How this command reaches a session (docs/agents/grok.md#interface).
 enum Route {
     /// Through the live leader, which holds the session; clients of one leader do not
     /// exclude each other.
@@ -215,8 +212,8 @@ impl<'a> Grok<'a> {
 
     /// Connect to the leader socket. Only a missing socket, a refused connection (a
     /// stale socket file, e.g. after the leader died) or a path too long for a Unix
-    /// socket (macOS: 104 bytes; Grok cannot listen there either, DESIGN.md §6.4)
-    /// means "no leader".
+    /// socket (macOS: 104 bytes; Grok cannot listen there either, grok 1.0.46) means
+    /// "no leader" (docs/agents/grok.md#interface).
     fn leader(&self) -> Result<Option<Leader>> {
         let pid = self.leader_pid();
         let socket = self.socket();
@@ -450,9 +447,11 @@ impl<'a> Grok<'a> {
             policy,
             shared,
         );
-        // The turn needs this connection until it ends (DESIGN.md §6.4), so without a
-        // deadline it is still observed to its end, and no turn is reported; only a signal
-        // ends it early. A keeper (the MCP server) gets the outcome at acceptance.
+        // Without a deadline the turn is still observed to its end, on both routes, and no
+        // turn is reported; only a signal ends it early. A direct-mode turn needs this
+        // connection until it ends, and through a leader only an observing command declines
+        // the requests of sessions agent-talk started (docs/agents/grok.md#sending-and-turn-end).
+        // A keeper (the MCP server) gets the outcome at acceptance.
         let deadline = wait.deadline();
         let observe = async {
             if let Wait::Accepted(Some(keeper)) = wait {
@@ -507,7 +506,7 @@ impl<'a> Grok<'a> {
                 note.as_deref(),
             )),
             // A refusal of the prompt itself; an error after acceptance is a failed turn,
-            // except a lost connection, whose outcome is unknown (DESIGN.md §4).
+            // except a lost connection, whose outcome is unknown (docs/behaviour.md#receipts).
             Err(e) if !w.accepted() => Err(reject(self.store, intent.receipt_id, e)),
             Err(e) if e.code == ErrorCode::Transport => Err(e),
             Err(e) => Ok(model::Turn {
@@ -719,8 +718,9 @@ impl<'a> Grok<'a> {
 /// The deadline or a signal ended observation of a direct-mode prompt. The child dies
 /// with this command and would take the turn down mid-step; end it Grok's way instead,
 /// so updates.jsonl records turn_completed (stop_reason cancelled), and answer the
-/// permission requests still open `cancelled`, as ACP requires after a cancel (DESIGN.md
-/// §4). A cancel sent before the prompt runs is ignored, hence the wait for it to start.
+/// permission requests still open `cancelled`, as ACP requires after a cancel
+/// (docs/behaviour.md#approvals). A cancel sent before the prompt runs is ignored, hence
+/// the wait for it to start (docs/agents/grok.md#sending-and-turn-end).
 async fn wind_down(w: &mut Watch<'_>, conn: &mut Conn, id: &str) {
     let ended = tokio::time::timeout(WIND_DOWN, w.until_running(conn)).await;
     if !matches!(ended, Ok(Ok(true))) {
@@ -735,7 +735,7 @@ async fn wind_down(w: &mut Watch<'_>, conn: &mut Conn, id: &str) {
 impl Agent for Grok<'_> {
     async fn models(&self) -> Result<Vec<Model>> {
         // A direct child's `initialize` response lists the account's models with their
-        // effort choices; no session is opened (DESIGN.md §6.4).
+        // effort choices; no session is opened (docs/agents/grok.md#interface).
         let conn = self.connect(&self.home, false).await?;
         let models = conn.init["_meta"]["modelState"]["availableModels"]
             .as_array()
@@ -754,8 +754,8 @@ impl Agent for Grok<'_> {
                 })
             })
             .collect();
-        // Dropping kills the child: a clean exit takes about 4 s and there is nothing to
-        // flush.
+        // Dropping kills the child: a clean exit takes about 4 s (grok 1.0.46) and there is
+        // nothing to flush.
         drop(conn);
         Ok(models)
     }
@@ -853,8 +853,8 @@ impl Agent for Grok<'_> {
             })?;
             // Set on the session, not as `grok agent -m` or `--reasoning-effort`: an
             // unknown `-m` silently runs the default model, and a leader proxy ignores
-            // `--reasoning-effort` (DESIGN.md §6.4). A refusal leaves the new session empty
-            // and unrecorded; agent-talk deletes nothing, so the error names it.
+            // `--reasoning-effort` (docs/agents/grok.md#settings). A refusal leaves the new
+            // session empty and unrecorded; agent-talk deletes nothing, so the error names it.
             configure(&conn, id, req.settings)
                 .await
                 .map_err(|mut err| {
@@ -913,25 +913,25 @@ impl Agent for Grok<'_> {
         let res = async {
             let direct = matches!(route, Route::Direct { .. });
             // yoloMode only in direct mode: on a session resident in a leader it has no
-            // effect (`yolo` stayed unchanged for every client after such a load; grok
-            // 1.0.46).
+            // effect (docs/agents/grok.md#settings).
             if !direct && req.change.full_access {
                 return Err(Error::new(
                     ErrorCode::Unsupported,
                     format!(
-                        "full access cannot be given to {h} while it is resident in the Grok leader (DESIGN.md §6.4); send without --full-access"
+                        "full access cannot be given to {h} while it is resident in the Grok leader; send without --full-access"
                     ),
                 ));
             }
             let yolo = direct && req.settings.is_some_and(|s| s.full_access);
             self.session_load(&mut conn, id, &cwd, yolo).await?;
             // Model and effort are set on the session, which Grok stores at once for
-            // every later load and, in a leader, every attached client (DESIGN.md §6.4).
-            // A refusal fails the send before anything is recorded, as in `start`. A
-            // value set here stays stored even if the prompt below is then refused.
+            // every later load and, in a leader, every attached client. A refusal fails the
+            // send before anything is recorded, as in `start`. A value set here stays
+            // stored even if the prompt below is then refused (docs/behaviour.md#settings).
             let effort = configure(&conn, id, req.change).await?;
             // After a model without efforts the next model starts at its default effort, so
-            // a model change stores the effort Grok reports, or none (DESIGN.md §6.4).
+            // a model change stores the effort Grok reports, or none
+            // (docs/agents/grok.md#settings).
             if req.change.model.is_some()
                 && let Some(s) = req.settings
                 && s.effort != effort

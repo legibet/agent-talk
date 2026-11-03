@@ -6,8 +6,8 @@
 
 Runs the release `agent-talk` binary against the installed agents and checks agent-talk's own
 end-to-end behaviour: receipts and their recovery, turn correlation, queue and steer, refusals,
-foreign holders, approvals, settings, paging, MCP. Facts about the agents themselves live in the
-findings, not here.
+foreign holders, approvals, settings, paging, MCP. Facts about the agents themselves live in
+docs/agents/, not here.
 
     uv run tests/live.py (offline|codex|claude|opencode|grok|antigravity|pi|devin ... | all) [--keep]
 

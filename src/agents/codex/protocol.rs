@@ -289,7 +289,8 @@ pub struct Incoming {
 // ---- errors ----
 
 /// Classify a Codex error. `-32600` is reused for several unrelated conditions
-/// (not initialized, missing capability, stale or idle steer), so the message decides.
+/// (not initialized, missing capability, stale or idle steer, the writer lock), so the
+/// message decides.
 pub fn classify_error(e: &AgentError) -> ErrorCode {
     if e.message.contains("requires experimentalApi") {
         ErrorCode::CapMissing
@@ -302,12 +303,10 @@ pub fn classify_error(e: &AgentError) -> ErrorCode {
     }
 }
 
-/// History of a thread created moments ago is not readable yet. Two transient shapes:
-/// `-32603 "… rollout at <path> is empty"` (`thread/resume`, `thread/turns/list`) while
-/// the rollout file has no line, and `-32601 "list_turns is not supported yet"` from
-/// `thread/turns/list` while the thread has no row in the daemon's state DB (its
-/// paginated reads check that row first). Other -32603s are thread-store failures and
-/// other -32601s are really unsupported methods.
+/// History of a thread created moments ago is not readable yet: `-32603 "… rollout at
+/// <path> is empty"` or `-32601 "list_turns is not supported yet"`
+/// (docs/agents/codex.md#sessions-and-history). Other -32603s are thread-store failures
+/// and other -32601s are really unsupported methods.
 pub fn history_not_ready(e: &Error) -> bool {
     e.agent_error.as_ref().is_some_and(|v| {
         (v.code == -32603 && v.message.ends_with(" is empty"))
@@ -316,7 +315,8 @@ pub fn history_not_ready(e: &Error) -> bool {
 }
 
 /// `thread/queue/start` found nothing dormant to start: the submission already started
-/// (`queued submission not found: <id>`) or waits behind an active turn (DESIGN.md §6.1).
+/// (`queued submission not found: <id>`) or waits behind an active turn
+/// (docs/agents/codex.md#sending-and-turn-end).
 pub fn nothing_dormant(e: &Error) -> bool {
     e.agent_error.as_ref().is_some_and(|v| {
         v.code == -32600
@@ -326,9 +326,9 @@ pub fn nothing_dormant(e: &Error) -> bool {
 }
 
 /// `thread/resume` refused because another app-server process holds the thread's
-/// cross-process writer lock (`~/.codex/thread-writer-locks/<id>.lock`): `-32600 "thread
-/// <id> already has an active writer"`. Becomes `E_FOREIGN_LIVE`; the Codex error stays
-/// attached. Every other error passes through unchanged.
+/// cross-process writer lock (`~/.codex/thread-writer-locks/<id>.lock` on 0.160.0;
+/// docs/agents/codex.md#writers-and-liveness). Becomes `E_FOREIGN_LIVE`; the Codex error
+/// stays attached. Every other error passes through unchanged.
 pub fn resume_error(e: Error) -> Error {
     let held = e
         .agent_error
@@ -347,9 +347,10 @@ pub fn resume_error(e: Error) -> Error {
     }
 }
 
-/// The deny answer for a server request: a schema-valid refusal that
-/// lets the turn continue (never `accept`, never `cancel`). `None` for requests
-/// that are not approvals; those are never answered.
+/// The deny answer for a server request: a schema-valid refusal that lets the turn
+/// continue (never `accept`; never `cancel`, which interrupts it;
+/// docs/agents/codex.md#approvals). `None` for requests that are not approvals; those are
+/// never answered.
 pub fn deny_response(method: &str) -> Option<Value> {
     Some(match method {
         "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
@@ -499,7 +500,8 @@ mod tests {
     /// codes with other messages are real failures.
     #[test]
     fn history_not_ready_errors() {
-        // The shape recorded in DESIGN.md §6.1; the text before "rollout at" was not kept.
+        // The shape in docs/agents/codex.md#sessions-and-history; the text before
+        // "rollout at" was not kept.
         let empty = r#"{"error":{"code":-32603,"message":"failed to load thread: rollout at /Users/me/.codex/sessions/2026/10/03/rollout-2026-10-03T06-38-37-01a101c5-fcb5-77c1-804d-5c1bd9358f1f.jsonl is empty"},"id":4}"#;
         let no_row =
             r#"{"error":{"code":-32601,"message":"list_turns is not supported yet"},"id":4}"#;

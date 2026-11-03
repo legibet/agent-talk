@@ -69,7 +69,7 @@ macro_rules! string_enum {
 }
 
 string_enum! {
-    /// Stable error codes (DESIGN.md §5).
+    /// Stable error codes (docs/behaviour.md#errors).
     pub enum ErrorCode {
         NoDaemon = "E_NO_DAEMON",
         CapMissing = "E_CAP_MISSING",
@@ -79,7 +79,7 @@ string_enum! {
         NoSteer = "E_NO_STEER",
         MaxHops = "E_MAX_HOPS",
         Timeout = "E_TIMEOUT",
-        /// Ctrl-C during an observation; outcome unknown like a timeout.
+        /// Ctrl-C or SIGTERM during an observation; outcome unknown like a timeout.
         Interrupted = "E_INTERRUPTED",
         Transport = "E_TRANSPORT",
         Unsupported = "E_UNSUPPORTED",
@@ -88,7 +88,7 @@ string_enum! {
 
 impl ErrorCode {
     /// The outcome of a submission is unknown: the deadline passed, Ctrl-C or SIGTERM
-    /// ended observation, or the transport was lost (DESIGN.md §4).
+    /// ended observation, or the transport was lost (docs/behaviour.md#receipts).
     pub fn is_unknown_outcome(self) -> bool {
         matches!(self, Self::Timeout | Self::Interrupted | Self::Transport)
     }
@@ -302,7 +302,8 @@ pub struct Turn {
 
 /// Who sent a message. Attribution, not authenticated identity.
 // Configured or derived: `--caller`, `--from`, `AGENT_TALK_CALLER`, the MCP call's `_meta`
-// (Codex, OpenCode, Antigravity), the agents' session variables (DESIGN.md §4).
+// (Codex, OpenCode, Antigravity), the agents' session variables
+// (docs/behaviour.md#provenance-and-hops).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Caller {
     pub kind: CallerKind,

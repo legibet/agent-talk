@@ -12,7 +12,8 @@ use tokio::process::{Child, Command};
 use tokio::time::Instant;
 
 /// The environment variables naming the session an agent-talk command runs in, with
-/// the agent each one belongs to, in the order the CLI derives its sender from them (DESIGN.md §4).
+/// the agent each one belongs to, in the order the CLI derives its sender from them
+/// (docs/behaviour.md#provenance-and-hops).
 pub const SESSION_VARS: [(&str, &str); 6] = [
     ("CODEX_THREAD_ID", "codex"),
     ("OPENCODE_SESSION_ID", "opencode"),
@@ -70,9 +71,10 @@ pub fn pid_alive(pid: u32) -> bool {
 }
 
 /// Non-blocking exclusive OS lock on a session, held for the duration of the command so
-/// two agent-talk commands never write to one session at once (DESIGN.md §3): the file
-/// `~/.agent-talk/locks/<agent>-<id>`, opened with O_CLOEXEC so an agent child does
-/// not inherit it (a run that outlives the command is tracked by pid). `why` says what a
+/// two agent-talk commands never write to one session at once
+/// (docs/architecture.md#local-state): the file `~/.agent-talk/locks/<agent>-<id>`, opened
+/// with O_CLOEXEC so an agent child does not inherit it (a run that outlives the command is
+/// tracked by pid). `why` says what a
 /// second writer would break.
 pub fn lock(handle: &str, why: &str) -> Result<File> {
     let dir = std::env::home_dir()
@@ -102,7 +104,7 @@ pub fn lock(handle: &str, why: &str) -> Result<File> {
 /// The children of an agent CLI that runs one child per mutation (Claude, Antigravity, pi).
 /// Each child writes its stdout to the run log `~/.agent-talk/<agent>-runs/<receipt>.ndjson`,
 /// which the command tails and later commands read to recover the receipt, and its stderr
-/// to `<receipt>.stderr` next to it (DESIGN.md §3).
+/// to `<receipt>.stderr` next to it (docs/architecture.md#local-state).
 pub struct Runs {
     program: &'static str,
     /// `~/.agent-talk/<agent>-runs`
@@ -147,7 +149,7 @@ impl Runs {
         let mut stdin = child.stdin.take().expect("stdin is piped");
         match stdin.write_all(message).await {
             // The child exited without reading its stdin (a refused `--model`); `tail`
-            // then sees how, and the receipt is rejected (DESIGN.md §3).
+            // then sees how, and the receipt is rejected (docs/architecture.md#adapters).
             Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
             r => r.map_err(|e| {
                 Error::transport(format!("write the message to {}", self.program), e)
@@ -160,7 +162,8 @@ impl Runs {
 
     /// The turn of a run whose process ended without its end event (`result`,
     /// `agent_settled`): `failed` when the exit status says so, else `unknown`, since the
-    /// agent's files may still hold a reply (DESIGN.md §6.5).
+    /// agent's files may still hold a reply (Claude, Antigravity, pi; for pi only once its
+    /// session file does not end the turn, docs/agents/pi.md#sending-and-turn-end).
     pub fn exited_turn(
         &self,
         handle: String,
@@ -220,7 +223,8 @@ impl Runs {
 /// is written; `on_line` says whether the child has taken the message (Claude, Antigravity
 /// and pi runs). Returns the exit status once the process exits, or, when the command has no
 /// `deadline`, `None` as soon as the message is taken: the run then goes on without this
-/// command, tracked by its pid (DESIGN.md §3). The caller bounds the tail by the deadline.
+/// command, tracked by its pid (docs/architecture.md#local-state). The caller bounds the tail
+/// by the deadline.
 pub async fn tail(
     child: &mut Child,
     log: &Path,

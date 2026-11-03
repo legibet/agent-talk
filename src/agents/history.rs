@@ -1,12 +1,12 @@
-//! Paging a session's history for `read` (DESIGN.md §5): the query, the page, and how a
-//! page is cut out of an agent's records.
+//! Paging a session's history for `read` (docs/behaviour.md#reading-and-waiting): the query,
+//! the page, and how a page is cut out of an agent's records.
 
 use crate::model::{Error, ErrorCode, Message, Page, Phase, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// What `read` returns: the newest `limit` messages, or the newest before the page a
-/// previous read's `next_cursor` names (DESIGN.md §5).
+/// previous read's `next_cursor` names.
 pub struct ReadQuery {
     pub limit: usize,
     /// The cursor a previous read returned: an item id, or a `Boundary` for Codex and

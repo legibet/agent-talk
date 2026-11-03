@@ -1,17 +1,16 @@
 //! Claude Code adapter.
 //!
 //! Each mutation runs one `claude -p --input-format stream-json` process (`new` with
-//! `--session-id`, `send` with `--resume`) and writes one user line carrying the
-//! agent-talk's uuid, which becomes the transcript `user.uuid` and so the turn id. The
-//! process's stdout goes to a run log, `~/.agent-talk/claude-runs/<receipt>.ndjson`,
-//! which this command tails; the process keeps running when the command stops observing
-//! (deadline, Ctrl-C, or the message taken without one), and its pid is recorded so later
-//! commands know the run is still alive. History, turn boundaries and listings come from
-//! the transcripts under `~/.claude/projects` and from `claude agents --json --all`.
+//! `--session-id`, `send` with `--resume`) and writes one user line carrying agent-talk's
+//! uuid, which becomes the transcript `user.uuid` and so the turn id. The process's stdout
+//! goes to a run log, `~/.agent-talk/claude-runs/<receipt>.ndjson`, which this command
+//! tails; the process keeps running when the command stops observing (deadline, Ctrl-C, or
+//! the message taken without one), and its pid is recorded so later commands know the run
+//! is still alive. History, turn boundaries and listings come from the transcripts under
+//! `~/.claude/projects` and from `claude agents --json --all`. See docs/agents/claude-code.md.
 //!
-//! Approvals: agent-talk never passes `--permission-prompt-tool stdio`, so claude never
-//! asks the host (`control_request`); it denies on its own and the denials are surfaced.
-//! An answerer for that stdio prompt protocol is an open item (DESIGN.md §8).
+//! Approvals: without `--permission-prompt-tool stdio` claude never asks the host; it
+//! denies on its own, and the denials are recorded (docs/agents/claude-code.md#approvals).
 
 mod process;
 mod stream;
@@ -42,12 +41,12 @@ use std::time::{Duration, UNIX_EPOCH};
 use tokio::process::Command;
 use tokio::time::Instant;
 
-/// Why agent-talk refuses a second writer (DESIGN.md §6.2).
+/// Why agent-talk refuses a second writer (docs/agents/claude-code.md#writers-and-liveness).
 const SECOND_WRITER: &str = "a concurrent --resume would fork the transcript and silently drop one branch of the conversation";
 
 /// Claude Code has no listing interface; `--model` takes an alias for the latest model of a
-/// family (`claude --help`, plus `haiku`, accepted on 2.1.291) and `--effort` one of these
-/// levels. The one model list agent-talk carries itself (DESIGN.md §5).
+/// family (`claude --help`, plus `haiku`) and `--effort` one of these levels. The one model
+/// list agent-talk carries itself (docs/agents/claude-code.md#interface).
 const MODELS: [&str; 4] = ["fable", "opus", "sonnet", "haiku"];
 const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 
@@ -464,8 +463,8 @@ impl<'a> Claude<'a> {
         if let Some(pid) = child.id() {
             self.store.insert_process(&watch.receipt_id, &h, pid)?;
         }
-        // claude 2.1.288 honors the input uuid as the transcript user.uuid, so the turn
-        // id is known before the run.
+        // The input uuid becomes the transcript user.uuid: the turn id, known before the
+        // run (docs/agents/claude-code.md#sessions-and-history).
         let line = json!({
             "type": "user",
             "uuid": watch.turn_id,
@@ -505,7 +504,8 @@ impl<'a> Claude<'a> {
 
     /// The turn `turn_id` of a run of session `id` that ended: its `result` event, or how the
     /// process exited without one (`status` is `None` when this command did not see the
-    /// exit). A run that never took the message rejects the receipt (DESIGN.md §3).
+    /// exit). A run that never took the message rejects the receipt
+    /// (docs/architecture.md#adapters).
     fn finished(
         &self,
         id: &str,
@@ -527,8 +527,8 @@ impl<'a> Claude<'a> {
         })
     }
 
-    /// The turn `turn_id` of session `id` as its transcript shows it (DESIGN.md §6.2): ended,
-    /// or what it is still waiting for.
+    /// The turn `turn_id` of session `id` as its transcript shows it
+    /// (docs/agents/claude-code.md#sending-and-turn-end): ended, or what it is still waiting for.
     async fn turn_in_transcript(
         &self,
         id: &str,
@@ -693,9 +693,8 @@ impl Agent for Claude<'_> {
         let path = self.require_transcript(id)?;
         let _lock = lock(&h, SECOND_WRITER)?;
         self.refuse_live(id).await?;
-        // Resuming from another directory runs the turn there: the transcript stays in
-        // its original project folder and only the new lines carry the new cwd
-        // (observed on claude 2.1.288). Never pick one silently.
+        // Resuming from another directory runs the turn there, so the directory is never
+        // picked silently (docs/agents/claude-code.md#sessions-and-history).
         let cwd = match self.store.owned_cwd(&h)? {
             Some(c) => c,
             None => match head(&path).cwd {
@@ -718,8 +717,9 @@ impl Agent for Claude<'_> {
         };
         let watch = self.intent(id, &req.message)?;
         // Claude restores the model from the transcript, so only a change passes it; effort
-        // and permission mode are per process and come from the session's settings. Only a
-        // session agent-talk started has settings, and agent-talk denies its approvals.
+        // and permission mode are per process and come from the session's settings
+        // (docs/agents/claude-code.md#settings). Only a session agent-talk started has settings,
+        // and agent-talk denies its approvals.
         let unset = Settings::default();
         let settings = req.settings.unwrap_or(&unset);
         let cmd = process::command(&TurnArgs {
@@ -767,7 +767,8 @@ impl Agent for Claude<'_> {
             WaitTarget::Turn(t) => (t.clone(), self.store.receipt_by_turn(&h, t)?),
             WaitTarget::Receipt(r) => {
                 let rec = wait_receipt(self.store, &h, r)?;
-                // The input line's uuid is the turn id (DESIGN.md §6.2).
+                // The input line's uuid is the turn id
+                // (docs/agents/claude-code.md#sessions-and-history).
                 (rec.client_msg_id.clone(), Some(rec))
             }
         };

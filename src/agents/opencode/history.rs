@@ -1,12 +1,12 @@
-//! OpenCode history rows and the rules read from them (DESIGN.md §6.3): where a turn ends
-//! and what it answered, the turn of a page that starts mid-turn, and the messages `read`
-//! shows.
+//! OpenCode history rows and the rules read from them
+//! (docs/agents/opencode.md#sending-and-turn-end): where a turn ends and what it answered,
+//! the turn of a page that starts mid-turn, and the messages `read` shows.
 //!
 //! A row (`Session.Message.*`) stays the `Value` the service sent and is read field by
-//! field: a field of an unexpected type reads as absent and never hides its row (DESIGN.md
-//! §3). `read` shows `user`, `synthetic` and `assistant` rows; an `idle` row, written at
-//! an execution's end, ends a turn; `system`, `compaction`, `skill`, `shell` and
-//! `{agent,model,location}-switched` rows are skipped.
+//! field: a field of an unexpected type reads as absent and never hides its row
+//! (docs/architecture.md#decoding-agent-records). `read` shows `user`, `synthetic` and
+//! `assistant` rows; an `idle` row, written at an execution's end, ends a turn; `system`,
+//! `compaction`, `skill`, `shell` and `{agent,model,location}-switched` rows are skipped.
 
 use super::handle;
 use super::transport::Service;
@@ -74,7 +74,7 @@ pub struct Span {
     end: Option<End>,
 }
 
-/// How the turn ended in history (DESIGN.md §6.3).
+/// How the turn ended in history (docs/agents/opencode.md#sending-and-turn-end).
 enum End {
     /// The `idle` row an execution end writes.
     Idle(Value),
@@ -94,11 +94,11 @@ impl Span {
             if !aborted(r) {
                 return None;
             }
-            // A user message right after the aborted step is another execution's input
-            // (DESIGN.md §6.3); anything else continues this one: its own
-            // `idle` (user interrupt), a restart notice, or further steps after the
-            // location closed during a permission prompt (OpenCode source `step.ts`,
-            // `needsContinuation`). Nothing after it yet: undecided.
+            // A user message right after the aborted step is another execution's input;
+            // anything else continues this one: its own `idle` (user interrupt), a restart
+            // notice, or further steps after the location closed during a permission prompt
+            // (`needsContinuation` in OpenCode's `step.ts`, read in source on 2.0.22).
+            // Nothing after it yet: undecided.
             (after.get(i + 1)?["type"] == "user").then_some(i)
         });
         let end = match end_at {
@@ -347,8 +347,8 @@ mod tests {
         assert_eq!(t.error.unwrap()["type"], "aborted");
         assert_eq!(t.duration_ms, Some(2000));
 
-        // A shutdown-reason interrupt (DESIGN.md §6.3): no idle; the next
-        // execution's rows must not become this turn's reply.
+        // A shutdown-reason interrupt (docs/agents/opencode.md#sending-and-turn-end): no
+        // idle; the next execution's rows must not become this turn's reply.
         let idle_later =
             json!({"id":"msg_k","time":{"created":6000},"type":"idle","outcome":"succeeded"});
         let span = Span::new(

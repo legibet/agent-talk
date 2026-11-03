@@ -384,7 +384,8 @@ impl Service {
         Ok(active.data.unwrap_or_default().into_keys().collect())
     }
 
-    /// Requests already pending are not replayed on a new subscription (DESIGN.md §6.3).
+    /// The session's pending permission requests, which a new subscription does not replay
+    /// (docs/agents/opencode.md#approvals).
     pub async fn permissions(&self, session_id: &str) -> Result<Vec<Value>> {
         let list: List<Value> = self
             .get(&format!("/api/session/{session_id}/permission"), &[])
@@ -483,7 +484,9 @@ impl Service {
     }
 
     /// The rules of the agent a new session in `directory` runs: the default agent, which
-    /// the service lists first (read as `Value`, so that no entry is skipped before it).
+    /// the service lists first (unverified with a configured default agent,
+    /// docs/agents/opencode.md#limitations; read as `Value`, so that no entry is skipped
+    /// before it).
     pub async fn default_agent_rules(&self, directory: &str) -> Result<Vec<Value>> {
         let agents: List<Value> = self
             .get("/api/agent", &[("location[directory]", directory.into())])

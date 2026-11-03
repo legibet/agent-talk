@@ -1,13 +1,12 @@
 //! OpenCode adapter: HTTP client of the user's background service (`opencode serve
 //! --service`), which every OpenCode client shares. Built against opencode 2.0.22; the
-//! verified behaviour is in DESIGN.md §6.3.
+//! verified behaviour is in docs/agents/opencode.md.
 //!
 //! OpenCode has no turn id. agent-talk's turn id is the user message id, which the client
-//! chooses (`session.prompt.id`); a turn ends at the first `idle` message after that user
-//! message in history (`outcome` = status), or at its aborted step when an interrupt with
-//! reason `shutdown` wrote no `idle` (`history::Span`). Live, `session.execution.{succeeded,
-//! failed,interrupted}` says "an execution ended"; history is re-read to confirm, because the
-//! SSE stream replays nothing and one execution can serve several user messages.
+//! chooses (`session.prompt.id`). Where a turn ends is decided from history (`history::Span`,
+//! docs/agents/opencode.md#sending-and-turn-end). Live, `session.execution.{succeeded,
+//! failed,interrupted}` says only that some execution ended, so history is re-read at each
+//! one: the SSE stream replays nothing and one execution can serve several user messages.
 
 mod history;
 mod transport;
@@ -130,13 +129,12 @@ fn new_msg_id() -> String {
     format!("msg_{time:012x}{tail}")
 }
 
-/// The rules of a session agent-talk started, so that the default agent never asks
-/// (DESIGN.md §6.3): its rules from the first `ask` on, with every `ask` turned into `deny`,
-/// or into `allow` under full access, then a denied question tool, since nobody answers it.
-/// The service evaluates the agent's rules, then the session's, and the last match wins, so
-/// every other answer stays, the user's denials included. The rules before the first `ask`
-/// decide the same either way and are left out, so sub-agents, which inherit session rules,
-/// keep their own there.
+/// The rules of a session agent-talk started, so that the default agent never asks: its
+/// rules from the first `ask` on, with every `ask` turned into `deny`, or into `allow` under
+/// full access, then a denied question tool, since nobody answers it. The last matching rule
+/// wins, so every other answer stays, the user's denials included; the rules before the
+/// first `ask` are left out so that sub-agents, which inherit session rules, keep their own
+/// there (docs/agents/opencode.md#approvals).
 fn session_rules(agent_rules: &[Value], full_access: bool) -> Value {
     let answer = if full_access { "allow" } else { "deny" };
     let mut rules: Vec<Value> = agent_rules
@@ -195,9 +193,9 @@ impl<'a> OpenCode<'a> {
     }
 
     /// A permission request (`Permission.Request`) reached us (live event or
-    /// `GET …/permission`). Under `observe` it stays unanswered; under `deny` it gets
-    /// `reject` with a message (a message-less reject interrupts the execution and writes no
-    /// idle message; DESIGN.md §6.3). Never `once` or `always`.
+    /// `GET …/permission`). Under `Observe` it stays unanswered; under `Deny` it gets
+    /// `reject` with a message, since a message-less reject interrupts the execution
+    /// (docs/agents/opencode.md#approvals). Never `once` or `always`.
     async fn on_permission(&self, svc: &Service, w: &mut Watch<'_>, req: Value) -> Result<()> {
         // The reply names the request: one without an id cannot be answered.
         let Some(request_id) = req["id"].as_str().map(String::from) else {
@@ -231,13 +229,13 @@ impl<'a> OpenCode<'a> {
         };
         // Deny only requests of the turn being observed: while the message is still
         // queued, whatever asks belongs to the execution before it.
-        // A reject that fails leaves the request pending, recorded as such (DESIGN.md §4).
+        // A reject that fails leaves the request pending, recorded as such.
         let mut failed = None;
         if w.policy == ApprovalPolicy::Deny && delivered {
             match svc.reject(w.session_id, &request_id, DENY_MESSAGE).await {
                 Ok(()) => a.outcome = ApprovalOutcome::Declined,
                 // Gone already: one reject answers every pending request of the session
-                // (DESIGN.md §6.3), or someone else replied first.
+                // (docs/agents/opencode.md#approvals), or someone else replied first.
                 Err(e) if e.agent_error.as_ref().is_some_and(|v| v.code == 404) => {
                     a.outcome = ApprovalOutcome::Resolved;
                 }
@@ -399,7 +397,7 @@ impl<'a> OpenCode<'a> {
             }
         };
         // Bounded even without a deadline, so that Ctrl-C or SIGTERM during the submission
-        // settles the receipt `unknown` (DESIGN.md §4).
+        // settles the receipt `unknown` (docs/behaviour.md#receipts).
         let res = bounded(deadline, work).await;
         let progress = w.progress();
         settle(
@@ -501,8 +499,8 @@ impl Agent for OpenCode<'_> {
         let deadline = wait.deadline();
         let svc = self.connect().await?;
         // The service answers a location's first requests before its configuration is
-        // applied: no default model, agents without the user's rules (opencode 2.0.23).
-        // `integration.list` waits for plugin activation, which applies it.
+        // applied; `integration.list` waits for plugin activation, which applies it
+        // (docs/agents/opencode.md#interface).
         svc.load_location(req.cwd).await?;
         let mut body = json!({"location": {"directory": req.cwd}});
         let mut model = req
@@ -529,7 +527,7 @@ impl Agent for OpenCode<'_> {
             body["title"] = json!(n);
         }
         // Session rules, so that the service itself never waits for an answer here
-        // (DESIGN.md §4, §6.3).
+        // (docs/agents/opencode.md#approvals).
         let rules = svc.default_agent_rules(req.cwd).await?;
         body["permissions"] = session_rules(&rules, req.settings.full_access);
         let session_id = svc.create_session(&body).await?;
@@ -544,8 +542,8 @@ impl Agent for OpenCode<'_> {
         let svc = self.connect().await?;
         // The session stores its model, variant and rules, and the service applies a change
         // from the next step on, so only the change is sent, before the message is recorded:
-        // a refused change is a plain error (DESIGN.md §4, §6.3). The prompt has no model
-        // field.
+        // a refused change is a plain error (docs/agents/opencode.md#settings). The prompt
+        // has no model field.
         let change = req.change;
         if change.model.is_some() || change.effort.is_some() {
             let model = if let Some(m) = &change.model {

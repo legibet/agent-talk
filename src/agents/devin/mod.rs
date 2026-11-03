@@ -1,4 +1,4 @@
-//! Devin CLI adapter (DESIGN.md §6.7).
+//! Devin CLI adapter (docs/agents/devin.md).
 //!
 //! Every mutation runs one `devin acp` child speaking ACP in the session's working
 //! directory. The child holds Devin's session lock until it exits, and a running turn dies
@@ -91,7 +91,7 @@ impl Listed {
 
     /// Whether `pid` holds the session: `Some(false)` when the listing says it is unlocked
     /// or names another holder, `None` when it does not say. A recorded child's pid alone
-    /// may since belong to another process (DESIGN.md §6.7).
+    /// may since belong to another process (docs/agents/devin.md#writers-and-liveness).
     fn held_by(&self, pid: u32) -> Option<bool> {
         match (self.locked?, self.holder) {
             (false, _) => Some(false),
@@ -102,7 +102,8 @@ impl Listed {
 }
 
 /// `session/set_config_option`: `config` (`model`, `thought_level`) of the session, which
-/// Devin stores with it (DESIGN.md §6.7). Devin refuses a value outside the option's list.
+/// Devin stores with it. Devin refuses a value outside the option's list
+/// (docs/agents/devin.md#settings).
 async fn set_config(conn: &Conn, id: &str, config: &str, value: &str) -> Result<()> {
     let params = json!({"sessionId": id, "configId": config, "value": value});
     match conn.request("session/set_config_option", params).await {
@@ -116,8 +117,8 @@ async fn set_config(conn: &Conn, id: &str, config: &str, value: &str) -> Result<
 
 /// Apply `change` to the loaded session; `settings` are the session's settings with the
 /// change included. A model change resets Devin's effort to the family's default, so the
-/// effort the settings hold is applied after it, changed or not (DESIGN.md §6.7). Full access
-/// is the session's `bypass` mode, which Devin stores.
+/// effort the settings hold is applied after it, changed or not. Full access is the session's
+/// `bypass` mode, which Devin stores (docs/agents/devin.md#approvals).
 async fn apply(conn: &Conn, id: &str, change: &Settings, settings: &Settings) -> Result<()> {
     if let Some(m) = &change.model {
         set_config(conn, id, "model", m).await?;
@@ -144,9 +145,10 @@ async fn apply(conn: &Conn, id: &str, change: &Settings, settings: &Settings) ->
 }
 
 /// The deadline or a signal ended observation. The child dies with this command and would
-/// take the turn down with nothing in the db; end it Devin's way instead, which leaves the
-/// cancelled tool call in the db when one ran, and answer the permission requests still
-/// open `cancelled`, as ACP requires after a cancel (DESIGN.md §4, §6.7).
+/// take the turn down with only its user node in the db; end it Devin's way instead, which
+/// leaves the cancelled tool call in the db when one ran, and answer the permission requests
+/// still open `cancelled`, as ACP requires after a cancel (docs/behaviour.md#approvals,
+/// docs/agents/devin.md#sending-and-turn-end).
 async fn wind_down(w: &mut Watch<'_>, conn: &mut Conn, id: &str) {
     if w.ended() {
         return;
@@ -262,7 +264,8 @@ impl<'a> Devin<'a> {
 
     /// `e`, a refused `session/load`, as agent-talk's error: Devin's `session_locked` names
     /// the holder's pid, which is `E_LOCKED` when it is a child agent-talk recorded for the
-    /// session and `E_FOREIGN_LIVE` otherwise (DESIGN.md §6.7). The agent's error is kept.
+    /// session and `E_FOREIGN_LIVE` otherwise (docs/agents/devin.md#writers-and-liveness).
+    /// The agent's error is kept.
     fn locked(&self, id: &str, mut e: Error) -> Error {
         let data = e
             .agent_error
@@ -302,7 +305,8 @@ impl<'a> Devin<'a> {
     /// until it ends or `wait`'s deadline passes, then settle the receipt. Without a deadline
     /// the outcome goes to `wait`'s keeper, if any, once the prompt is accepted. `name` is set
     /// once the turn is over, since Devin's automatic title after the first prompt would
-    /// override an earlier rename (DESIGN.md §6.7). The caller closes `conn`.
+    /// override an earlier rename (docs/agents/devin.md#sessions-and-history). The caller
+    /// closes `conn`.
     async fn run(
         &self,
         conn: &mut Conn,
@@ -378,8 +382,9 @@ impl<'a> Devin<'a> {
         let turn_id = w.turn_id().to_string();
         let res = match res {
             Ok(Ok(v)) => Ok(w.turn(h.clone(), &v, note.as_deref())),
-            // A refusal of the prompt itself; an error after acceptance is a failed turn,
-            // except a lost connection, whose outcome is unknown (DESIGN.md §4).
+            // Before acceptance an error is a refusal of the prompt (`reject` keeps a lost
+            // connection unknown); after it, a failed turn, except a lost connection, whose
+            // outcome is unknown (docs/behaviour.md#receipts).
             Ok(Err(e)) if !w.accepted() => Err(reject(self.store, intent.receipt_id, e)),
             Ok(Err(e)) if e.code == ErrorCode::Transport => Err(e),
             Ok(Err(e)) => Ok(model::Turn {
@@ -473,7 +478,7 @@ impl Agent for Devin<'_> {
     async fn models(&self) -> Result<Vec<Model>> {
         // Only a session's `configOptions` name the ids the `model` option accepts (one
         // variant per family; `devin models list` cannot tell which). `session/new` without
-        // a prompt writes no session row, only a lock file (DESIGN.md §6.7).
+        // a prompt writes no session row, only a lock file (docs/agents/devin.md#settings).
         let dir = std::env::temp_dir();
         let conn = self.connect(&dir).await?;
         let created = conn
@@ -576,7 +581,7 @@ impl Agent for Devin<'_> {
             // Nothing else lists the session before its first prompt.
             self.store.insert_owned(&h, req.cwd, req.settings)?;
             // Set on the session, never as `devin acp --model`, which matches names loosely
-            // and ignores an unknown one (DESIGN.md §6.7).
+            // and ignores an unknown one (docs/agents/devin.md#settings).
             apply(&conn, id, req.settings, req.settings)
                 .await
                 .map_err(|mut e| {
@@ -633,9 +638,9 @@ impl Agent for Devin<'_> {
             // The history replay, which arrives before the response.
             conn.discard_notifications();
             // ACP offers no `normal` mode: a session stored in it loads as `accept-edits`,
-            // and one prompt would store that (DESIGN.md §6.7). A session agent-talk did not
-            // start runs only in the mode Devin stored for it, read again now that the lock
-            // excludes every other writer.
+            // and one prompt would store that. A session agent-talk did not start runs only
+            // in the mode Devin stored for it, read again now that the lock excludes every
+            // other writer (docs/agents/devin.md#approvals).
             let mode = loaded["modes"]["currentModeId"].as_str();
             let stored = self.session_row(&self.db()?, id)?.agent_mode;
             if !owned && mode != Some(stored.as_str()) {
@@ -745,7 +750,8 @@ impl Agent for Devin<'_> {
                     // agent-talk's own child died or was ended with the turn: interrupted.
                     // Nobody holding a foreign turn proves only that it will not go on: a
                     // killed turn and one that ended without a final reply (a `-p` run after
-                    // a rejected permission) leave the same chain (DESIGN.md §6.7).
+                    // a rejected permission) leave the same chain
+                    // (docs/agents/devin.md#sending-and-turn-end).
                     let (status, message) = match (child, span) {
                         (Some(_), Some(_)) => (
                             TurnStatus::Interrupted,

@@ -23,7 +23,7 @@ pub enum System {
         session_id: Option<String>,
     },
     /// Claude's own rules denied a tool that would have prompted; the model is told and
-    /// nothing is pending (DESIGN.md §6.2).
+    /// nothing is pending (docs/agents/claude-code.md#approvals).
     PermissionDenied {
         #[serde(default, deserialize_with = "or_default")]
         tool_name: Option<String>,

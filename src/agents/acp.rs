@@ -346,7 +346,7 @@ impl Conn {
 }
 
 /// The answer that declines a `session/request_permission` once, when the agent offers
-/// it (`reject_once`; agent-talk never approves, DESIGN.md §7).
+/// it (`reject_once`; agent-talk never approves, docs/behaviour.md#approvals).
 pub fn reject_once(params: &Value) -> Option<Value> {
     let option = params["options"]
         .as_array()
@@ -359,7 +359,7 @@ pub fn reject_once(params: &Value) -> Option<Value> {
 
 /// The answer to a `session/request_permission` still open once the client sent
 /// `session/cancel`: ACP requires the `cancelled` outcome for every one (prompt turn,
-/// Cancellation). It approves nothing (DESIGN.md §4).
+/// Cancellation). It approves nothing (docs/behaviour.md#approvals).
 pub fn cancelled() -> Value {
     json!({"outcome": {"outcome": "cancelled"}})
 }

@@ -1,5 +1,6 @@
 //! pi session files, `<agent dir>/sessions/--<cwd>--/<timestamp>_<id>.jsonl`: finding and
-//! decoding them, the live branch, turn boundaries and normalized messages (DESIGN.md §6.6).
+//! decoding them, the live branch, turn boundaries and normalized messages
+//! (docs/agents/pi.md#sessions-and-history).
 //! The records are narrow: every field defaults when absent or when it does not fit, unknown
 //! entry types, roles, content shapes and block types are tolerated, and content of an unknown
 //! shape never ends a turn.
@@ -90,8 +91,9 @@ impl Body {
             .collect()
     }
 
-    /// An assistant message that ends a run: no tool calls to execute (DESIGN.md §6.6).
-    /// Content this version cannot read whole is not known to be free of them.
+    /// An assistant message without tool calls to execute: a `final` reply, and the end of a
+    /// turn read from the session file (docs/agents/pi.md#sending-and-turn-end). Content this
+    /// version cannot read whole is not known to be free of them.
     pub fn is_reply(&self) -> bool {
         self.role == "assistant"
             && match &self.content {
@@ -169,8 +171,8 @@ pub fn parse(text: &str) -> Vec<Entry> {
 }
 
 /// Indices of the live branch: the newest entry (the leaf pi takes on load) and its
-/// `parentId` ancestry. A second writer leaves other branches in the file (DESIGN.md §6.6);
-/// they are excluded.
+/// `parentId` ancestry. A second writer leaves other branches in the file
+/// (docs/agents/pi.md#writers-and-liveness); they are excluded.
 pub fn live_branch(entries: &[Entry]) -> HashSet<usize> {
     let by_id: HashMap<&str, usize> = entries
         .iter()
@@ -242,7 +244,8 @@ fn status(stop_reason: Option<&str>) -> TurnStatus {
 
 /// Turn ended by the assistant message `reply`, from a run log or the session file: its
 /// `stopReason` gives the status, its text the reply. No duration: pi stamps an assistant
-/// message when its request starts, not when the reply ends (DESIGN.md §6.6).
+/// message when its request starts, not when the reply ends
+/// (docs/agents/pi.md#sending-and-turn-end).
 pub fn reply_turn(
     handle: String,
     turn_id: String,
@@ -306,7 +309,7 @@ pub fn transcript_turn(
 
 /// Messages on the live branch with their entry index, oldest first. A turn's id is the id
 /// of its user message; steer and follow-up messages are user messages too and start a turn
-/// of their own here (the file does not mark them, DESIGN.md §6.6).
+/// of their own here (the file does not mark them, docs/agents/pi.md#sessions-and-history).
 pub fn messages(entries: &[Entry], branch: &HashSet<usize>) -> Vec<(usize, Message)> {
     let mut out = Vec::new();
     let mut turn_id = "";
@@ -415,7 +418,7 @@ pub fn tool_summary(name: &str, arguments: &Value) -> String {
 pub struct Head {
     /// The working directory the `session` header records.
     pub cwd: Option<String>,
-    /// The newest `session_info` (`--name` and `/name` append one at any point).
+    /// The newest `session_info` (`--name` and `/name` append one at any point, pi 1.0.3).
     pub name: Option<String>,
     /// The first prompt's first line.
     pub preview: Option<String>,
@@ -476,8 +479,8 @@ pub fn dir_name(cwd: &str) -> String {
     format!("--{body}--")
 }
 
-/// Session ids pi accepts for `--session-id`: alphanumerics, `.`, `_` and `-`, starting and
-/// ending alphanumeric. Anything else is refused before it reaches a path.
+/// Session ids pi accepts for `--session-id` (pi 1.0.3): alphanumerics, `.`, `_` and `-`,
+/// starting and ending alphanumeric. Anything else is refused before it reaches a path.
 pub fn check_id(id: &str) -> Result<()> {
     let ok = id
         .chars()

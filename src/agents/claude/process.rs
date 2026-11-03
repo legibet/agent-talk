@@ -21,7 +21,8 @@ pub struct TurnArgs<'a> {
 }
 
 /// `claude -p` for one turn. `--resume` restores the model from the transcript but neither the
-/// effort nor the permission mode (DESIGN.md §6.2), so those pass again on every turn.
+/// effort nor the permission mode (docs/agents/claude-code.md#settings), so those pass again on
+/// every turn.
 pub fn command(a: &TurnArgs<'_>) -> Command {
     // A nested `claude -p` with the inherited CLAUDECODE=1 runs normally (observed on
     // claude 2.1.288).
@@ -39,7 +40,7 @@ pub fn command(a: &TurnArgs<'_>) -> Command {
         cmd.args(["--model", m]);
     }
     if let Some(e) = a.effort {
-        // CLAUDE_CODE_EFFORT_LEVEL silently overrides --effort (claude 2.1.291, DESIGN.md §6.2).
+        // CLAUDE_CODE_EFFORT_LEVEL silently overrides --effort (docs/agents/claude-code.md#settings).
         cmd.args(["--effort", e])
             .env_remove("CLAUDE_CODE_EFFORT_LEVEL");
     }
@@ -61,14 +62,15 @@ pub fn command(a: &TurnArgs<'_>) -> Command {
     cmd
 }
 
-/// One entry of `claude agents --json --all`. Fields seen: cwd, id, kind, name, pid,
-/// sessionId, startedAt, state, status. `kind: interactive` also covers running
-/// `claude -p` processes, so it does not tell a TUI from a headless run.
+/// One entry of `claude agents --json --all` (docs/agents/claude-code.md#writers-and-liveness).
+/// Fields seen: cwd, id, kind, name, pid, sessionId, startedAt, state, status.
+/// `kind: interactive` also covers running `claude -p` processes, so it does not tell a TUI
+/// from a headless run.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentEntry {
-    /// Strict with `pid`: an entry that does not say which process holds which session
-    /// fails the listing (see `agents`).
+    /// Strict with `pid`: a value of an unexpected type fails the listing (see `agents`); an
+    /// absent one is accepted, since ended background sessions have no pid.
     pub session_id: Option<String>,
     #[serde(default, deserialize_with = "or_default")]
     pub cwd: Option<String>,
@@ -103,9 +105,9 @@ pub async fn agents() -> std::result::Result<Vec<AgentEntry>, String> {
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    // Every entry must decode (its session id and pid; the other fields default): a
-    // dropped one could be the process that is writing the session, and the caller would
-    // then proceed as if nothing ran it.
+    // Every entry must decode (a session id or pid of the wrong type fails; the other fields
+    // default): a dropped one could be the process that is writing the session, and the
+    // caller would then proceed as if nothing ran it.
     serde_json::from_slice(&out.stdout)
         .map_err(|e| format!("claude agents --json: unexpected output: {e}"))
 }

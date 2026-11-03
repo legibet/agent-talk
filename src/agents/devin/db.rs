@@ -1,17 +1,16 @@
-//! `sessions.db`, Devin's session store, read-only (DESIGN.md §6.7): the session rows and
-//! the conversation of a session, the `parent_node_id` chain from `sessions.main_chain_id`.
-//! agent-talk opens it with `mode=ro` and never writes it.
+//! `sessions.db`, Devin's session store, read-only (docs/agents/devin.md#sessions-and-history):
+//! the session rows and the conversation of a session, the `parent_node_id` chain from
+//! `sessions.main_chain_id`. agent-talk opens it with `mode=ro` and never writes it.
 //!
 //! A node's `chat_message` stays the `Value` Devin wrote, read field by field: a field of an
-//! unexpected type reads as absent and never drops the node (DESIGN.md §3).
+//! unexpected type reads as absent and never drops the node
+//! (docs/architecture.md#decoding-agent-records).
 //!
-//! Turns: a `user` node with `metadata.is_user_input` opens one; its turn id is the client
-//! message id Devin stored for it (`metadata.extensions["chisel/client-message-id"]`, set by
-//! agent-talk, `devin -p` and the TUI alike), else its `message_id`. A turn ends at the first
-//! later assistant node with `finish_reason: stop` and no tool calls, or at a tool node
-//! Devin's cancel marked `Canceled`. A prompt that follows before either leaves the earlier
-//! turn `unknown`: the process that took it died, or (a prompt sent while it ran) Devin
-//! answered both together, and the chain does not tell which.
+//! Turns: a `user` node with `metadata.is_user_input` opens one, its turn id the client
+//! message id Devin stored for it, else its `message_id`. A turn ends at a final assistant
+//! node or at a tool node Devin's cancel marked `Canceled`; a prompt that comes before either
+//! leaves it `unknown`, since the chain does not tell a dead process from two prompts
+//! answered together.
 
 use crate::agents::history::first_line;
 use crate::model::{self, Message, Phase, Result, Role, TurnStatus};
@@ -113,7 +112,7 @@ fn tool_calls(n: &Value) -> &[Value] {
 
 /// An assistant reply that ends a turn: `finish_reason: stop` and no tool calls (`[]` or
 /// null on 3000.11.92). A `tool_calls` of another shape is not read as "none": an odd field
-/// never ends a turn (DESIGN.md §3).
+/// never ends a turn (docs/architecture.md#decoding-agent-records).
 fn is_final(n: &Value) -> bool {
     let no_calls = match &n["tool_calls"] {
         Value::Null => true,
@@ -201,7 +200,8 @@ impl History {
     /// text (`final` for the node that ends a turn, `commentary` otherwise) and each tool
     /// call as one `other` message whose status comes from its tool node. Item ids are
     /// `<message_id>-<phase>` and the tool call id, both stable when Devin copies the chain
-    /// into a new root (DESIGN.md §6.7). The `from` of prompts is left to the caller.
+    /// into a new root (docs/agents/devin.md#sessions-and-history). The `from` of prompts is
+    /// left to the caller.
     pub fn messages(&self) -> Vec<(usize, Message)> {
         let results: HashMap<&str, &Value> = self
             .nodes
@@ -355,8 +355,8 @@ fn tool_text(call: &Value, result: Option<&Value>) -> String {
 mod tests {
     use super::*;
 
-    // Nodes in the shape Devin 3000.11.92 writes them (.agents/findings/devin.md §3, §11),
-    // trimmed to the fields read.
+    // Nodes in the shape Devin 3000.11.92 writes them (.agents/findings/devin.md, "Sessions
+    // and history"), trimmed to the fields read.
 
     fn prompt(id: &str, client: Option<&str>, text: &str) -> Value {
         let mut n = json!({"message_id": id, "role": "user", "content": text,

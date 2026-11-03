@@ -20,8 +20,9 @@ use tokio::time::Instant;
 
 /// The text delivered for `text` from `from`: agent senders get a one-line provenance
 /// header so the receiving model, and a person watching its session, sees who is
-/// talking and that the answer belongs in the turn's final response (DESIGN.md §4). Not
-/// doubled when the text already starts with one (`[from `).
+/// talking and that the answer belongs in the turn's final response
+/// (docs/behaviour.md#provenance-and-hops). Not doubled when the text already starts with one
+/// (`[from `).
 pub fn delivered(from: &Caller, text: &str) -> String {
     match (&from.kind, &from.session) {
         (CallerKind::Agent, Some(h)) if !text.starts_with("[from ") => {
@@ -194,8 +195,8 @@ pub enum Wait {
     /// The end of the turn, until the deadline passes.
     Turn(Instant),
     /// The agent's acceptance of the message. On agents whose turn needs the command's
-    /// connection until it ends (Grok direct mode, DESIGN.md §6.4; Devin, §6.7) the command
-    /// observes it to its end all the same; given a keeper (the MCP server, DESIGN.md §4),
+    /// connection until it ends (Grok, Devin; docs/behaviour.md#sending) the command observes it
+    /// to its end all the same; given a keeper (the MCP server, docs/behaviour.md#mcp-server),
     /// the adapter sends it the outcome once the message is accepted and goes on observing in
     /// the background.
     Accepted(Option<oneshot::Sender<Outcome>>),
@@ -223,10 +224,10 @@ pub struct ListFilter<'a> {
 }
 
 /// A session's `--model`, `--effort` and `--full-access`, passed through unvalidated in the
-/// agent's syntax (DESIGN.md §4). `new` chooses them; agent-talk stores them for the sessions
-/// it started, where a later `send` may change them. Each adapter passes again only what its
-/// agent does not keep between turns (DESIGN.md §6). As a change, an absent field keeps the
-/// current value; full access is only ever turned on.
+/// agent's syntax (docs/behaviour.md#settings). `new` chooses them; agent-talk stores them for
+/// the sessions it started, where a later `send` may change them. Each adapter passes again
+/// only what its agent does not keep between turns (its doc in docs/agents/). As a change, an
+/// absent field keeps the current value; full access is only ever turned on.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Settings {
     pub model: Option<String>,
@@ -299,7 +300,7 @@ pub struct SendRequest<'a> {
 }
 
 /// One agent's entry in `status`: the installed version, the state of the shared process
-/// agent-talk joins, and which operations can run now (DESIGN.md §2).
+/// agent-talk joins, and which operations can run now (docs/architecture.md#principles).
 #[derive(Serialize)]
 pub struct AgentStatus {
     pub agent: &'static str,

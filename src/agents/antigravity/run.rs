@@ -1,4 +1,4 @@
-//! One `agy -p --input-format stream-json --output-format stream-json` child: its command
+//! One `agy -p "" --input-format stream-json --output-format stream-json` child: its command
 //! line, its start-up, and what its run log (stdout) says about the turn. Narrow; unknown
 //! events are tolerated. Spawning into the run log and reading it are `agents::child`.
 
@@ -17,8 +17,8 @@ use tokio::process::Child;
 
 /// `agy -p` arguments for one turn. The model and effort pass as given: agent-talk adds no
 /// default effort, so agy refuses a model alias without one (`--model gemini-3.8-flash
-/// requires --effort`). Nothing here persists across runs (DESIGN.md §6.5), so every turn
-/// passes it again.
+/// requires --effort`). Nothing here persists across runs
+/// (docs/agents/antigravity.md#settings), so every turn passes all of it again.
 pub fn args(conversation: Option<&str>, settings: &Settings) -> Vec<String> {
     let mut args: Vec<String> = [
         "-p",

@@ -1,17 +1,23 @@
 # agent-talk
 
-Rust CLI and stdio MCP server that sends messages to agent sessions (Codex, Claude Code,
+Rust CLI and stdio MCP server that sends messages to other agents' sessions (Codex, Claude Code,
 OpenCode, Grok CLI, Antigravity CLI, pi, Devin CLI) through each agent's official interface, and
-reads the replies. No daemon of its own; state lives with the agents, plus intents and receipts
-in `~/.agent-talk/store.db`.
+reads the replies.
 
-## Where to read
+## Docs
 
-- `DESIGN.md` is the design as built. Read §2 (principles) and §7 (decisions) before changing
-  behaviour, and the agent's §6.x before touching `src/agents/<agent>/`.
-- `.agents/findings/<agent>.md` (git-ignored, present only on the maintainer's machine) holds
-  the evidence for each agent. Reach for it when a fact about an agent in DESIGN.md is in doubt
-  or an agent CLI was upgraded.
+- `docs/architecture.md`: principles, processes, local state, the adapter boundary, how agent
+  records are decoded. Read before a change that spans adapters or touches the shared code
+  (`ops.rs`, `mcp.rs`, `store.rs`, `agents/*.rs`).
+- `docs/behaviour.md`: what callers can rely on: receipts, approvals, settings, provenance,
+  MCP, errors. Read before changing anything a caller can observe.
+- `docs/agents/<agent>.md`: how agent-talk drives that agent, the agent behaviour it relies on,
+  and why. Read before touching `src/agents/<agent>/`. Claude's doc and findings are
+  `claude-code.md`: macOS would load a `claude.md` as CLAUDE.md.
+- `.agents/findings/<agent>.md` (git-ignored, on the maintainer's machine only): the evidence
+  behind `docs/agents/<agent>.md`, under the same headings. Reach for it when a fact in the
+  agent's doc is in doubt or the agent CLI was upgraded, and record new probe results there.
+  The public docs never cite it.
 - `tests/README.md` before running or changing the live harness.
 
 ## The machine has real sessions on it
@@ -20,15 +26,14 @@ The agents on this machine hold the user's own sessions, configuration and daemo
 alongside them:
 
 - Read agent configuration (`~/.codex`, `~/.claude*`, `~/.config/opencode`, `~/.grok`,
-  `~/.gemini`, `~/.pi`), never edit it.
+  `~/.gemini`, `~/.pi`, `~/.config/devin`, `~/.local/share/devin`), never edit it.
 - Connect to running daemons, services and leaders; leave starting and stopping them to the
   user. Grok leader experiments use an isolated `GROK_HOME` and a short socket path.
 - Clean up only sessions and files you created. The user's sessions are never deleted,
   archived or written to by tests.
-- agent-talk answers approval requests with decline or reject only. On OpenCode that means
-  `reject` with a message; `once` and `always` are never sent. The one other answer is ACP's
-  `cancelled`, to the requests still pending when agent-talk cancels a Grok or Devin turn
-  (DESIGN.md §4).
+- Answer approval requests with decline or reject only, in code and in experiments. On OpenCode
+  that is `reject` with a message; `once` and `always` are never sent. The one other answer is
+  ACP's `cancelled`, to the requests still pending when agent-talk cancels a Grok or Devin turn.
 - Reach sessions through agent interfaces only: no PTY, no terminal input injection. TUI cases
   run in herdr panes opened with `--no-focus`; close only the panes you opened.
 - The OpenCode service password stays in `service.json`; it goes into no file of this repo.
@@ -39,30 +44,27 @@ alongside them:
 cargo test
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
-uv run tests/live.py offline <tier>    # tiers: codex claude opencode grok antigravity pi, or all
+uv run tests/live.py offline <tier>  # codex claude opencode grok antigravity pi devin, or all
 ```
 
 Every live tier but `offline` spends real model calls, Grok and Antigravity the most. Run the
-tier of the adapter you changed; run `all` before a release. Tests use the cheap default models
-in `tests/live.py`. Add a test only when it would catch a real regression. Python runs through
-`uv run` with PEP 723 metadata; `tests/live.py` is formatted with `ruff format --line-length 120`.
+tier of the adapter you changed; run `all` before a release. Add a test only when it would catch
+a real regression. `tests/live.py` is formatted with `ruff format --line-length 120`.
 
-## Conventions
+## Keeping docs true
 
-- Receipt and approval semantics live once in `src/agents/lifecycle.rs`; each adapter keeps its own
-  observe loop (DESIGN.md §3, §7).
-- Records and events are decoded into small structs where the shape is stable or a decoding
-  failure should be an error. A record read for a few fields whose shape must be tolerated stays
-  `serde_json::Value` with accessors, as do payloads agent-talk only passes through. The tolerance
-  rules apply either way (DESIGN.md §3): an odd field never drops its record, an odd list entry
-  is skipped on its own, a listed entry without the id that addresses it is skipped, the raw record
-  is kept, and unrecognized content never ends a turn.
-- Comments cite `DESIGN.md §N`; a fact about an agent that the design does not cover names the
-  version it was observed on.
-- A behaviour change updates DESIGN.md, and `skills/agent-talk/SKILL.md` where it states that
-  behaviour, in the same change. README.md is for users and stays short. Short-term work on
-  agent-talk's own code is listed in `.agents/TODO.md`; limitations imposed by the agents and
-  unverified facts go to DESIGN.md §8.
-- `.github/workflows/release.yml` is generated by `dist generate` from `dist-workspace.toml`;
-  change the config and regenerate it. Pushing a `v*` tag builds the binaries and publishes the
-  GitHub Release. `cargo publish` is run by hand.
+- A behaviour change updates the doc that states it, and `skills/agent-talk/SKILL.md` where it
+  states that behaviour, in the same change. README.md is for users and stays short.
+- Docs record decisions next to what they govern, with the reason. They state the design and
+  the agent behaviour it rests on, not what the code already shows.
+- Comments cite the doc section they rely on, as a repo path with anchor
+  (`docs/agents/grok.md#approvals`). A fact about an agent that the docs do not cover names the
+  agent version it was observed on.
+- Limitations imposed by an agent and unverified facts go under Limitations in its doc;
+  short-term work on agent-talk's own code goes to `.agents/TODO.md`.
+
+## Release
+
+`.github/workflows/release.yml` is generated by `dist generate` from `dist-workspace.toml`;
+change the config and regenerate it. Pushing a `v*` tag builds the binaries and publishes the
+GitHub Release. `cargo publish` is run by hand.

@@ -20,7 +20,8 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
-/// Agent-to-agent hops allowed before a message is refused (DESIGN.md §4).
+/// Agent-to-agent hops allowed before a message is refused
+/// (docs/behaviour.md#provenance-and-hops).
 pub const MAX_HOPS: u32 = 3;
 pub const LS_LIMIT: u32 = 25;
 pub const READ_LIMIT: usize = 20;
@@ -209,8 +210,8 @@ pub async fn send(store: &Store, a: SendArgs) -> Result<Outcome> {
     let (name, id) = split_handle(&a.handle)?;
     let agent = Adapter::named(store, name)?;
     // Settings change only on sessions agent-talk started, and for a turn of their own
-    // (DESIGN.md §4). The change is recorded first and taken back if the agent refused the
-    // message, so a refused value is not passed again.
+    // (docs/behaviour.md#settings). The change is recorded first and taken back if the agent
+    // refused the message, so a refused value is not passed again.
     let current = store.settings(&a.handle)?;
     let change = match &current {
         Some(c) => c.change_to(&a.settings),

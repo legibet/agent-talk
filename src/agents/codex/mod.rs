@@ -134,8 +134,8 @@ impl<'a> Codex<'a> {
         let mut params = resume_latest_turn(thread_id);
         let settings = self.store.settings(&handle(thread_id))?;
         if settings.is_some_and(|s| s.full_access) {
-            // A thread that unloaded comes back with the user's sandbox; the approval
-            // policy survives (observed on codex 0.160.1, DESIGN.md §6.1).
+            // A thread that unloaded comes back with the daemon's sandbox; the approval
+            // policy survives (docs/agents/codex.md#settings).
             params["sandbox"] = json!("danger-full-access");
         }
         let mut retries = 0;
@@ -154,7 +154,7 @@ impl<'a> Codex<'a> {
     }
 
     /// `turn/start`, accepted with the turn it started. What `settings` sets becomes the
-    /// thread's setting for its later turns too (DESIGN.md §6.1).
+    /// thread's setting for its later turns too (docs/agents/codex.md#settings).
     async fn start_turn(
         &self,
         conn: &Conn,
@@ -234,7 +234,8 @@ impl<'a> Codex<'a> {
                 Some(turn_id) => return Ok(Target::Turn(turn_id)),
                 // A turn started, maybe a dormant one queued ahead, or nothing was dormant.
                 // Until a `userMessage` ties a turn to this message, seconds later on a cold
-                // thread (DESIGN.md §6.1), whether it runs or waits is unknown.
+                // thread, whether it runs or waits is unknown
+                // (docs/agents/codex.md#sending-and-turn-end).
                 None => false,
             }
         } else {
@@ -248,13 +249,10 @@ impl<'a> Codex<'a> {
         })
     }
 
-    /// Start a submission `thread/queue/add` left dormant. On an idle thread the daemon
-    /// starts the queued turn inside the add request (`turn/started` follows within
-    /// milliseconds), except when the thread's last turn was aborted by an interrupt (or a
-    /// budget limit): that thread stays `Interrupted`, also across a reload, and neither the
-    /// add nor the daemon's 10 s queue watcher starts anything until some turn starts
-    /// (codex-rs ext/queue `wake_if_loaded`, `on_thread_idle`). The rest, including the two
-    /// `thread/queue/start` refusals that mean nothing is dormant, is in DESIGN.md §6.1.
+    /// Start a submission `thread/queue/add` left dormant: on an idle thread whose last turn
+    /// was interrupted (or hit a budget limit) nothing starts it
+    /// (docs/agents/codex.md#sending-and-turn-end). Waits `DORMANT_WINDOW` for a
+    /// `turn/started`, else calls `thread/queue/start`.
     /// Returns the turn when it started the submission itself; `None` when some turn started
     /// on its own or nothing was dormant.
     async fn start_if_dormant(
@@ -359,8 +357,8 @@ impl<'a> Codex<'a> {
     }
 
     /// Search persisted history for the target, newest turn first (full items), until it
-    /// is found or history ends (DESIGN.md §7). A client id found in history is resolved
-    /// to its turn.
+    /// is found or history ends (docs/architecture.md#adapters). A client id found in
+    /// history is resolved to its turn.
     async fn lookup(&self, conn: &Conn, thread_id: &str, target: &mut Target) -> Result<Lookup> {
         let mut pages = conn.pages(
             "thread/turns/list",
@@ -649,7 +647,8 @@ impl Agent for Codex<'_> {
                     )
                     .await;
                 conn.close().await;
-                // The daemon can be older than the CLI until it is restarted.
+                // The daemon's version can differ from the CLI's: it updates itself, and a
+                // running daemon keeps its version until restarted.
                 let server = agent_cmd("codex")
                     .args(["app-server", "daemon", "version"])
                     .output()
@@ -764,7 +763,8 @@ impl Agent for Codex<'_> {
         let deadline = wait.deadline();
         let mut conn = self.connect().await?;
         // Nobody answers approvals on a thread agent-talk started: what needs one fails
-        // and the model is told. The sandbox and model fall back to the daemon's defaults.
+        // and the model is told (docs/agents/codex.md#approvals). A sandbox or model not
+        // given is the daemon's.
         let mut params = json!({"cwd": req.cwd, "approvalPolicy": "never"});
         if let Some(m) = &req.settings.model {
             params["model"] = json!(m);
@@ -777,7 +777,8 @@ impl Agent for Codex<'_> {
         let handle = handle(&thread_id);
         if let Some(name) = req.name {
             // Before turn/start: right after it the rollout file is still empty and the
-            // daemon cannot update thread metadata (DESIGN.md §6.1).
+            // daemon cannot update thread metadata
+            // (docs/agents/codex.md#sessions-and-history).
             conn.call::<Value>(
                 "thread/name/set",
                 json!({"threadId": thread_id, "name": name}),
@@ -838,7 +839,8 @@ impl Agent for Codex<'_> {
         let work = async {
             // Always resume (subscribe) before submitting, on every path:
             // - on a not-loaded thread, thread/queue/add is accepted but stays dormant
-            //   (no load, no turn) until some client resumes (DESIGN.md §6.1);
+            //   (no load, no turn) until some client resumes
+            //   (docs/agents/codex.md#sending-and-turn-end);
             // - with --wait, no event of the resulting turn may be missed;
             // - the response carries the newest turn: whether the thread is idle (queue
             //   then checks for a dormant submission) and which turn steer targets.
@@ -856,8 +858,9 @@ impl Agent for Codex<'_> {
                     ));
                 }
             };
-            // A settings change needs a turn of its own: only turn/start carries it, and
-            // thread/queue/add ignores those fields (DESIGN.md §6.1).
+            // A settings change needs turn/start: thread/queue/add ignores those fields
+            // and a busy turn/start would join the running turn
+            // (docs/agents/codex.md#settings).
             let change = !req.change.is_empty();
             if change && !idle {
                 return Err(Error::new(
@@ -870,7 +873,7 @@ impl Agent for Codex<'_> {
             let submitted = match steer_into {
                 Some(turn) => self.steer(&conn, thread_id, &intent, &turn).await?,
                 // The sandbox stays only until the thread unloads, so subscribe passes it
-                // again (DESIGN.md §6.1).
+                // again (docs/agents/codex.md#settings).
                 None if change => {
                     self.start_turn(&conn, thread_id, &intent, req.change)
                         .await?
@@ -902,7 +905,8 @@ impl Agent for Codex<'_> {
                 params["cursor"] = json!(c);
             }
             // In the window after a thread's first turn history is not readable yet
-            // (DESIGN.md §6.1): an empty page, as `lookup` treats it.
+            // (docs/agents/codex.md#sessions-and-history): an empty page, as `lookup`
+            // treats it.
             let page: CursorPage<Value> = match conn.call("thread/turns/list", params).await {
                 Err(e) if history_not_ready(&e) => return Ok((Vec::new(), None)),
                 r => r?,

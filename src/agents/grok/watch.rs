@@ -1,7 +1,8 @@
-//! What one command observes of a prompt on its ACP connection (DESIGN.md §6.4): its
-//! acceptance, the turn it runs as, the agent text, the permission requests it raises, and
-//! the end of the turn. The authority for the end is the `session/prompt` response, or for a
-//! steer message the joined turn's `_x.ai/session/prompt_complete` (DESIGN.md §7).
+//! What one command observes of a prompt on its ACP connection
+//! (docs/agents/grok.md#sending-and-turn-end): its acceptance, the turn it runs as, the
+//! agent text, the permission requests it raises, and the end of the turn. The authority for
+//! the end is the `session/prompt` response, or for a steer message the joined turn's
+//! `_x.ai/session/prompt_complete`.
 
 use super::handle;
 use super::updates;
@@ -188,9 +189,10 @@ impl<'s> Watch<'s> {
     }
 
     /// agent-talk sent `session/cancel`: answer each request still pending `cancelled`, as ACP
-    /// requires, and every later one of the prompt too (DESIGN.md §4). Unanswered, Grok
-    /// resolves it itself at the cancel (`interaction_resolved`) without a decision (1.0.70).
-    /// An answer that cannot be written leaves the request pending.
+    /// requires, and every later one of the prompt too (docs/behaviour.md#approvals).
+    /// Unanswered, Grok would resolve it itself without a decision
+    /// (docs/agents/grok.md#approvals). An answer that cannot be written leaves the request
+    /// pending.
     pub async fn cancel(&mut self, conn: &Conn) {
         self.cancelling = true;
         for a in self
@@ -290,7 +292,8 @@ impl<'s> Watch<'s> {
             Event::Request(r) if r.method == REQUEST_PERMISSION => {
                 if let Some((mut a, answer)) = self.on_permission(r.id, r.params) {
                     // Declined only once the answer is written; one that could not be
-                    // written leaves the request pending, recorded as such (DESIGN.md §4).
+                    // written leaves the request pending, recorded as such
+                    // (docs/behaviour.md#approvals).
                     let sent = match answer {
                         Some(answer) => conn.respond(&a.request_id, answer).await,
                         None => Ok(()),
@@ -320,8 +323,8 @@ impl<'s> Watch<'s> {
         }
         match method {
             // The queue lists the prompt (its id is the promptId) and then names it
-            // running; the first is the earliest proof of acceptance (direct mode:
-            // about 20 ms after the request).
+            // running; the first is the earliest proof of acceptance (direct mode: about
+            // 20 ms after the request, grok 1.0.46).
             "_x.ai/queue/changed" => {
                 let running = params["runningPromptId"].as_str();
                 if let Kind::Prompt { prompt_id, .. } = &self.kind {
@@ -505,8 +508,8 @@ mod tests {
     use crate::store::NewIntent;
     use serde_json::json;
 
-    // Frames as captured on grok 1.0.46 (.agents/findings/grok.md §5, §8, §10), with the
-    // session id filled in and elided fields dropped.
+    // Frames as captured on grok 1.0.46, with the session id filled in and elided fields
+    // dropped.
 
     const SESSION: &str = "01a107e9-eede-7e82-8808-76482c1baa7e";
 

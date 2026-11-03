@@ -1,6 +1,6 @@
-//! Grok's session store under `<GROK_HOME>` (DESIGN.md §6.4): one directory per session,
-//! `sessions/<urlencoded cwd>/<id>/`, holding `summary.json` and `updates.jsonl`, and
-//! `active_sessions.json`, the live TUIs.
+//! Grok's session store under `<GROK_HOME>` (docs/agents/grok.md#sessions-and-history): one
+//! directory per session, `sessions/<urlencoded cwd>/<id>/`, holding `summary.json` and
+//! `updates.jsonl`, and `active_sessions.json`, the live TUIs.
 
 use crate::agents::decode::or_default;
 use crate::model::{Error, ErrorCode, Result};
@@ -13,7 +13,7 @@ pub struct Summary {
     /// Set by `_x.ai/session/rename` (with `title_is_manual: true`) or generated.
     #[serde(default, deserialize_with = "or_default")]
     pub generated_title: Option<String>,
-    /// `headless` for `-p`; null for the TUI and ACP.
+    /// `headless` for `-p`; null for TUI, ACP and leader sessions alike.
     #[serde(default, deserialize_with = "or_default")]
     pub session_kind: Option<String>,
     #[serde(default, deserialize_with = "or_default")]
@@ -34,7 +34,8 @@ pub struct SummaryInfo {
     pub cwd: Option<String>,
 }
 
-/// One row of `active_sessions.json`: a live TUI (DESIGN.md §6.4).
+/// One row of `active_sessions.json`: a TUI, live while its pid is
+/// (docs/agents/grok.md#writers-and-liveness).
 #[derive(Debug, Deserialize)]
 pub struct Active {
     pub session_id: String,

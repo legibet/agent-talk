@@ -1,6 +1,6 @@
 //! The receipt and approval lifecycle, and the bounds of an observation. These are
-//! agent-talk's semantics (DESIGN.md §4), not an agent's, so they are implemented once here;
-//! the adapters supply the agent plumbing.
+//! agent-talk's semantics, not an agent's, so they are implemented once here and the adapters
+//! supply the agent plumbing (docs/architecture.md#adapters).
 
 use crate::model::{
     Approval, ApprovalOutcome, Error, ErrorCode, Outcome, Progress, Receipt, ReceiptState, Result,
@@ -13,8 +13,8 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::time::Instant;
 
 /// How agent-talk treats approval requests that reach it while it observes a turn
-/// (DESIGN.md §4). Every subscribed client receives them, and any answer resolves them for
-/// all.
+/// (docs/behaviour.md#approvals). Every subscribed client receives them, and any answer
+/// resolves them for all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApprovalPolicy {
     /// Never answer; record the request and report it as pending. Sessions agent-talk did
@@ -52,7 +52,7 @@ pub fn reject(store: &Store, receipt_id: &str, e: Error) -> Error {
 }
 
 /// The agent child that was to take the message failed to spawn or exited before taking
-/// it: `rejected` whatever the error, since nothing ran (DESIGN.md §3).
+/// it: `rejected` whatever the error, since nothing ran (docs/architecture.md#adapters).
 pub fn reject_unstarted(store: &Store, receipt_id: &str, e: Error) -> Error {
     let agent_error = e.agent_error.as_deref();
     if let Err(store_err) = store.settle_unaccepted(receipt_id, ReceiptState::Rejected, agent_error)
@@ -150,7 +150,7 @@ pub fn settle(
 
 /// Whether Ctrl-C and SIGTERM end observation. Once tokio listens for a signal, its default
 /// action never returns for the life of the process, so only the CLI, which exits after one
-/// operation, listens; `agent-talk mcp` keeps the default actions (DESIGN.md §4).
+/// operation, listens; `agent-talk mcp` keeps the default actions (docs/behaviour.md#mcp-server).
 static INTERRUPTIBLE: AtomicBool = AtomicBool::new(false);
 
 /// Let Ctrl-C and SIGTERM end observation in this process.

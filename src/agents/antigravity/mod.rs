@@ -1,4 +1,4 @@
-//! Antigravity CLI adapter (DESIGN.md §6.5).
+//! Antigravity CLI adapter (docs/agents/antigravity.md).
 //!
 //! Each mutation runs one `agy -p "" --input-format stream-json --output-format stream-json`
 //! process in the conversation's cwd (`--conversation <id>` for `send`) and writes one user
@@ -9,7 +9,7 @@
 //!
 //! History comes from Antigravity's files under `~/.gemini/antigravity-cli/`: the per-
 //! conversation `brain/<id>/.system_generated/logs/transcript.jsonl` (lossy, see
-//! `TRANSCRIPT_LOSSES`), the shared `conversation_summaries.db` (read-only, in place) and
+//! `TRANSCRIPT_LOSSES`), the shared `conversation_summaries.db` (read-only) and
 //! `presence/<id>.lock`, which the process that has a conversation open keeps flocked. agy
 //! itself ignores that lock, so agent-talk refuses to write while it is held.
 //!
@@ -47,7 +47,7 @@ use std::time::Duration;
 use tokio::process::Child;
 use tokio::time::Instant;
 
-/// Why agent-talk refuses a second writer (DESIGN.md §6.5).
+/// Why agent-talk refuses a second writer (docs/agents/antigravity.md#writers-and-liveness).
 const SECOND_WRITER: &str = "agy has no lock between writers: a second process on the same conversation overwrites its steps by index and silently drops messages";
 
 /// What the transcript cannot show, attached to every turn derived from it.
@@ -76,8 +76,9 @@ fn check_id(id: &str) -> Result<()> {
 }
 
 /// agy starts a new conversation, with a warning only, when it does not find the id
-/// (DESIGN.md §6.5). Nothing reached the requested conversation: the receipt is rejected
-/// with this error, so a later `wait` does not take the other conversation's turn for it.
+/// (docs/agents/antigravity.md#sessions-and-history). Nothing reached the requested
+/// conversation: the receipt is rejected with this error, so a later `wait` does not take
+/// the other conversation's turn for it.
 fn mismatch(ran_in: &str, wanted: &str) -> Error {
     Error::new(
         ErrorCode::Precondition,
@@ -139,7 +140,8 @@ struct Summary {
     status: String,
 }
 
-/// The summary status during a turn; a killed run may leave it (DESIGN.md §6.5).
+/// The summary status during a turn; a killed run may leave it
+/// (docs/agents/antigravity.md#writers-and-liveness).
 const RUNNING: &str = "CASCADE_RUN_STATUS_RUNNING";
 
 const SUMMARY_COLUMNS: &str = "conversation_id, title, last_modified_time, workspace_uris, status";
@@ -342,10 +344,10 @@ impl<'a> Antigravity<'a> {
 
     /// What the run log of a run that is over (a `result`, or the process gone) means:
     /// without a user step agy never took the message and the receipt is `rejected` with
-    /// agy's error (DESIGN.md §3); without a `result` the turn `failed` when the process
-    /// exited unsuccessfully, else its outcome is unknown; otherwise the turn is the
-    /// `result`, and its denials are recorded. `status` is known when this command saw the
-    /// process exit.
+    /// agy's error (docs/architecture.md#adapters); without a `result` the turn `failed`
+    /// when the process exited unsuccessfully, else its outcome is unknown; otherwise the
+    /// turn is the `result`, and its denials are recorded. `status` is known when this
+    /// command saw the process exit.
     fn finished(
         &self,
         h: &str,
@@ -416,7 +418,8 @@ impl<'a> Antigravity<'a> {
     }
 
     /// A turn agent-talk did not run (or whose run log is gone), from the transcript
-    /// (DESIGN.md §6.5): the USER_INPUT `turn_id` must exist, and `foreign_end` decides.
+    /// (docs/agents/antigravity.md#sending-and-turn-end): the USER_INPUT `turn_id` must
+    /// exist, and `foreign_end` decides.
     fn foreign_turn(&self, id: &str, turn_id: &str) -> Result<Foreign> {
         // Presence before the transcript: a transcript read after the holder let go is
         // complete. Its error matters only for a turn the transcript does not close.
@@ -469,10 +472,11 @@ enum Foreign {
     Ended(model::Turn),
 }
 
-/// The rule for a turn agent-talk did not run (DESIGN.md §6.5), setting `turn`'s status and
-/// basis. A later USER_INPUT ends it (`closed`). Otherwise it is open while some process
-/// holds the conversation; once none does, nothing will add to it: completed when it ends
-/// with a reply (`replied`) and the summary `status` is not RUNNING, else unknown.
+/// The rule for a turn agent-talk did not run
+/// (docs/agents/antigravity.md#sending-and-turn-end), setting `turn`'s status and basis. A
+/// later USER_INPUT ends it (`closed`). Otherwise it is open while some process holds the
+/// conversation; once none does, nothing will add to it: completed when it ends with a
+/// reply (`replied`) and the summary `status` is not RUNNING, else unknown.
 fn foreign_end(
     mut turn: model::Turn,
     closed: bool,
@@ -521,9 +525,10 @@ fn foreign_end(
     Foreign::Ended(turn)
 }
 
-/// A conversation's `ls` state and `loaded` (DESIGN.md §6.5): from agent-talk's own child
-/// when one runs it, else from the presence lock (`None` when it could not be checked) and
-/// whether the summary status is RUNNING. A killed run leaves RUNNING with the lock released.
+/// A conversation's `ls` state and `loaded` (docs/agents/antigravity.md#writers-and-liveness):
+/// from agent-talk's own child when one runs it, else from the presence lock (`None` when it
+/// could not be checked) and whether the summary status is RUNNING. A killed run can leave
+/// RUNNING with the lock released.
 fn session_state(own_run: bool, held: Option<bool>, running: bool) -> (SessionState, Loaded) {
     let state = match (own_run, held, running) {
         (true, ..) | (false, Some(true), true) => SessionState::Running,
@@ -540,7 +545,7 @@ fn session_state(own_run: bool, held: Option<bool>, running: bool) -> (SessionSt
 
 /// `agy models` output: one line per model and effort, `gemini-3.8-flash-low\tGemini 3.8
 /// Flash (Low)`. `--model` takes the alias before the effort suffix, with that `--effort`
-/// (DESIGN.md §6.5), so the lines fold into the alias with its efforts.
+/// (docs/agents/antigravity.md#interface), so the lines fold into the alias with its efforts.
 fn parse_models(out: &str) -> Vec<Model> {
     let mut models: Vec<Model> = Vec::new();
     for line in out.lines() {

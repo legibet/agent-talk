@@ -91,7 +91,7 @@ impl Body {
 }
 
 /// One transcript line. Every field but `type` defaults when absent or when it does not
-/// fit (DESIGN.md §3).
+/// fit (docs/architecture.md#decoding-agent-records).
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Line {
@@ -277,7 +277,8 @@ fn ancestry(entries: &[Entry], by_uuid: &HashMap<&str, usize>, idx: usize) -> Ve
 
 /// Lines on the live branch: the newest main-chain line, if it descends from the newest
 /// `last-prompt.leafUuid`, else that leaf, and its ancestry. A concurrent `--resume`
-/// leaves orphaned branches in the file (DESIGN.md §6.2); they are excluded.
+/// leaves orphaned branches in the file (docs/agents/claude-code.md#writers-and-liveness); they
+/// are excluded.
 pub fn live_branch(entries: &[Entry]) -> HashSet<usize> {
     let by_uuid: HashMap<&str, usize> = entries
         .iter()
@@ -350,8 +351,9 @@ pub enum TurnEnd {
 
 /// The first line on the live branch after the prompt at `start` that ends its turn.
 /// Interactive sessions (entrypoint `cli`) write `system/turn_duration` at turn end, or an
-/// interrupt line on Esc; -p sessions write no marker, so only the next prompt ends their
-/// turns (DESIGN.md §6.2).
+/// interrupt line on Esc; -p sessions write no marker, so in the file only the next prompt
+/// ends their turns, and otherwise the end of every writing process does
+/// (docs/agents/claude-code.md#sending-and-turn-end).
 pub fn turn_end(entries: &[Entry], branch: &HashSet<usize>, start: usize) -> Option<TurnEnd> {
     (start + 1..entries.len())
         .filter(|i| branch.contains(i))
@@ -620,7 +622,8 @@ pub fn head(path: &Path) -> Head {
 
 /// Project directory name Claude uses for a cwd: every UTF-16 unit that is not ASCII
 /// alphanumeric becomes `-` (an astral character two of them). Claude cuts a name over
-/// `SLUG_CUT` units there and appends `-<hash>` of the cwd (2.1.311).
+/// `SLUG_CUT` units there and appends `-<hash>` of the cwd (read in the Claude Code 2.1.311
+/// binary; docs/agents/claude-code.md#sessions-and-history).
 pub fn slug(cwd: &str) -> String {
     let units: Vec<u16> = cwd.encode_utf16().collect();
     let mut name: String = units
@@ -741,8 +744,8 @@ mod tests {
         );
     }
 
-    /// Probe 1 shape: a concurrent resume (B) branches off A's tool_use; A's later
-    /// lines are the live leaf, B's turn is orphaned. a3b is a parallel tool_result sibling of A.
+    /// A concurrent resume (B) branches off A's tool_use; A's later lines are the live
+    /// leaf, B's turn is orphaned. a3b is a parallel tool_result sibling of A.
     #[test]
     fn orphaned_branch_is_excluded() {
         let lines = [

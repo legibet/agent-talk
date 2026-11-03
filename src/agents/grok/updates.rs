@@ -1,18 +1,17 @@
 //! ACP session updates, and `updates.jsonl`, the conversation log of a Grok session: the
-//! updates as persisted, one JSON object per line, append-only (DESIGN.md §6.4). Streamed
-//! chunks are coalesced on disk: one `agent_message_chunk` line per stretch of text.
+//! updates as persisted, one JSON object per line, append-only
+//! (docs/agents/grok.md#sessions-and-history). Streamed chunks are coalesced on disk: one
+//! `agent_message_chunk` line per stretch of text.
 //!
 //! An update (`params.update`, as Grok sends it live in `session/update` and
 //! `_x.ai/session_notification`) stays the `Value` it was, read field by field: a field of
-//! an unexpected type reads as absent and never hides the update (DESIGN.md §3).
+//! an unexpected type reads as absent and never hides the update
+//! (docs/architecture.md#decoding-agent-records).
 //!
-//! Turns: a `user_message_chunk` with `_meta.promptIndex` opens one, a `turn_completed
-//! {prompt_id, stop_reason}` closes it. Lines the agent writes during a turn carry its
-//! prompt id in `params._meta.promptId`, and the turn id is that prompt id (the
-//! `promptId` agent-talk chose for its turns). A second writer on the same session
-//! interleaves turns (DESIGN.md §6.4): the other process closes a running turn as
-//! `interrupted` and the first keeps appending to it, so lines are attributed by their
-//! prompt id where they carry one and by position otherwise, and the last
+//! A turn's id is its prompt id, which the agent's lines carry. A second writer on the same
+//! session interleaves turns and closes the running one as `interrupted` while the first
+//! keeps appending to it (docs/agents/grok.md#writers-and-liveness), so lines are attributed
+//! by their prompt id where they carry one and by position otherwise, and the last
 //! `turn_completed` of a prompt id is its end.
 
 use crate::agents::history::first_line;
@@ -349,8 +348,8 @@ pub fn first_prompt(path: &Path) -> Option<String> {
 mod tests {
     use super::*;
 
-    // Literal lines from probe sessions (grok 1.0.46: two-writer and step-3 probes); usage
-    // objects and long fields trimmed.
+    // Literal lines from probe sessions on grok 1.0.46; usage objects and long fields
+    // trimmed.
 
     /// Two `-p` processes on one session: A runs a shell loop, B starts meanwhile,
     /// closes A's turn as `interrupted` and runs its own; A keeps appending.

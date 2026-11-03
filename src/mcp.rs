@@ -56,11 +56,11 @@ pub struct Server {
     /// The session named by this server's environment at startup: `grok:<GROK_SESSION_ID>`,
     /// else `claude:<CLAUDE_CODE_SESSION_ID>`. Grok and Claude Code set their variable for
     /// each MCP server they spawn (one server per session) and send no session id in
-    /// `_meta` (DESIGN.md §4). Grok's goes first because Claude's is also inherited by
-    /// every shell command.
+    /// `_meta` (docs/behaviour.md#provenance-and-hops). Grok's goes first because Claude's
+    /// is also inherited by every shell command.
     env: Option<Caller>,
     /// The operations running, including the Grok and Devin turns kept after their call
-    /// returned; the server exits once they have ended (DESIGN.md §4).
+    /// returned; the server exits once they have ended (docs/behaviour.md#mcp-server).
     tasks: TaskTracker,
     tool_router: ToolRouter<Self>,
 }
@@ -116,8 +116,8 @@ struct NewParams {
 
 /// What `new` and `send` wait for: with wait=true the end of the turn, until the timeout;
 /// otherwise the acceptance of the message, with a keeper for a turn that needs agent-talk
-/// until it ends (Grok direct mode, Devin): its outcome arrives on the receiver at acceptance,
-/// and the turn goes on in the server (DESIGN.md §4).
+/// until it ends (Grok, Devin): its outcome arrives on the receiver at acceptance,
+/// and the turn goes on in the server (docs/behaviour.md#mcp-server).
 fn wait_for(wait: Option<bool>, timeout_s: Option<u64>) -> (Wait, oneshot::Receiver<Outcome>) {
     let (keeper, kept) = oneshot::channel();
     let wait = if wait.unwrap_or(false) {
@@ -206,14 +206,15 @@ impl Server {
         }
     }
 
-    /// Sender of one call, explicit pins first, then what the agent says:
+    /// Sender of one call, explicit pins first, then what the agent says
+    /// (docs/behaviour.md#provenance-and-hops):
     /// 1. `--caller`, else AGENT_TALK_CALLER;
     /// 2. the calling Codex thread from the request's `_meta` (`threadId`, else
-    ///    `x-codex-turn-metadata.thread_id`; sent on every tools/call; DESIGN.md §4),
-    ///    with its turn id. Checked before the environment: a Codex daemon started from a
-    ///    Claude shell carries an unrelated CLAUDE_CODE_SESSION_ID;
-    /// 3. the calling OpenCode session from `_meta["ai.opencode/sessionID"]` (sent on every
-    ///    tools/call). One stdio server serves every session of a
+    ///    `x-codex-turn-metadata.thread_id`), with its turn id. Checked before the
+    ///    environment: a Codex daemon started from a Claude shell carries an unrelated
+    ///    CLAUDE_CODE_SESSION_ID;
+    /// 3. the calling OpenCode session from `_meta["ai.opencode/sessionID"]` (read in
+    ///    OpenCode's source, may be absent). One stdio server serves every session of a
     ///    directory, so the environment says nothing about the caller;
     /// 4. the calling Antigravity conversation from `_meta["antigravity.google/conversation_id"]`
     ///    (sent on every tools/call);
@@ -459,7 +460,7 @@ impl ServerHandler for Server {
 }
 
 /// Serve until the client closes stdin, then exit once the operations still running,
-/// kept turns included, have ended (DESIGN.md §4).
+/// kept turns included, have ended (docs/behaviour.md#mcp-server).
 pub async fn serve(caller_arg: Option<String>) -> model::Result<()> {
     // Reject a malformed handle before accepting requests.
     let pinned = caller_arg
