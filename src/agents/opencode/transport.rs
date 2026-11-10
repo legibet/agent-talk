@@ -507,14 +507,16 @@ impl Service {
             })
     }
 
-    /// `integration.list`, which returns once the location's plugins are active, and with
-    /// them its configuration.
+    /// Wait until the location's plugins are active, and with them its configuration:
+    /// `integration.list` returns then up to 2.2.0, `model.default` on 2.2.7
+    /// (docs/agents/opencode.md#interface).
     pub async fn load_location(&self, directory: &str) -> Result<()> {
         self.send(
             self.request(reqwest::Method::GET, "/api/integration")
                 .query(&[("location[directory]", directory)]),
         )
-        .await
+        .await?;
+        self.default_model(directory).await.map(drop)
     }
 
     pub async fn events(&self) -> Result<Events> {

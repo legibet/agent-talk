@@ -14,10 +14,12 @@ OpenCode 2.0.22.
   a connect failure while the pid is alive is `E_TRANSPORT` (a sandbox, for instance).
 - Any request naming a directory makes the service load that location for its lifetime, so
   agent-talk sends only directories it was given.
-- The service answers a location's first requests before its configuration is applied, without
-  the user's default model and rules (2.0.23). So `new`, `send --full-access`, and `send
-  --effort` on a session without a model first call `GET /api/integration`, which waits for
-  plugin activation (read in source).
+- The service answers a location's first requests before its plugins applied the configuration:
+  `GET /api/agent` lists no agent, then the built-in agents with their built-in rules, and only
+  then the user's (2.2.7). Which request waits for the plugins changed between versions: `GET
+  /api/integration` up to 2.2.0, `GET /api/model/default` on 2.2.7, for at most 5 s (both read
+  in source). So `new`, `send --full-access`, and `send --effort` on a session without a model
+  first call both.
 - Events come over one global stream (`GET /api/event`) without replay, and executions run on
   without subscribers. So agent-talk subscribes before submitting, filters by session id, and
   then reads history and the pending permission requests.

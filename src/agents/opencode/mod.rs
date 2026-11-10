@@ -498,9 +498,8 @@ impl Agent for OpenCode<'_> {
     async fn start(&self, req: &StartRequest<'_>, wait: Wait) -> Result<Outcome> {
         let deadline = wait.deadline();
         let svc = self.connect().await?;
-        // The service answers a location's first requests before its configuration is
-        // applied; `integration.list` waits for plugin activation, which applies it
-        // (docs/agents/opencode.md#interface).
+        // The service answers a location's first requests before its plugins applied the
+        // configuration (docs/agents/opencode.md#interface).
         svc.load_location(req.cwd).await?;
         let mut body = json!({"location": {"directory": req.cwd}});
         let mut model = req
