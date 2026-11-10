@@ -75,8 +75,7 @@ delivered.
 ones. N counts the messages returned, on every agent. By default a page holds `prompt` and
 `final` messages, the conversation itself; `--all` adds `commentary` and `other`. Tool calls
 appear as `other` messages (`[tool name] status input`), the one place normalization goes past
-text; how calls are grouped into messages differs between agents, and Codex's tool items are
-not read. `--raw` returns the agent's own
+text; how calls are grouped into messages differs between agents. `--raw` returns the agent's own
 records of the span instead. A message an agent sent through agent-talk carries its sender in
 `from`; input the agent runtime injected (task notifications, system messages) has
 `from.kind: runtime` where the agent marks it as such.

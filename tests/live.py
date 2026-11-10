@@ -660,6 +660,12 @@ def codex_tier():
         expect(out["turn"]["turn_id"] != t0, "as a turn of its own")
         out = cli("wait", h, "--turn", t0, "--timeout", "5")
         expect(out["turn"]["status"] == "completed", "the first turn completed")
+        turns = cli("read", h, "--raw", "--limit", "20")["raw"]
+        items = [i for t in turns if t.get("id") == t0 for i in t.get("items", [])]
+        if not any(i.get("type") == "commandExecution" for i in items):
+            raise Inconclusive("the model ran no shell command in the first turn")
+        shown = [m for m in paged(h, 20) if m["turn_id"] == t0 and m["text"].startswith("[commandExecution]")]
+        expect(shown and shown[0]["phase"] == "other", "read --all: the shell call of the first turn")
 
     def dormant():
         # After an interrupt the thread runs no queued item on its own; send starts it.

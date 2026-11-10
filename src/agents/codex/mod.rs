@@ -520,6 +520,15 @@ impl<'a> Codex<'a> {
                         from: None,
                         timestamp: completed.clone(),
                     },
+                    Item::Tool(t) => Message {
+                        turn_id: turn.id.clone(),
+                        item_id: t.id,
+                        role: Role::Assistant,
+                        phase: Phase::Other,
+                        text: t.text,
+                        from: None,
+                        timestamp: completed.clone(),
+                    },
                     Item::Other => continue,
                 };
                 messages.push((i, message));
@@ -1021,7 +1030,8 @@ mod tests {
     }
 
     /// Prompts carry the turn's start time, replies its end; the agent's phase decides the
-    /// message phase, and items that are not messages or do not decode are skipped.
+    /// message phase, a tool call is an `other` message, and items that do not decode are
+    /// skipped.
     #[test]
     fn messages_map_items_and_phases() {
         let store = Store::memory();
@@ -1043,6 +1053,13 @@ mod tests {
                     Role::Assistant,
                     Phase::Commentary,
                     "Running the build."
+                ),
+                (
+                    0,
+                    "call_1",
+                    Role::Assistant,
+                    Phase::Other,
+                    "[commandExecution] completed cargo build"
                 ),
                 (
                     0,

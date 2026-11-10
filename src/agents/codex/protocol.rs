@@ -3,6 +3,7 @@
 //! keep the raw `Value`), plus the few request pieces shared by several call sites.
 
 use crate::agents::decode::{entries, or_default};
+use crate::agents::history::first_line;
 use crate::model::{AgentError, Error, ErrorCode};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -213,13 +214,14 @@ pub struct ItemNotification {
 
 // ---- items ----
 
-/// A turn item. Only user and agent messages are read; any other kind, and a user or
-/// agent message without its id, is `Other`, never displayed or matched.
+/// A turn item. User messages, agent messages and tool calls are read; any other kind,
+/// and an item without its id, is `Other`, never displayed or matched.
 #[derive(Deserialize, Debug)]
 #[serde(from = "Value")]
 pub enum Item {
     User(UserMessage),
     Agent(AgentMessage),
+    Tool(ToolCall),
     Other,
 }
 
@@ -228,7 +230,14 @@ impl From<Value> for Item {
         match v["type"].as_str() {
             Some("userMessage") => UserMessage::deserialize(&v).map_or(Item::Other, Item::User),
             Some("agentMessage") => AgentMessage::deserialize(&v).map_or(Item::Other, Item::Agent),
-            _ => Item::Other,
+            Some(kind) => match (v["id"].as_str(), tool_text(kind, &v)) {
+                (Some(id), Some(text)) => Item::Tool(ToolCall {
+                    id: id.into(),
+                    text,
+                }),
+                _ => Item::Other,
+            },
+            None => Item::Other,
         }
     }
 }
@@ -271,6 +280,51 @@ pub enum AgentPhase {
     Commentary,
     #[serde(other)]
     Other,
+}
+
+/// A tool call item, as `read --all` shows it.
+#[derive(Debug)]
+pub struct ToolCall {
+    pub id: String,
+    /// `[kind tool] status input` (docs/behaviour.md#reading-and-waiting).
+    pub text: String,
+}
+
+/// `[kind tool] status input` for a tool call item of `kind`: the tool where the item names
+/// one, the status where it has one, and the first line of its input (fields of the
+/// codex-cli 0.167.0 schema). `None` for the kinds that are not tool calls: reasoning,
+/// plans, hook prompts, sub-agent activity, review and compaction markers.
+fn tool_text(kind: &str, item: &Value) -> Option<String> {
+    let field = |k: &str| item[k].as_str().unwrap_or_default().to_string();
+    let json = |k: &str| match &item[k] {
+        Value::Null => String::new(),
+        v => v.to_string(),
+    };
+    let (tool, input) = match kind {
+        "commandExecution" => (String::new(), field("command")),
+        "fileChange" => {
+            let changes = item["changes"].as_array().into_iter().flatten();
+            let paths: Vec<&str> = changes.filter_map(|c| c["path"].as_str()).collect();
+            (String::new(), paths.join(", "))
+        }
+        "mcpToolCall" => (
+            format!("{}.{}", field("server"), field("tool")),
+            json("arguments"),
+        ),
+        "dynamicToolCall" => (field("tool"), json("arguments")),
+        "collabAgentToolCall" => (field("tool"), field("prompt")),
+        "webSearch" => (String::new(), field("query")),
+        "imageView" => (String::new(), field("path")),
+        "imageGeneration" => (String::new(), field("revisedPrompt")),
+        _ => return None,
+    };
+    let name = match tool.as_str() {
+        "" => format!("[{kind}]"),
+        tool => format!("[{kind} {tool}]"),
+    };
+    let parts = [name, field("status"), first_line(&input, 120)];
+    let shown: Vec<String> = parts.into_iter().filter(|p| !p.is_empty()).collect();
+    Some(shown.join(" "))
 }
 
 // ---- wire envelope ----
@@ -421,6 +475,38 @@ mod tests {
         let r = ThreadStartResponse::deserialize(m.result.as_ref().unwrap()).unwrap();
         assert_eq!(r.thread.id, "01a101c5-fcb5-77c1-804d-5c1bd9358f1f");
         assert_eq!(r.thread.status, ThreadStatus::Idle);
+    }
+
+    /// Tool call items read as `[kind tool] status input` with the empty parts left out;
+    /// an item that is no tool call, or has no id, is `Other`.
+    #[test]
+    fn tool_call_items() {
+        let text = |item: Value| match Item::from(item) {
+            Item::Tool(t) => Some(t.text),
+            _ => None,
+        };
+        let item = json!({"type": "mcpToolCall", "id": "c1", "server": "talk", "tool": "ls", "status": "failed", "arguments": {"agent": "codex"}});
+        assert_eq!(
+            text(item).as_deref(),
+            Some(r#"[mcpToolCall talk.ls] failed {"agent":"codex"}"#)
+        );
+        let item = json!({"type": "fileChange", "id": "c2", "status": "completed", "changes": [{"path": "a.rs", "diff": "@@"}, {"path": "b.rs"}]});
+        assert_eq!(
+            text(item).as_deref(),
+            Some("[fileChange] completed a.rs, b.rs")
+        );
+        let item = json!({"type": "webSearch", "id": "c3", "query": "rust flock", "action": {"type": "search"}});
+        assert_eq!(text(item).as_deref(), Some("[webSearch] rust flock"));
+        let item = json!({"type": "commandExecution", "id": "c4", "command": "\nsleep 1\nls", "status": "inProgress"});
+        assert_eq!(
+            text(item).as_deref(),
+            Some("[commandExecution] inProgress sleep 1")
+        );
+        assert_eq!(text(json!({"type": "reasoning", "id": "rs_1"})), None);
+        assert_eq!(
+            text(json!({"type": "commandExecution", "command": "ls"})),
+            None
+        );
     }
 
     #[test]
