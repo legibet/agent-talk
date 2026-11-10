@@ -144,6 +144,10 @@ struct Summary {
 /// (docs/agents/antigravity.md#writers-and-liveness).
 const RUNNING: &str = "CASCADE_RUN_STATUS_RUNNING";
 
+/// How long after a turn's process freed the presence lock the status can still say RUNNING
+/// (5 to 30 ms on agy 1.5.5), with a margin.
+const STATUS_LAG: Duration = Duration::from_millis(200);
+
 const SUMMARY_COLUMNS: &str = "conversation_id, title, last_modified_time, workspace_uris, status";
 
 fn summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Summary> {
@@ -846,7 +850,14 @@ impl Agent for Antigravity<'_> {
                         "the receipt has no turn id and no run log; its outcome cannot be recovered",
                     ));
                 };
-                match self.foreign_turn(id, t)? {
+                let mut end = self.foreign_turn(id, t)?;
+                // agy writes IDLE a moment after it frees the lock, so an unknown end is
+                // observed once more (docs/agents/antigravity.md#sending-and-turn-end).
+                if matches!(&end, Foreign::Ended(turn) if turn.status == TurnStatus::Unknown) {
+                    tokio::time::sleep(STATUS_LAG).await;
+                    end = self.foreign_turn(id, t)?;
+                }
+                match end {
                     Foreign::Ended(turn) => return Ok((turn, Vec::new())),
                     Foreign::Open(w) => waiting_for = w,
                 }

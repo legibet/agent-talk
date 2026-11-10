@@ -87,7 +87,8 @@ lock without `RUNNING` is an idle TUI or a turn whose status was reset, and a fr
   the log, a receipt that names no turn stays `unknown` (no text matching).
 - A turn agent-talk did not run ends at the next user input, or at a final response without tool
   calls once the lock is free and the status is not `RUNNING`; short of that it is `running` or
-  `unknown` with a `basis`.
+  `unknown` with a `basis`. agy writes `IDLE` 5 to 30 ms after it frees the lock (1.5.5), so
+  `wait` observes a turn that looks `unknown` once more before it reports that.
 - A line written during a turn becomes the next turn: there is no steer (`E_NO_STEER`). A send
   while a turn runs meets the lock and is refused.
 
