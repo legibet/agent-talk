@@ -29,11 +29,11 @@ covers many unrelated refusals, so errors are told apart by method and message.
 - `read` maps `agentMessage` phases (`final_answer`, `commentary`) and shows each tool call item
   as one `other` message: commands, file changes, MCP, dynamic and collaboration tool calls, web
   searches, image views and image generations (item types of 0.167.0). Reasoning, plans, hook
-  prompts, sub-agent activity and review and compaction markers are skipped. Item times are not
-  read (items had none on 0.160.0): a prompt gets its turn's start, a reply or tool call its end.
-  A prompt's sender is looked up by `userMessage.clientId`, which holds the
-  `clientUserMessageId` of the `turn/start`, `turn/steer` or `thread/queue/add` that delivered
-  the message (0.166.0).
+  prompts, sub-agent activity and review and compaction markers are skipped. A prompt's time is
+  its item's start, a reply's or tool call's its item's end (0.167.0); an item without them, as
+  every item was on 0.160.0, gets its turn's start or end. A prompt's sender is looked up by
+  `userMessage.clientId`, which holds the `clientUserMessageId` of the `turn/start`,
+  `turn/steer` or `thread/queue/add` that delivered the message (0.166.0).
 - `thread/list` returns only interactive sources unless source kinds are named (`ls --all` adds
   sub-agent and unknown kinds). It has one row per rollout file, so a thread resumed into a new
   file repeats and only its newest row counts. The state-DB-only listing avoids the repeats but

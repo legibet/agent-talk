@@ -215,7 +215,8 @@ pub struct ItemNotification {
 // ---- items ----
 
 /// A turn item. User messages, agent messages and tool calls are read; any other kind,
-/// and an item without its id, is `Other`, never displayed or matched.
+/// and an item without its id, is `Other`, never displayed or matched. An item's times are
+/// Unix milliseconds, absent on items written before codex-cli 0.167.0.
 #[derive(Deserialize, Debug)]
 #[serde(from = "Value")]
 pub enum Item {
@@ -234,6 +235,7 @@ impl From<Value> for Item {
                 (Some(id), Some(text)) => Item::Tool(ToolCall {
                     id: id.into(),
                     text,
+                    completed_at_ms: v["completedAtMs"].as_i64(),
                 }),
                 _ => Item::Other,
             },
@@ -250,6 +252,8 @@ pub struct UserMessage {
     pub client_id: Option<String>,
     #[serde(default, deserialize_with = "or_default")]
     pub content: Vec<Value>,
+    #[serde(default, deserialize_with = "or_default")]
+    pub started_at_ms: Option<i64>,
 }
 
 impl UserMessage {
@@ -265,12 +269,15 @@ impl UserMessage {
 }
 
 #[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
 pub struct AgentMessage {
     pub id: String,
     #[serde(default, deserialize_with = "or_default")]
     pub text: String,
     #[serde(default, deserialize_with = "or_default")]
     pub phase: Option<AgentPhase>,
+    #[serde(default, deserialize_with = "or_default")]
+    pub completed_at_ms: Option<i64>,
 }
 
 #[derive(Deserialize, Debug, Clone, Copy, PartialEq)]
@@ -288,6 +295,7 @@ pub struct ToolCall {
     pub id: String,
     /// `[kind tool] status input` (docs/behaviour.md#reading-and-waiting).
     pub text: String,
+    pub completed_at_ms: Option<i64>,
 }
 
 /// `[kind tool] status input` for a tool call item of `kind`: the tool where the item names

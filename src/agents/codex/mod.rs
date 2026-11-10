@@ -491,8 +491,15 @@ impl<'a> Codex<'a> {
                     continue;
                 }
             };
+            // An item without its own time gets its turn's
+            // (docs/agents/codex.md#sessions-and-history).
             let started = timestamp(turn.started_at);
             let completed = timestamp(turn.completed_at).or_else(|| started.clone());
+            let at = |ms: Option<i64>, turn_time: &Option<String>| {
+                ms.and_then(|ms| jiff::Timestamp::from_millisecond(ms).ok())
+                    .map(|t| t.to_string())
+                    .or_else(|| turn_time.clone())
+            };
             for item in turn.items {
                 let message = match item {
                     Item::User(u) => Message {
@@ -504,7 +511,7 @@ impl<'a> Codex<'a> {
                             Some(c) => self.store.sender_of(c)?,
                             None => None,
                         },
-                        timestamp: started.clone(),
+                        timestamp: at(u.started_at_ms, &started),
                         item_id: u.id,
                     },
                     Item::Agent(a) => Message {
@@ -518,7 +525,7 @@ impl<'a> Codex<'a> {
                         },
                         text: a.text,
                         from: None,
-                        timestamp: completed.clone(),
+                        timestamp: at(a.completed_at_ms, &completed),
                     },
                     Item::Tool(t) => Message {
                         turn_id: turn.id.clone(),
@@ -527,7 +534,7 @@ impl<'a> Codex<'a> {
                         phase: Phase::Other,
                         text: t.text,
                         from: None,
-                        timestamp: completed.clone(),
+                        timestamp: at(t.completed_at_ms, &completed),
                     },
                     Item::Other => continue,
                 };
@@ -1008,7 +1015,7 @@ mod tests {
     // A full-items turn in the shape of `thread/turns/list` (codex-cli 0.162.1): a
     // commentary, a tool call, the final answer, then a malformed and a phase-less agent
     // message.
-    const FULL_TURN: &str = r#"{"id":"01a13552-4235-74b1-8363-86f62efed88f","items":[{"type":"userMessage","id":"01a13552-4236-7a52-8b0c-1f2e3d4c5b6a","clientId":null,"content":[{"type":"text","text":"check the build","text_elements":[]},{"type":"image","url":"data:,"}]},{"type":"agentMessage","id":"msg_1","text":"Running the build.","phase":"commentary","memoryCitation":null,"delivery":null,"questions":null},{"type":"commandExecution","id":"call_1","command":"cargo build","status":"completed"},{"type":"agentMessage","id":"msg_2","text":"The build passes.","phase":"final_answer","memoryCitation":null,"delivery":null,"questions":null},{"type":"agentMessage","text":"no id"},{"type":"agentMessage","id":"msg_3","text":"One more note.","phase":null}],"itemsView":"full","status":"completed","error":null,"startedAt":1791895945,"completedAt":1791895962,"durationMs":16416}"#;
+    const FULL_TURN: &str = r#"{"id":"01a13552-4235-74b1-8363-86f62efed88f","items":[{"type":"userMessage","id":"01a13552-4236-7a52-8b0c-1f2e3d4c5b6a","clientId":null,"startedAtMs":1791895945123,"completedAtMs":1791895945124,"content":[{"type":"text","text":"check the build","text_elements":[]},{"type":"image","url":"data:,"}]},{"type":"agentMessage","id":"msg_1","text":"Running the build.","phase":"commentary","startedAtMs":1791895946000,"completedAtMs":1791895947500,"memoryCitation":null,"delivery":null,"questions":null},{"type":"commandExecution","id":"call_1","command":"cargo build","status":"completed","startedAtMs":1791895948000,"completedAtMs":1791895955250},{"type":"agentMessage","id":"msg_2","text":"The build passes.","phase":"final_answer","completedAtMs":null,"memoryCitation":null,"delivery":null,"questions":null},{"type":"agentMessage","text":"no id"},{"type":"agentMessage","id":"msg_3","text":"One more note.","phase":null,"completedAtMs":"soon"}],"itemsView":"full","status":"completed","error":null,"startedAt":1791895945,"completedAt":1791895962,"durationMs":16416}"#;
 
     fn turn(frame: &str) -> protocol::Turn {
         serde_json::from_str(frame).unwrap()
@@ -1029,9 +1036,10 @@ mod tests {
         assert_eq!(t.final_text.as_deref(), Some("Still looking."));
     }
 
-    /// Prompts carry the turn's start time, replies its end; the agent's phase decides the
-    /// message phase, a tool call is an `other` message, and items that do not decode are
-    /// skipped.
+    /// A message carries its item's time, the start for a prompt and the end for a reply or
+    /// tool call, or its turn's when the item has no readable one. The agent's phase decides
+    /// the message phase, a tool call is an `other` message, and items that do not decode
+    /// are skipped.
     #[test]
     fn messages_map_items_and_phases() {
         let store = Store::memory();
@@ -1073,10 +1081,19 @@ mod tests {
         );
         let (_, prompt) = &messages[0];
         assert_eq!(prompt.turn_id, "01a13552-4235-74b1-8363-86f62efed88f");
-        assert_eq!(prompt.timestamp.as_deref(), Some("2026-10-13T12:52:25Z"));
+        let times: Vec<_> = messages
+            .iter()
+            .map(|(_, m)| m.timestamp.as_deref().unwrap())
+            .collect();
         assert_eq!(
-            messages[2].1.timestamp.as_deref(),
-            Some("2026-10-13T12:52:42Z")
+            times,
+            [
+                "2026-10-13T12:52:25.123Z",
+                "2026-10-13T12:52:27.5Z",
+                "2026-10-13T12:52:35.25Z",
+                "2026-10-13T12:52:42Z",
+                "2026-10-13T12:52:42Z",
+            ]
         );
     }
 }
