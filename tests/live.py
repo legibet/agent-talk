@@ -846,6 +846,7 @@ def claude_tier():
         proc.wait(timeout=30)
         out = cli("wait", h, "--turn", prompt_id, "--timeout", "10")
         expect(out["turn"]["status"] == "completed", "wait: completed once it exits")
+        expect(ls_row("claude", h)["state"] == "idle", "ls: idle once no process holds the session")
 
     for name, fn in (("settings", settings), ("foreign-process", foreign_process)):
         check("claude", name, fn)

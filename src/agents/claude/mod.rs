@@ -392,6 +392,9 @@ impl<'a> Claude<'a> {
                 Some("idle") => SessionState::Idle,
                 _ => SessionState::Unknown,
             }
+        } else if agents_ok {
+            // No process holds the session (docs/behaviour.md#sessions).
+            SessionState::Idle
         } else {
             SessionState::Unknown
         };

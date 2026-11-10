@@ -16,7 +16,9 @@ operations on it:
   `agent-talk` for sessions it started.
 
 A session also has a `state` (`idle`, `running`, `waiting`, `unknown`) and is `owned` when
-agent-talk started it.
+agent-talk started it. A session that no process holds is `idle`, since nothing can be running a
+turn in it. Its state is `unknown` where the agent cannot show whether a process holds it, or
+where the agent's own record says a turn is running in a session no process holds.
 
 `ls` without `--agent` returns every agent's first page; an agent that fails is reported in
 `errors` and does not hide the others. Each row shows the session's `name` and a `preview`, so a

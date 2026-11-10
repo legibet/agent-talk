@@ -30,7 +30,8 @@ names, plus `haiku` (accepted on 2.1.291): the one model list agent-talk carries
   crosses a compaction. Other branches appear only in `read --raw`, and `wait` on a turn there is
   refused. Sub-agent transcripts are not read.
 - `ls` adds `claude agents`: `running` while an agent-talk child runs the session or the listing
-  says `busy`, `idle` when it says `idle`, else `unknown`.
+  says `busy`, `idle` when it says `idle` or lists no live process for the session, else
+  `unknown`.
 
 ## Writers and liveness
 
