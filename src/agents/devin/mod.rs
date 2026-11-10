@@ -101,6 +101,17 @@ impl Listed {
     }
 }
 
+/// The refusal of a `send` to a session agent-talk did not start, which Devin stored in the
+/// permission mode `stored` and ACP opens in `opened` (docs/agents/devin.md#approvals).
+fn mode_differs(h: &str, stored: &str, opened: &str) -> Error {
+    Error::new(
+        ErrorCode::Unsupported,
+        format!(
+            "{h} is stored in permission mode {stored}, but Devin's ACP interface opens it in {opened} and would store that with the user's session, so agent-talk only reads it"
+        ),
+    )
+}
+
 /// `session/set_config_option`: `config` (`model`, `thought_level`) of the session, which
 /// Devin stores with it. Devin refuses a value outside the option's list
 /// (docs/agents/devin.md#settings).
@@ -628,6 +639,12 @@ impl Agent for Devin<'_> {
         }
         let policy = approval_policy(self.store, &h)?;
         let owned = self.store.is_owned(&h)?;
+        // ACP offers no `normal` mode: it opens such a session in `accept-edits`, and the
+        // child stores that when it exits, prompt or not. So the session is refused before
+        // the load (docs/agents/devin.md#approvals).
+        if !owned && row.agent_mode == "normal" {
+            return Err(mode_differs(&h, &row.agent_mode, "accept-edits"));
+        }
         let mut conn = self.connect(Path::new(&row.cwd)).await?;
         let res = async {
             let params = json!({"sessionId": id, "cwd": row.cwd, "mcpServers": []});
@@ -637,19 +654,16 @@ impl Agent for Devin<'_> {
             };
             // The history replay, which arrives before the response.
             conn.discard_notifications();
-            // ACP offers no `normal` mode: a session stored in it loads as `accept-edits`,
-            // and one prompt would store that. A session agent-talk did not start runs only
-            // in the mode Devin stored for it, read again now that the lock excludes every
-            // other writer (docs/agents/devin.md#approvals).
+            // A session agent-talk did not start runs only in the mode Devin stored for it,
+            // read again now that the lock excludes every other writer
+            // (docs/agents/devin.md#approvals).
             let mode = loaded["modes"]["currentModeId"].as_str();
             let stored = self.session_row(&self.db()?, id)?.agent_mode;
             if !owned && mode != Some(stored.as_str()) {
-                return Err(Error::new(
-                    ErrorCode::Unsupported,
-                    format!(
-                        "{h} is stored in permission mode {stored}, but Devin's ACP interface opens it in {}; a prompt would change the user's session to that mode, so agent-talk only reads it",
-                        mode.unwrap_or("no reported mode")
-                    ),
+                return Err(mode_differs(
+                    &h,
+                    &stored,
+                    mode.unwrap_or("no reported mode"),
                 ));
             }
             // Devin keeps model, effort and mode with the session, so only a change is

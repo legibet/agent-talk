@@ -68,9 +68,10 @@ it does not say.
 
 ## Sending and turn end
 
-- `send` checks the session row and its directory, runs `session/load` (whose history replay is
-  discarded), checks the mode of a session agent-talk did not start ([Approvals](#approvals)),
-  applies a settings change, records the intent and the child's pid, and prompts.
+- `send` checks the session row and its directory, then the mode of a session agent-talk did not
+  start, before and after `session/load` ([Approvals](#approvals)); the load's history replay is
+  discarded. It then applies a settings change, records the intent and the child's pid, and
+  prompts.
 - Devin admits one process per session, so there is no queue: a send while a turn runs is refused
   by the lock. A second `session/prompt` on the holding connection would join the running turn,
   but no later command can reach that connection, so `--steer` is refused (`E_NO_STEER`).
@@ -103,10 +104,14 @@ MCP calls ask, and the user's `permissions.allow` rules apply. Sessions agent-ta
 therefore run in `accept-edits` rather than the user's default.
 
 ACP offers no `normal` mode, the CLI's default: a session stored in it loads as `accept-edits`,
-and one prompt would store that. So a session agent-talk did not start is sent to only when the
-mode `session/load` reports equals its stored `agent_mode`, read again after the load (the lock
-then excludes every other writer); otherwise `send` is refused with `E_UNSUPPORTED` before
-anything is recorded. `read` and `wait` work on every session.
+and the `devin acp` process stores that when it exits, even without a prompt (3000.12.43; on
+3000.11.228 only a prompt stored it). So `send` refuses a `normal` session agent-talk did not
+start before `session/load`. Any other session it did not start is sent to only when the mode
+`session/load` reports equals its stored `agent_mode`, read again after the load (the lock then
+excludes every other writer). Both refusals are `E_UNSUPPORTED`, before anything is recorded.
+The first check is not atomic with the load: a session that another process turns `normal` in
+between is refused after the load, and the child's exit then stores `accept-edits`. `read` and
+`wait` work on every session.
 
 On sessions agent-talk started it answers `session/request_permission` with `reject_once` (Devin
 offers no reject-always): the tool fails, the model goes on and the turn ends `end_turn`. On the
@@ -165,5 +170,6 @@ there.
   turn until the server exits.
 - Each `devin acp` run (also for `ls`, `models` and `wait`'s holder checks) leaves a log file
   under `~/.local/share/devin/cli/logs/`; `models` also leaves a lock file.
-- Unverified: errors from the model service over ACP, `session/close`, and whether a TUI shows a
-  turn another process ran once it reopens the session.
+- Unverified: errors from the model service over ACP, `session/close`, whether a TUI shows a
+  turn another process ran once it reopens the session, and whether a load also changes the
+  stored mode of a session in a mode other than `normal` that ACP opens differently.
