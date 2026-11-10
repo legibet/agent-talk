@@ -46,8 +46,10 @@ in the summary's first workspace and is refused when that directory is gone.
 
 ## Writers and liveness
 
-`presence/<id>.lock` is flocked by the process that has the conversation open: `-p` from
-startup, a TUI from its first prompt, moved on `/new`, released on exit or `kill -9`. It does not
+`presence/<id>.lock` is flocked by the process that has the conversation open. A `-p` process
+takes it at startup and releases it when it writes `result`, about half a second before it exits
+(1.5.4), so a send right after a turn's `result` finds the lock free. A TUI takes it at its first
+prompt, moves it on `/new` and releases it on exit. `kill -9` releases it too. The lock does not
 name its holder.
 
 agy ignores its own lock. A second `-p --conversation X` runs while another process holds X;

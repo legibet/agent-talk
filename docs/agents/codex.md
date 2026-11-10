@@ -28,7 +28,9 @@ covers many unrelated refusals, so errors are told apart by method and message.
   lookup treat the window as an empty history.
 - `read` maps `agentMessage` phases (`final_answer`, `commentary`) and skips other items, so
   `read --all` shows no tool calls. Items carry no time: a prompt gets its turn's start, a reply
-  its end.
+  its end. A prompt's sender is looked up by `userMessage.clientId`, which holds the
+  `clientUserMessageId` of the `turn/start`, `turn/steer` or `thread/queue/add` that delivered
+  the message (0.166.0).
 - `thread/list` returns only interactive sources unless source kinds are named (`ls --all` adds
   sub-agent and unknown kinds). It has one row per rollout file, so a thread resumed into a new
   file repeats and only its newest row counts. The state-DB-only listing avoids the repeats but
@@ -126,6 +128,4 @@ Under approval policy `never`, Codex fails MCP tool calls unless the server entr
 - A connection lost mid-`wait` ends with `E_TRANSPORT` without a history re-read.
 - `status` marks a method unavailable only when the daemon reports it missing.
 - Unverified: how a terminal TUI renders a decline from agent-talk; `send` changing the model
-  (effort and full access were exercised); whether `turn/start` and `turn/steer` store the
-  `clientUserMessageId` as `userMessage.clientId`, which `read` needs to name the sender (checked
-  for `thread/queue/add` only).
+  (effort and full access were exercised).
