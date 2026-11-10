@@ -104,7 +104,7 @@ struct NewParams {
     model: Option<String>,
     /// A title that ls shows. Antigravity does not support titles.
     name: Option<String>,
-    /// An effort value returned by `models` for the selected model. Defaults to the agent's setting. Antigravity requires this when model is supplied.
+    /// An effort value returned by `models` for the selected model. Defaults to the agent's setting.
     effort: Option<String>,
     /// Allow file edits, commands and network access without approval prompts. Defaults to false, which uses the agent's own permissions. The session runs unattended, so actions requiring approval are denied by the agent or declined by agent-talk.
     full_access: Option<bool>,

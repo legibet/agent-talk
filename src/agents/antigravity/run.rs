@@ -16,9 +16,9 @@ use std::time::Duration;
 use tokio::process::Child;
 
 /// `agy -p` arguments for one turn. The model and effort pass as given: agent-talk adds no
-/// default effort, so agy refuses a model alias without one (`--model gemini-3.8-flash
-/// requires --effort`). Nothing here persists across runs
-/// (docs/agents/antigravity.md#settings), so every turn passes all of it again.
+/// default effort, so a model alias without one runs at agy's default for it. Nothing here
+/// persists across runs (docs/agents/antigravity.md#settings), so every turn passes all of
+/// it again.
 pub fn args(conversation: Option<&str>, settings: &Settings) -> Vec<String> {
     let mut args: Vec<String> = [
         "-p",
@@ -259,8 +259,8 @@ mod tests {
         r#"{"event":"result","result":{"conversation_id":"06615f44-46a4-4237-8139-581ebfb0c167","status":"SUCCESS","response":"I have launched `sleep 25` and will wait for it to finish.\nDONE1\n","duration_seconds":31.833063,"num_turns":1,"usage":{"input_tokens":38285,"output_tokens":376,"thinking_tokens":244,"cache_read_tokens":0,"total_tokens":38661}}}"#,
     ];
     const DENIED_RESULT: &str = r#"{"event":"result","result":{"conversation_id":"d3a52273-f08b-48af-8990-ad267df0433b","status":"SUCCESS","response":"","duration_seconds":4.4268979999999996,"num_turns":1,"usage":{"input_tokens":12337,"output_tokens":161,"thinking_tokens":49,"cache_read_tokens":0,"total_tokens":12498},"denied_actions":[{"action":"command","display_name":"RunCommand"}]}}"#;
-    // `--model` without `--effort`: no init, an error result (agy exit 1).
-    const MODEL_ERROR: &str = r#"{"event":"result","result":{"conversation_id":"","status":"ERROR","response":"","error":"invalid model selection (--model \"gemini-3.8-flash\" --effort \"\"): --model gemini-3.8-flash requires --effort (available: low, medium, high)"}}"#;
+    // An invalid model selection: no init, an error result (agy exit 1).
+    const MODEL_ERROR: &str = r#"{"event":"result","result":{"conversation_id":"","status":"ERROR","response":"","error":"invalid model selection (--model \"gemini-3.8-flash\" --effort \"bogus\"): invalid --effort \"bogus\" (valid: low, medium, high, xhigh, max)","duration_seconds":0,"num_turns":0,"usage":{"input_tokens":0,"output_tokens":0,"thinking_tokens":0,"cache_read_tokens":0,"total_tokens":0},"finished_reason":"error"}}"#;
 
     fn run(lines: &[&str]) -> Run {
         let mut run = Run::default();

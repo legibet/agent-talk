@@ -421,8 +421,9 @@ impl<'a> Antigravity<'a> {
     /// (docs/agents/antigravity.md#sending-and-turn-end): the USER_INPUT `turn_id` must
     /// exist, and `foreign_end` decides.
     fn foreign_turn(&self, id: &str, turn_id: &str) -> Result<Foreign> {
-        // Presence before the transcript: a transcript read after the holder let go is
-        // complete. Its error matters only for a turn the transcript does not close.
+        // Presence before the transcript: a transcript read after the lock's holder let go
+        // has all that holder wrote. Its error matters only for a turn the transcript does
+        // not close.
         let held = self.presence_held(id);
         let lines = load(&self.transcript_path(id))?;
         let Some(start) = user_input(&lines, turn_id) else {
@@ -475,8 +476,9 @@ enum Foreign {
 /// The rule for a turn agent-talk did not run
 /// (docs/agents/antigravity.md#sending-and-turn-end), setting `turn`'s status and basis. A
 /// later USER_INPUT ends it (`closed`). Otherwise it is open while some process holds the
-/// conversation; once none does, nothing will add to it: completed when it ends with a
-/// reply (`replied`) and the summary `status` is not RUNNING, else unknown.
+/// presence lock. Once none does, the turn is taken as over, which is best effort, since an
+/// `agy acp` process holds no lock (docs/agents/antigravity.md#limitations): completed when
+/// it ends with a reply (`replied`) and the summary `status` is not RUNNING, else unknown.
 fn foreign_end(
     mut turn: model::Turn,
     closed: bool,
@@ -502,14 +504,14 @@ fn foreign_end(
         (
             TurnStatus::Completed,
             format!(
-                "transcript-derived, best effort: the turn ends with a reply without tool calls, no process holds the conversation and the summary status is {status:?}"
+                "transcript-derived, best effort: the turn ends with a reply without tool calls, no process holds the presence lock and the summary status is {status:?}"
             ),
         )
     } else {
         (
             TurnStatus::Unknown,
             format!(
-                "transcript-derived: no process holds the conversation, the summary status is {status:?} (a killed run may leave RUNNING) and the transcript {} (a denied tool ends the turn without a reply)",
+                "transcript-derived: no process holds the presence lock, the summary status is {status:?} (a killed run may leave RUNNING) and the transcript {} (a denied tool ends the turn without a reply)",
                 if replied {
                     "ends with a reply"
                 } else {
@@ -527,13 +529,14 @@ fn foreign_end(
 
 /// A conversation's `ls` state and `loaded` (docs/agents/antigravity.md#writers-and-liveness):
 /// from agent-talk's own child when one runs it, else from the presence lock (`None` when it
-/// could not be checked) and whether the summary status is RUNNING. A killed run can leave
-/// RUNNING with the lock released.
+/// could not be checked) and whether the summary status is RUNNING. The status alone proves
+/// neither: a killed run can leave RUNNING with the lock released, and another agy process
+/// starting resets a running turn's status until its next step.
 fn session_state(own_run: bool, held: Option<bool>, running: bool) -> (SessionState, Loaded) {
     let state = match (own_run, held, running) {
         (true, ..) | (false, Some(true), true) => SessionState::Running,
-        (false, Some(false), true) | (false, None, _) => SessionState::Unknown,
-        (false, Some(_), false) => SessionState::Idle,
+        (false, Some(false), false) => SessionState::Idle,
+        (false, ..) => SessionState::Unknown,
     };
     let loaded = match (own_run, held) {
         (true, _) | (_, Some(true)) => Loaded::Yes,
@@ -975,9 +978,9 @@ mod tests {
         // A later USER_INPUT ends the turn, whoever holds the lock.
         assert_eq!(end(true, true, true, RUNNING), Some(TurnStatus::Completed));
         assert_eq!(end(true, false, false, ""), Some(TurnStatus::Unknown));
-        // Open while some process holds the conversation.
+        // Open while some process holds the presence lock.
         assert_eq!(end(false, true, true, IDLE), None);
-        // Nobody holds it: a reply completes it unless the summary says RUNNING.
+        // The lock is free: a reply completes it unless the summary says RUNNING.
         assert_eq!(end(false, true, false, IDLE), Some(TurnStatus::Completed));
         assert_eq!(end(false, true, false, ""), Some(TurnStatus::Completed));
         assert_eq!(end(false, true, false, RUNNING), Some(TurnStatus::Unknown));
@@ -993,7 +996,11 @@ mod tests {
         );
         assert_eq!(session_state(true, None, false), (S::Running, L::Yes));
         assert_eq!(session_state(false, Some(true), true), (S::Running, L::Yes));
-        assert_eq!(session_state(false, Some(true), false), (S::Idle, L::Yes));
+        // An idle TUI, or a running turn whose status another agy start reset.
+        assert_eq!(
+            session_state(false, Some(true), false),
+            (S::Unknown, L::Yes)
+        );
         // A killed run leaves RUNNING with the lock released.
         assert_eq!(session_state(false, Some(false), true), (S::Unknown, L::No));
         assert_eq!(session_state(false, Some(false), false), (S::Idle, L::No));

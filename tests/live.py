@@ -1177,7 +1177,8 @@ def antigravity_tier():
         wait_for(lambda: agy_lock_held(conv), 30, "the foreign agy process took the presence lock")
         out = cli("send", h, "x", expect_exit=2)
         expect(code(out) == "E_FOREIGN_LIVE", "E_FOREIGN_LIVE")
-        expect(ls_row("antigravity", h)["observations"]["loaded"] == "yes", "ls: loaded")
+        row = ls_row("antigravity", h)
+        expect(row["observations"]["loaded"] == "yes" and row["state"] == "unknown", "ls: loaded, unknown")
         line = {"event": "user", "message": {"content": "reply with the single word foreign"}}
         proc.stdin.write(json.dumps(line) + "\n")
         proc.stdin.flush()

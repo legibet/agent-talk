@@ -27,8 +27,7 @@ run unattended: actions that require approval are denied by the agent or decline
 
 `--model <id>` and `--effort <value>` select the model and reasoning effort; omitted options use
 the agent's defaults. `agent-talk models <agent> [query]` lists model IDs and their accepted effort
-values. The optional query filters IDs by substring. Antigravity requires `--effort` when
-`--model` is supplied.
+values. The optional query filters IDs by substring.
 
 Codex requires its app-server daemon to be running. OpenCode requires its background service,
 which an open OpenCode client also provides. agent-talk connects to these services without
@@ -64,7 +63,9 @@ messages, without the turn sent before. In sessions created outside agent-talk, 
 approval requests for the user to answer.
 
 Antigravity releases a session when the user switches away with `/new`, but keeps it in memory.
-Returning to it with `/resume` overwrites messages that agent-talk added in the meantime.
+Returning to it with `/resume` overwrites messages that agent-talk added in the meantime. A client
+that drives Antigravity through `agy acp` cannot be detected: a `send` to a session it has open is
+not refused and can overwrite that client's messages.
 
 ## Wait for the result
 
