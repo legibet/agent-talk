@@ -111,6 +111,9 @@ struct Line {
     is_sidechain: bool,
     #[serde(default, deserialize_with = "or_default")]
     is_meta: bool,
+    /// The summary a compaction puts in place of the earlier conversation.
+    #[serde(default, deserialize_with = "or_default")]
+    is_compact_summary: bool,
     #[serde(default, deserialize_with = "or_default")]
     message: Option<Body>,
     #[serde(default, deserialize_with = "or_default")]
@@ -195,12 +198,13 @@ impl Line {
     }
 
     /// A user line that starts a turn: content that is not only tool results, and not
-    /// injected meta content, a sub-agent line, local-command bookkeeping or an interrupt
-    /// marker.
+    /// injected meta content, a compaction summary, a sub-agent line, local-command
+    /// bookkeeping or an interrupt marker.
     fn is_prompt(&self) -> bool {
         self.kind == "user"
             && !self.is_sidechain
             && !self.is_meta
+            && !self.is_compact_summary
             && !self.is_interrupt()
             && !self.is_local_command()
             && self.message.as_ref().is_some_and(Body::is_input)
@@ -418,7 +422,7 @@ pub fn transcript_turn(
                 td["durationMs"].as_i64(),
                 format!(
                     "transcript-derived, best effort: system/turn_duration after the prompt (pendingBackgroundAgentCount {}; claude agents status {})",
-                    td["pendingBackgroundAgentCount"],
+                    td["pendingBackgroundAgentCount"].as_i64().unwrap_or(0),
                     agent_status.unwrap_or("not listed")
                 ),
             )
@@ -483,11 +487,11 @@ pub fn messages(entries: &[Entry], branch: &HashSet<usize>) -> Vec<(usize, Messa
 }
 
 /// Normalize one transcript line. Only `user` and `assistant` lines carry content;
-/// thinking-only lines yield nothing. Injected meta content and local slash-command
-/// bookkeeping are not messages (they stay in `--raw`); runtime-injected input is kept
-/// with `from: runtime`, since the model saw it.
+/// thinking-only lines yield nothing. Injected meta content, compaction summaries and local
+/// slash-command bookkeeping are not messages (they stay in `--raw`); runtime-injected
+/// input is kept with `from: runtime`, since the model saw it.
 fn to_message(line: &Line, turn_id: &str, item_id: &str) -> Option<Message> {
-    if line.is_meta || line.is_local_command() {
+    if line.is_meta || line.is_compact_summary || line.is_local_command() {
         return None;
     }
     let body = line.message.as_ref()?;
@@ -795,12 +799,19 @@ mod tests {
     const CAVEAT_LINE: &str = r#"{"parentUuid":null,"isSidechain":false,"promptId":"8c54d57d-da40-4a60-8fae-c792739881d1","type":"user","message":{"role":"user","content":"<local-command-caveat>The command below was run directly in Claude Code, not sent to you as a request, and its output goes straight to the user. It's recorded here as context for later messages.</local-command-caveat>"},"isMeta":true,"uuid":"37b40075-0fb8-486d-9c10-05e54bebca93","timestamp":"2026-10-03T15:33:34.419Z"}"#;
     const COMMAND_LINE: &str = r#"{"parentUuid":"37b40075-0fb8-486d-9c10-05e54bebca93","isSidechain":false,"promptId":"8c54d57d-da40-4a60-8fae-c792739881d1","type":"user","message":{"role":"user","content":"<command-name>/model</command-name>\n            <command-message>model</command-message>\n            <command-args></command-args>"},"uuid":"aaf0d84f-2ae0-4227-b5f1-57c1ef0b5b73","timestamp":"2026-10-03T15:33:34.419Z"}"#;
     const COMMAND_STDOUT_LINE: &str = r#"{"parentUuid":"aaf0d84f-2ae0-4227-b5f1-57c1ef0b5b73","isSidechain":false,"promptId":"8c54d57d-da40-4a60-8fae-c792739881d1","type":"user","message":{"role":"user","content":"<local-command-stdout>Set model to `Opus 5.5` for this session only</local-command-stdout>"},"uuid":"c95a4fb4-c4c7-40c6-a138-27ff570d2045","timestamp":"2026-10-03T15:33:34.419Z"}"#;
+    // Claude Code 2.1.322, the text cut.
+    const COMPACT_SUMMARY_LINE: &str = r#"{"parentUuid":"d6eff052-b478-4f7a-9e3e-21821b416731","isSidechain":false,"promptId":"63139ad9-daa3-46f3-adc5-95d720cba089","type":"user","message":{"role":"user","content":"This session is being continued from a previous conversation that ran out of context."},"isVisibleInTranscriptOnly":true,"isCompactSummary":true,"uuid":"6fe4a251-eb4f-4bb9-a321-052dac61a9f6","timestamp":"2026-11-10T20:56:38.981Z"}"#;
     const HUMAN_LINE: &str = r#"{"parentUuid":"77641974-744f-4f93-ad1c-5ba473af9235","isSidechain":false,"promptId":"2fc91780-b4f8-4acb-9a8b-7877f3e622fb","type":"user","message":{"role":"user","content":"reply with the single word hello"},"uuid":"3f96dc4b-d6dd-4989-8564-9ec7918b62f7","timestamp":"2026-10-03T15:33:49.026Z","origin":{"kind":"human"},"promptSource":"typed","turnOrigin":"human"}"#;
     const TASK_NOTIFICATION_LINE: &str = r#"{"parentUuid":"b9116c14-dd32-42d0-ba3e-8e144fc36dcf","isSidechain":false,"promptId":"2855a424-3eed-4042-97c9-b87ad47c1cbc","type":"user","message":{"role":"user","content":"<task-notification>\n<task-id>bgevs17w6</task-id>\n<status>completed</status>\n</task-notification>"},"uuid":"e3fa3913-1d7e-4069-aaf3-2d1cf966a11e","timestamp":"2026-10-03T15:43:41.194Z","origin":{"kind":"task-notification","producer":"session-task"},"promptSource":"system","turnOrigin":"task_notification"}"#;
 
     #[test]
     fn local_commands_meta_and_runtime_input() {
-        for s in [CAVEAT_LINE, COMMAND_LINE, COMMAND_STDOUT_LINE] {
+        for s in [
+            CAVEAT_LINE,
+            COMMAND_LINE,
+            COMMAND_STDOUT_LINE,
+            COMPACT_SUMMARY_LINE,
+        ] {
             let l = line(s);
             assert!(!l.is_prompt());
             assert!(to_message(&l, "t", "i").is_none());

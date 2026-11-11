@@ -1,8 +1,9 @@
 # Claude Code
 
 One `claude -p` process per `new` or `send` runs the turn; history, other processes' turns and
-listings come from Claude's transcripts and `claude agents`. Verified on Claude Code 2.1.288.
-Claude Code updates itself, so behaviour can change under an installation.
+listings come from Claude's transcripts and `claude agents`. Verified on Claude Code 2.1.322; the
+cases that need a TUI driven were last checked on 2.1.288 to 2.1.311. Claude Code updates itself,
+so behaviour can change under an installation.
 
 ## Interface
 
@@ -20,11 +21,11 @@ names, plus `haiku` (accepted on 2.1.291): the one model list agent-talk carries
   directory appends to the original file but runs the turn there, so transcripts are found by id
   in every folder, and `send` runs in the directory recorded at `new`, else the transcript's
   first `cwd`; when that is gone it refuses (`E_PRECONDITION`) rather than run elsewhere.
-  `ls --cwd` computes Claude's folder name (the cut of long paths read in the 2.1.311 binary).
+  `ls --cwd` computes Claude's folder name (the cut of long paths read in the 2.1.322 binary).
 - The input `uuid` becomes the prompt line's `uuid`, so the turn id is known before the run.
-- Turns group by `promptId`. User lines of tool results only, meta lines, sub-agent lines,
-  local-command bookkeeping and interrupt markers start no turn; runtime input (a task
-  notification) does, shown `from: runtime`.
+- Turns group by `promptId`. User lines of tool results only, meta lines, compaction summaries,
+  sub-agent lines, local-command bookkeeping and interrupt markers start no turn; runtime input
+  (a task notification) does, shown `from: runtime`.
 - The live branch is the `parentUuid` chain from the newest line, or from the newest
   `last-prompt.leafUuid` when the newest line does not descend from it; `logicalParentUuid`
   crosses a compaction. Other branches appear only in `read --raw`, and `wait` on a turn there is
@@ -85,7 +86,8 @@ Every shell command below a session inherits `CLAUDE_CODE_SESSION_ID`, which is 
 in the sender order ([behaviour.md](../behaviour.md#provenance-and-hops)). Claude sets it in each
 MCP server's environment to the spawning session, overriding an inherited value. Claude speaks MCP
 2026-07-28 without `initialize`; `tools/call` `_meta` has no session id, only
-`claudecode/toolUseId`, kept as the caller's `turn`.
+`claudecode/toolUseId`, kept as the caller's `turn`. A TUI keeps its servers when it changes to
+another session, and they keep the id it started with (2.1.322).
 
 ## Limitations
 
@@ -93,6 +95,8 @@ MCP server's environment to the spawning session, overriding an inherited value.
   answerer, and agent-talk relies on Claude's own denial.
 - Other processes' turn ends are best effort, and after `system/turn_duration` `claude agents`
   can still say `busy` while a background agent is pending (the `basis` reports both).
-- Unverified: `CLAUDE_CODE_SESSION_ID` in a globally registered MCP server (verified with
-  `--mcp-config` only); whether a TUI's MCP server names the old session after `/clear` or
-  `/resume`; the end marker of TUI turns that fail mid-turn.
+- A message sent through `agent-talk mcp` from a TUI that changed session names the session the
+  TUI started with as its sender, which may have no transcript.
+- Unverified: `CLAUDE_CODE_SESSION_ID` in a globally registered MCP server under `-p` (verified
+  there with `--mcp-config`, and for a global server in a TUI); which TUI commands (`/clear`,
+  `/resume`) leave a server with the old session; the end marker of TUI turns that fail mid-turn.
