@@ -2,7 +2,7 @@
 
 agent-talk runs one `pi --mode json` process per `new` or `send` and reads pi's session files for
 history, listings and the turns it is not running. pi has no shared process to join and no marker
-of a live one. Verified on pi 1.5.2, except the TUI and `--mode rpc` cases, last checked on 1.0.3.
+of a live one. Verified on pi 1.5.2, except the `--mode rpc` cases, last checked on 1.0.3.
 
 ## Interface
 
@@ -30,13 +30,15 @@ its stdin, never from a later command.
   every operation but `models` is refused (`E_UNSUPPORTED`), and `status` names the directory.
 - Entries form a tree (`id`, `parentId`); on load pi takes the file's last entry as the leaf. The
   live branch is the newest entry's ancestry; `read` and turns read from the file follow it, and
-  `wait` refuses a turn off it (`E_PRECONDITION`). Steer and follow-up messages are plain user
-  entries, so they read as prompts of their own.
+  `wait` refuses a turn off it (`E_PRECONDITION`) unless agent-talk ran the turn and its run log
+  holds the end. Steer and follow-up messages are plain user entries, so they read as prompts of
+  their own.
 
 ## Writers and liveness
 
-pi has no lock between processes, no marker of a live process and no re-read: a process holding a
-session, a TUI included, never sees entries another process appends, its next message hangs off
+pi has no lock between processes and no marker of a live process, and it reads a session file
+only when it opens the session (at start, or `/resume` in a TUI): until then a process holding a
+session, a TUI included, does not see entries another process appends, its next message hangs off
 its own leaf, and the next load follows the file's last entry. agent-talk takes its session lock
 ([architecture.md](../architecture.md#local-state)) and refuses a send while a pi process it
 started still runs the session (`E_LOCKED`). A session open in a TUI cannot be told from an idle
@@ -61,7 +63,8 @@ an own run lives, else `unknown`.
 - **From the file**, best effort, a turn ends at the first assistant entry on the live branch
   without tool calls, skipping one that a later `context_edit` hides (how pi's auto-retry leaves a
   failed message), or `unknown` at a later user message.
-- No `duration_ms`: pi stamps an assistant message when its request starts, not when it ends.
+- No `duration_ms`: pi stamps an assistant message when its request starts, and the `durationMs`
+  that 1.5.2 adds is that one request's, not the turn's.
 
 ## Approvals
 
@@ -76,8 +79,9 @@ mode without blocking. `--full-access` changes nothing and is recorded as given.
 - **Effort** (`--thinking`): a resumed session takes the level of its newest thinking-level entry.
   pi 1.0.3 writes one only for a new session; 1.5.2 also writes one when a run's level differs
   from the branch's, so there a change stays for later loads, the user's included. On a session
-  agent-talk started `send` passes the stored effort on every run, which 1.0.3 needs. The level
-  pi records is the model's own mapping of the one asked. An invalid level is only a warning.
+  agent-talk started `send` passes the stored effort on every run, which 1.0.3 needs, and which
+  replaces a level the user set in a TUI meanwhile. The level pi records is the model's own
+  mapping of the one asked. An invalid level is only a warning.
 - `models` reads the table of `pi --list-models` (every model of every provider with credentials)
   as `provider/model`, with pi's thinking levels as efforts for reasoning models.
 
@@ -90,11 +94,12 @@ through `agent-talk mcp` has no sender unless the server is pinned with `--calle
 
 ## Limitations
 
-- A send to a session open in a TUI branches the conversation: the TUI shows neither the message
-  nor its reply, its next message starts a branch beside them, and whichever process writes last
-  decides the branch the next load continues, so a turn agent-talk sent can drop out of the
-  session's context. Continuing agent-talk's branch instead would need moving the leaf, which only
-  extensions (`navigateTree`) can do.
+- A send to a session open in a TUI branches the conversation: until the user reopens the
+  session there (`/resume`), the TUI shows neither the message nor its reply and its next
+  message starts a branch beside them, and whichever process writes last decides the branch the
+  next load continues, so a turn agent-talk sent can drop out of the session's context.
+  agent-talk cannot continue its own branch instead: that needs moving the leaf, which only the
+  TUI user (`/resume`, then `/tree`) and extensions (`navigateTree`) can do.
 - Turn ends read from the file are best effort: no marker separates a running turn from one whose
   process died, and a steer message reads as a new prompt.
 - A custom flat session directory is not read; nobody has asked for it.

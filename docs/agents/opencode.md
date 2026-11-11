@@ -2,7 +2,7 @@
 
 agent-talk is an HTTP client of the user's background service (`opencode serve --service`),
 shared by every OpenCode client, and follows turns over its SSE event stream. Verified on
-OpenCode 2.2.7; the TUI and desktop app cases were last checked on 2.0.23 and 2.2.0.
+OpenCode 2.2.7; the desktop app cases were last read in source on 2.2.0.
 
 ## Interface
 
@@ -78,8 +78,10 @@ indicator, and a session waiting on a permission request still counts as running
 `permission.asked` goes to every subscriber and is not replayed, so agent-talk also lists pending
 requests. An unanswered request blocks with no timeout. `reject` with a `message` hands the text
 to the model and the execution continues; a message-less `reject` interrupts it (`shutdown`), so
-agent-talk always sends a message. Any `reject` rejects every pending request of the session, so
-a reject that finds its request gone records `resolved`. `always` would save a project-wide rule.
+agent-talk always sends a message. The TUI's Reject on a top-level session sends none, so a user
+who rejects there ends the turn `interrupted`. Any `reject` rejects every pending request of the
+session, so a reject that finds its request gone records `resolved`. `always` would save a
+project-wide rule.
 
 A request is answered by the last rule matching action and resource in the agent's ruleset
 followed by the session's, and asks when none matches; the agent's ruleset already holds the
@@ -107,10 +109,11 @@ its allow-all rule; a repeated `--full-access` changes nothing.
 The model sees a tool denied for every resource as absent, and a denied call as a tool error;
 the turn continues (2.0.23). Requests that still reach agent-talk (a plugin hook can turn an
 answer into `ask`) get `reject` with a message, and only once agent-talk's own message was
-delivered: earlier requests belong to the execution ahead of it. A TUI with
-`session.permissions: "autoaccept"` answers `once` to every pending request of the session it
-displays and its sub-sessions (read in source, 2.0.23 and 2.2.0), so while such a TUI shows a
-session agent-talk started, its requests are approved.
+delivered: earlier requests belong to the execution ahead of it. A TUI in auto-accept mode
+(`session.permissions: "autoaccept"` in its `cli.json`, or `--auto`: a setting of the TUI
+process, not of a session) answers `once` to every pending request of the session it displays
+and its sub-sessions, so while such a TUI shows a session agent-talk started, its requests are
+approved.
 
 ## Settings
 
@@ -119,8 +122,8 @@ The session stores its model, variant and rules, and the prompt has no model fie
 /api/session/{id}/model`, a `PATCH` of its permissions), before the message is recorded: a
 refused change is a plain error without a receipt. A model change carries the session's stored
 effort. The service reads the session's values at each step, so a change also covers the rest
-of an execution already running and the prompts queued behind it, and the user's TUI follows it
-(2.0.23); a permission request already pending is not re-evaluated.
+of an execution already running and the prompts queued behind it, and the user's TUI follows it;
+a permission request already pending is not re-evaluated.
 
 A changed toolset writes a `system` row into history and the model's context, and a model that
 was refused a tool earlier can go on treating it as missing (2.0.23). `send --full-access` adds
@@ -130,9 +133,8 @@ row.
 ## Caller identity
 
 Shell commands get `OPENCODE_SESSION_ID`, which overwrites an inherited value. MCP `tools/call`
-carries `_meta["ai.opencode/sessionID"]` (read in source and docs, never observed live; the docs
-say it can be absent). One MCP server process serves every session of a location, so its
-environment does not name the caller.
+carries `_meta["ai.opencode/sessionID"]` (the docs say it can be absent). One MCP server process
+serves every session of a location, so its environment does not name the caller.
 
 ## Limitations
 
@@ -143,9 +145,10 @@ environment does not name the caller.
 - The rules of a session agent-talk started are a copy taken at `new` or `send --full-access`:
   later changes to the user's configuration, approvals saved with `always` and plugin permission
   hooks do not reach them, and sub-sessions inherit them. A sub-agent, or an agent the user
-  switches the session to, thus gets the default agent's answer for what the copied rules match:
-  its own denial is lifted for what the default agent allows after its first `ask`, and under
-  full access for what the default agent asks (read in source; checked against one configuration
-  on 2.2.0, where no agent's denial was affected; not observed with such an agent).
+  switches the session to (in the TUI the switch takes effect with the user's next prompt
+  there), thus gets the default agent's answer for what the copied rules match: its own denial
+  is lifted for what the default agent allows after its first `ask`, and under full access for
+  what the default agent asks. Observed for an ask: after a switch to the plan agent, full
+  access let it read a file its own rules ask about. A lifted denial was read in source only.
 - A `send --full-access` while the desktop app has a browser attached to the session replaces the
   allow rules the attachment appended (read in source).

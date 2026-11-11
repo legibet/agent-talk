@@ -1,9 +1,8 @@
 # Antigravity CLI
 
 agent-talk runs one `agy -p` process per `new` or `send` and reads history and liveness from
-agy's files. Verified on agy 1.2.16 and 1.2.17, and the headless behaviour again on 1.5.5. agy
-updates itself in the background, so behaviour can change under an installation; the database
-layout and the TUI overwrite cases were seen on 1.2.16 only.
+agy's files. Verified on agy 1.5.5; the database layout was read on 1.2.16. agy updates itself
+in the background, so behaviour can change under an installation.
 
 ## Interface
 
@@ -29,7 +28,8 @@ The store is `~/.gemini/antigravity-cli/`:
 - `brain/<id>/.system_generated/logs/transcript.jsonl`: one object per step, which `read`,
   previews and turns agent-talk did not run use. Lossy: steps that never ran are absent, a tool
   step written `RUNNING` is never updated, long content is truncated, and two writers leave
-  duplicate step indices, so the read cursor is the line position. User text is wrapped in
+  duplicate step indices, so the read cursor is the line position. `read` leaves out error
+  steps (`ERROR_MESSAGE`). User text is wrapped in
   `<USER_REQUEST>` plus metadata blocks, which agent-talk strips.
 - `conversation_summaries.db`: title, workspaces (the first is the cwd), run status and
   modification time; `ls` reads it. agy deletes its WAL files when its last process exits, after
@@ -50,7 +50,9 @@ in the summary's first workspace and is refused when that directory is gone.
 process takes it as it emits `init` and keeps it while its stdin is open. With stdin closed, as
 agent-talk runs it, it releases the lock when it writes `result`, about half a second before it
 exits (1.5.5), so a send right after a turn's `result` finds the lock free. A TUI takes it at its
-first prompt, moves it on `/new` and releases it on exit. `kill -9` releases it too. The lock
+first prompt, or at startup when started with `--conversation`, and keeps it while idle. `/new`
+creates the next conversation at once and moves the lock to it; exit releases it. `kill -9`
+releases it too. The lock
 does not name its holder. An `agy acp` process (the ACP server agy has had since 1.5.0) takes no
 lock and ignores one that is held (1.5.5).
 
@@ -61,15 +63,15 @@ keeps X in memory and overwrites on `/resume`. So agent-talk takes its own sessi
 refuses `E_LOCKED` while its own child still runs a turn (known from its pid records), and
 `E_FOREIGN_LIVE` while the presence lock is held otherwise.
 
-The summary status is `RUNNING` during a turn and `IDLE` after, but it proves neither. A killed
-run leaves `RUNNING`. A `-p` or `acp` process resets all rows to `IDLE` when it starts, also the
-row of a turn another process is running, which turns `RUNNING` again only at that turn's next
-step (1.5.5). A run waiting on a backgrounded command is `IDLE`, and Esc in the TUI stores the
-partial reply as done. Liveness is therefore the presence lock. In `ls` a conversation is
+The summary status is `RUNNING` during a turn and `IDLE` after, but it proves neither. A killed run
+leaves `RUNNING`. Every agy process, a TUI included, resets all rows to `IDLE` when it starts, also
+the row of a turn another process is running, which turns `RUNNING` again only at that turn's next
+step (1.5.5). A run waiting on a backgrounded command is `IDLE`, and Esc or Ctrl+C in the TUI stores
+the partial reply as done. Liveness is therefore the presence lock. In `ls` a conversation is
 `running` while an agent-talk child runs its turn or the lock is held with status `RUNNING`, and
-`idle` when the lock is free and the status is not `RUNNING`. Otherwise it is `unknown`: a held
-lock without `RUNNING` is an idle TUI or a turn whose status was reset, and a free lock with
-`RUNNING` is a killed run or a turn in an `agy acp` process.
+`idle` when the lock is free and the status is not `RUNNING`. Otherwise it is `unknown`: a held lock
+without `RUNNING` is an idle TUI or a turn whose status was reset, and a free lock with `RUNNING` is
+a killed run or a turn in an `agy acp` process.
 
 ## Sending and turn end
 
@@ -88,7 +90,9 @@ lock without `RUNNING` is an idle TUI or a turn whose status was reset, and a fr
 - A turn agent-talk did not run ends at the next user input, or at a final response without tool
   calls once the lock is free and the status is not `RUNNING`; short of that it is `running` or
   `unknown` with a `basis`. agy writes `IDLE` 5 to 30 ms after it frees the lock (1.5.5), so
-  `wait` observes a turn that looks `unknown` once more before it reports that.
+  `wait` observes a turn that looks `unknown` once more before it reports that. A TUI keeps the
+  lock after its turn, so the turn stays `running` for `wait` until the TUI moves to another
+  conversation or exits.
 - A line written during a turn becomes the next turn: there is no steer (`E_NO_STEER`). A send
   while a turn runs meets the lock and is refused.
 
@@ -129,6 +133,12 @@ and inherit the variables of whoever launched agy, so it ranks before `CLAUDE_CO
   while its status is `RUNNING`; and `wait` on a turn that process runs can report it
   `completed` at a reply that is not its last, once another agy start has reset the status.
 - A denied action is not tied to its tool step.
-- A foreign turn interrupted with Esc reads as completed.
+- A foreign turn that Esc, Ctrl+C or an error cut off reads as `completed` when it left a
+  partial reply, since `read` does not show the error step; without a reply it is `unknown`.
+- Once a conversation holds an `ERROR_MESSAGE` step (a content-safety block in a TUI turn was
+  the case seen), every later `-p` run's `result` is `ERROR` with that step's error, so turns
+  agent-talk sends there report `failed` although they replied (1.5.5).
+- After a TUI overwrote steps agent-talk appended, `read` shows the TUI's prompt at such a step
+  index with the sender of agent-talk's message.
 - The `immutable=1` fallback can read a stale page when a writer starts at that moment.
 - Unverified: `result` statuses other than `SUCCESS` and `ERROR` (anything else is `failed`).

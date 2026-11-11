@@ -35,7 +35,9 @@ alongside them:
   that is `reject` with a message; `once` and `always` are never sent. The one other answer is
   ACP's `cancelled`, to the requests still pending when agent-talk cancels a Grok or Devin turn.
 - Reach sessions through agent interfaces only: no PTY, no terminal input injection. TUI cases
-  run in herdr panes opened with `--no-focus`; close only the panes you opened.
+  run in terminal panes you open for them without taking focus (in Rex, a session of your own:
+  `rex new`, `rex window new --focus=false`); type only into those panes and close only what
+  you opened.
 - The OpenCode service password stays in `service.json`; it goes into no file of this repo.
 
 ## Checks
