@@ -79,9 +79,9 @@ bypassPermissions`.
 ## Settings
 
 `--resume` restores the newest assistant message's model unless `--model` is given (2.1.292), so
-`send` passes `--model` only to change it, and the user's TUI follows on its next resume. Effort
-and permission mode are not kept (the user's defaults apply again, 2.1.291), so every send to a
-session agent-talk started passes them again. `CLAUDE_CODE_EFFORT_LEVEL` silently overrides
+`send` passes `--model` only when it is given one, and the user's TUI follows on its next resume.
+Effort and permission mode are not kept (the user's defaults apply again, 2.1.291), so every send to
+a session agent-talk started passes them again. `CLAUDE_CODE_EFFORT_LEVEL` silently overrides
 `--effort` (2.1.291), so the child runs without it when an effort is passed.
 
 ## Caller identity

@@ -117,12 +117,12 @@ Rules: [behaviour.md](../behaviour.md#settings). `new` puts model and sandbox on
 and effort, which it does not take, on `turn/start`. Full access is the `danger-full-access`
 sandbox. Effort is a model-specific string; an invalid value fails the turn, not the submission.
 
-What `turn/start` sets (`model`, `effort`, `sandboxPolicy`, `approvalPolicy`) becomes the
-thread's setting for later turns (0.161.0). Model, effort and approval policy survive unloading;
-the sandbox does not (a resume after an unload restores the daemon's, 0.160.1), so every resume of
-a full-access thread passes it again (a loaded busy thread ignores it, 0.161.0).
-`thread/queue/add` ignores all four fields (0.161.0), so a send that changes settings goes
-through `turn/start` and is refused (`E_PRECONDITION`) while a turn is running.
+What `turn/start` sets (`model`, `effort`, `sandboxPolicy`, `approvalPolicy`) becomes the thread's
+setting for later turns (0.161.0). Model, effort and approval policy survive unloading; the sandbox
+does not (a resume after an unload restores the daemon's, 0.160.1), so every resume of a full-access
+thread passes it again (a loaded busy thread ignores it, 0.161.0). `thread/queue/add` ignores all
+four fields (0.161.0), so a send given a model, effort or full access goes through `turn/start` and
+is refused (`E_PRECONDITION`) while a turn is running.
 
 ## Caller identity
 

@@ -119,21 +119,23 @@ started and never with `--steer`, which has no turn of its own; otherwise it is 
 Antigravity a model given for one turn stays with the session, so there is no per-turn override
 to offer on the user's sessions.
 
-agent-talk stores the settings of the sessions it started and passes again, on each send, what
-the agent does not keep between turns. Where the agent keeps a change, the user's own client sees
-it too. A change the agent refused is taken back from agent-talk's store. On OpenCode, Grok and
-Devin a change is a separate request made before the message; if the message is then refused, the
-session keeps the change.
+agent-talk stores the settings of the sessions it started and passes again, on each send, what the
+agent does not keep between turns. Where the agent keeps a change, the user's own client sees it
+too, and the user can change the session there in turn. So a value given to `send` is applied even
+when it equals the stored one, and is refused where any change would be. A change the agent refused
+is taken back from agent-talk's store. On OpenCode, Grok and Devin a change is a separate request
+made before the message; if the message is then refused, the session keeps the change.
 
-**Full access** gives a session every permission and no approval prompts. On OpenCode it allows
-what the user's rules would ask and keeps what they deny
-([opencode.md](agents/opencode.md#approvals)). On Grok the user's `ask` rules still ask, and
-agent-talk declines ([grok.md](agents/grok.md#approvals)). Without it the session runs under the
-agent's own configuration, except on Devin, whose ACP interface starts every session in `accept-edits`
-([devin.md](agents/devin.md#approvals)). Once given, full access is not taken back. Restricted levels (read-only, workspace write) were left out: tested in
-October 2026, only Claude could enforce one with web tools allowed; Codex loses the sandbox when a
-thread unloads and its queue path cannot carry one; OpenCode's shell bypasses its edit rules; and
-Grok and Antigravity have no per-session control.
+**Full access** gives a session every permission and no approval prompts. On OpenCode it allows what
+the user's rules would ask and keeps what they deny ([opencode.md](agents/opencode.md#approvals)).
+On Grok the user's `ask` rules still ask, and agent-talk declines
+([grok.md](agents/grok.md#approvals)). Without it the session runs under the agent's own
+configuration, except on Devin, whose ACP interface starts every session in `accept-edits`
+([devin.md](agents/devin.md#approvals)). Once given, full access is not taken back. Restricted
+levels (read-only, workspace write) were left out: tested in October 2026, only Claude could enforce
+one with web tools allowed; Codex loses the sandbox when a thread unloads and its queue path cannot
+carry one; OpenCode's shell bypasses its edit rules; and Grok and Antigravity have no per-session
+control.
 
 ## Provenance and hops
 

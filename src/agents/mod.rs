@@ -225,7 +225,7 @@ pub struct ListFilter<'a> {
 
 /// A session's `--model`, `--effort` and `--full-access`, passed through unvalidated in the
 /// agent's syntax (docs/behaviour.md#settings). `new` chooses them; agent-talk stores them for
-/// the sessions it started, where a later `send` may change them. Each adapter passes again
+/// the sessions it started, where a later `send` may set them again. Each adapter passes again
 /// only what its agent does not keep between turns (its doc in docs/agents/). As a change, an
 /// absent field keeps the current value; full access is only ever turned on.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -238,21 +238,6 @@ pub struct Settings {
 impl Settings {
     pub fn is_empty(&self) -> bool {
         *self == Settings::default()
-    }
-
-    /// The change from these settings to `wanted`: its values that differ.
-    pub fn change_to(&self, wanted: &Settings) -> Settings {
-        Settings {
-            model: wanted
-                .model
-                .clone()
-                .filter(|m| self.model.as_ref() != Some(m)),
-            effort: wanted
-                .effort
-                .clone()
-                .filter(|e| self.effort.as_ref() != Some(e)),
-            full_access: wanted.full_access && !self.full_access,
-        }
     }
 
     /// These settings with `change` applied.
@@ -292,7 +277,9 @@ pub struct SendRequest<'a> {
     pub message: Outgoing<'a>,
     /// Into the running turn (`send --steer`) instead of queued after it.
     pub steer: bool,
-    /// What this send changes; empty unless the session is one agent-talk started.
+    /// The settings this send was given, applied even where they equal the stored ones, since
+    /// the user may have changed the session since (docs/behaviour.md#settings); empty unless
+    /// the session is one agent-talk started.
     pub change: &'a Settings,
     /// The session's settings, `change` included; `None` for a session agent-talk did not
     /// start, which runs as the agent has it.

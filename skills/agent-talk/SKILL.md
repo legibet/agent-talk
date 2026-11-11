@@ -44,10 +44,10 @@ agent-talk send <handle> "<text>" --wait
 `ls` lists matching sessions with their handles, states and message previews. Omit `--agent` to list
 all seven agents. `send` continues the selected session with its history, including sessions created
 outside agent-talk. Sessions created by agent-talk keep their model, effort and `--full-access`
-setting on later sends, and `send --model`, `--effort` and `--full-access` change them from that
-message on. These options are refused on sessions created outside agent-talk and together with
-`--steer`. On Codex such a send is refused while a turn is running, and full access cannot be given
-to a Grok session held by its leader.
+setting on later sends, and `send --model`, `--effort` and `--full-access` set them from that
+message on, also when the user changed them in their own client. These options are refused on
+sessions created outside agent-talk and together with `--steer`. On Codex such a send is refused
+while a turn is running, and full access cannot be given to a Grok session held by its leader.
 
 On Codex, OpenCode and Grok through a live leader, `send` queues the message after the current
 reply. `--steer` adds it to the running turn instead and is refused when the session is idle.

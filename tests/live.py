@@ -12,7 +12,7 @@ docs/agents/, not here.
     uv run tests/live.py (offline|codex|claude|opencode|grok|antigravity|pi|devin ... | all) [--keep]
 
 Models: LIVE_CODEX_MODEL, LIVE_CLAUDE_MODEL, LIVE_OPENCODE_MODEL, LIVE_GROK_MODEL,
-LIVE_ANTIGRAVITY_MODEL, LIVE_PI_MODEL, LIVE_DEVIN_MODEL override the defaults below. Exit 0 only when every
+LIVE_ANTIGRAVITY_MODEL, LIVE_PI_MODEL, LIVE_PI_OTHER_MODEL, LIVE_DEVIN_MODEL override the defaults below. Exit 0 only when every
 requested check ran and passed.
 """
 
@@ -49,6 +49,7 @@ OPENCODE_MODEL = os.environ.get("LIVE_OPENCODE_MODEL", "deepseek/deepseek-flash"
 GROK_MODEL = os.environ.get("LIVE_GROK_MODEL", "grok-4.7")
 ANTIGRAVITY_MODEL = os.environ.get("LIVE_ANTIGRAVITY_MODEL", "gemini-3.8-flash")
 PI_MODEL = os.environ.get("LIVE_PI_MODEL", "deepseek/deepseek-flash")
+PI_OTHER_MODEL = os.environ.get("LIVE_PI_OTHER_MODEL", "deepseek/deepseek-v4-pro")
 DEVIN_MODEL = os.environ.get("LIVE_DEVIN_MODEL", "swe-2-high")
 
 SESSION_VARS = (
@@ -1229,6 +1230,26 @@ def pi_tier():
         expect(level() == "high", f"the changed turn runs at high, got {level()}")
         cli("send", h, "reply with the single word kept", "--wait")
         expect(level() == "high", f"a later plain send keeps high, got {level()}")
+
+        # The user switches the model in their own run; send --model with the model agent-talk
+        # stored switches it back.
+        def model() -> str:
+            m = next(m for m in reversed(pi_messages(native(h))) if m["role"] == "assistant")
+            return f"{m['provider']}/{m['model']}"
+
+        expect(PI_OTHER_MODEL != a.model, f"LIVE_PI_OTHER_MODEL must differ from {a.model}")
+        p = subprocess.run(
+            ["pi", "--mode", "json", "--model", PI_OTHER_MODEL, "--session", str(pi_session_file(native(h)))],
+            cwd=DIR,
+            input="reply with the single word other",
+            capture_output=True,
+            text=True,
+            env=BASE_ENV,
+            timeout=120,
+        )
+        expect(p.returncode == 0 and model() == PI_OTHER_MODEL, f"the user's run: {model()}, {p.stderr[-300:]}")
+        cli("send", h, "reply with the single word back", "--model", a.model, "--wait")
+        expect(model() == a.model, f"send --model with the stored model runs it again, got {model()}")
 
     def foreign_session():
         # A session pi wrote on its own: wait reads its turn from the file, send resumes it.

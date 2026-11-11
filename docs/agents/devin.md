@@ -142,8 +142,8 @@ every later load keeps, including the user's TUI.
 - Effort is `thought_level` (`medium|high|max` for swe-2), set after the model, since a model
   change resets it to the family's default; after a model change agent-talk applies the effort
   the session's settings hold.
-- Devin stores the resulting variant (`swe-2-medium`) and keeps model, effort and mode across
-  loads, so `send` applies only a change. A refused value fails the send before anything is
+- Devin stores the resulting variant (`swe-2-medium`) and keeps model, effort and mode across loads,
+  so `send` applies only the values it is given. A refused value fails the send before anything is
   recorded; a value applied before it stays with the session.
 - `models` lists the model options of a `session/new` in a temporary directory, with no prompt
   (no session row, one lock file): only those options name the ids `model` accepts, which

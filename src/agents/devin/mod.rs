@@ -671,8 +671,8 @@ impl Agent for Devin<'_> {
                     mode.unwrap_or("no reported mode"),
                 ));
             }
-            // Devin keeps model, effort and mode with the session, so only a change is
-            // applied. A refusal fails the send before anything is recorded; a value applied
+            // Devin keeps model, effort and mode with the session, so only the values the send
+            // was given are applied. A refusal fails the send before anything is recorded; a value applied
             // before it stays.
             if let Some(s) = req.settings {
                 apply(&conn, id, req.change, s).await?;

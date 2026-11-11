@@ -540,9 +540,9 @@ impl Agent for OpenCode<'_> {
         let deadline = wait.deadline();
         let svc = self.connect().await?;
         // The session stores its model, variant and rules, and the service applies a change
-        // from the next step on, so only the change is sent, before the message is recorded:
-        // a refused change is a plain error (docs/agents/opencode.md#settings). The prompt
-        // has no model field.
+        // from the next step on, so only the values the send was given are sent, before the
+        // message is recorded: a refused change is a plain error
+        // (docs/agents/opencode.md#settings). The prompt has no model field.
         let change = req.change;
         if change.model.is_some() || change.effort.is_some() {
             let model = if let Some(m) = &change.model {

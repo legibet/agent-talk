@@ -73,8 +73,8 @@ mode without blocking. `--full-access` changes nothing and is recorded as given.
 
 ## Settings
 
-- **Model** (`--model provider/model`): a resumed session takes the model of its newest model
-  change or assistant message, so `send` passes `--model` only to change it, and later loads, the
+- **Model** (`--model provider/model`): a resumed session takes the model of its newest model change
+  or assistant message, so `send` passes `--model` only when it is given one, and later loads, the
   user's included, keep the change.
 - **Effort** (`--thinking`): a resumed session takes the level of its newest thinking-level entry.
   pi 1.0.3 writes one only for a new session; 1.5.2 also writes one when a run's level differs

@@ -20,7 +20,8 @@ adapter you changed, `offline` always, `all` before a release. Default models ar
 sonnet, deepseek/deepseek-flash, grok-4.7, gemini-3.8-flash, deepseek/deepseek-flash and
 swe-2-high (at effort medium); override them with `LIVE_CODEX_MODEL`, `LIVE_CLAUDE_MODEL`,
 `LIVE_OPENCODE_MODEL`, `LIVE_GROK_MODEL`, `LIVE_ANTIGRAVITY_MODEL`, `LIVE_PI_MODEL`,
-`LIVE_DEVIN_MODEL`. Codex's `foreign-writer` starts its own thread with an unload delay of 5 s
+`LIVE_DEVIN_MODEL`. pi's `settings` also runs deepseek/deepseek-v4-pro as the model a user
+switched to (`LIVE_PI_OTHER_MODEL`). Codex's `foreign-writer` starts its own thread with an unload delay of 5 s
 (`thread_unload_delay_secs`), so it does not wait for the daemon's default.
 
 The script builds `target/release/agent-talk` first and runs a tier only when `agent-talk status`

@@ -719,8 +719,8 @@ impl Agent for Claude<'_> {
             },
         };
         let watch = self.intent(id, &req.message)?;
-        // Claude restores the model from the transcript, so only a change passes it; effort
-        // and permission mode are per process and come from the session's settings
+        // Claude restores the model from the transcript, so only a send given one passes it;
+        // effort and permission mode are per process and come from the session's settings
         // (docs/agents/claude-code.md#settings). Only a session agent-talk started has settings,
         // and agent-talk denies its approvals.
         let unset = Settings::default();

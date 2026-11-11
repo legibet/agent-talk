@@ -63,8 +63,7 @@ pub struct SendArgs {
     pub text: String,
     /// Into the running turn instead of queued after it.
     pub steer: bool,
-    /// Settings wanted before the message; only on a session agent-talk started, where the
-    /// values that differ from the session's are changed.
+    /// Settings to apply before the message; only on a session agent-talk started.
     pub settings: Settings,
     pub wait: Wait,
     pub from: Caller,
@@ -209,30 +208,31 @@ pub async fn new(store: &Store, a: NewArgs) -> Result<Outcome> {
 pub async fn send(store: &Store, a: SendArgs) -> Result<Outcome> {
     let (name, id) = split_handle(&a.handle)?;
     let agent = Adapter::named(store, name)?;
-    // Settings change only on sessions agent-talk started, and for a turn of their own
+    // Settings change only on sessions agent-talk started, and for a turn of their own. A
+    // given value is applied even when it equals the stored one: the store holds what
+    // agent-talk set, not what the user set in their own client since
     // (docs/behaviour.md#settings). The change is recorded first and taken back if the agent
     // refused the message, so a refused value is not passed again.
     let current = store.settings(&a.handle)?;
-    let change = match &current {
-        Some(c) => c.change_to(&a.settings),
-        None if a.settings.is_empty() => Settings::default(),
-        None => {
-            return Err(Error::new(
-                ErrorCode::Precondition,
-                "model, effort and full access can be changed only on sessions agent-talk started",
-            ));
-        }
-    };
+    let change = a.settings;
+    if current.is_none() && !change.is_empty() {
+        return Err(Error::new(
+            ErrorCode::Precondition,
+            "model, effort and full access can be changed only on sessions agent-talk started",
+        ));
+    }
     if a.steer && !change.is_empty() {
         return Err(Error::new(
             ErrorCode::Precondition,
             "--steer delivers into the running turn; send the change without it",
         ));
     }
+    let depth = hop_depth(store, &a.from)?;
     let settings = current.as_ref().map(|c| c.with(&change));
-    if let Some(s) = &settings
-        && !change.is_empty()
-    {
+    // Written only when the store changes, so a repeated value neither overwrites nor takes
+    // back what a concurrent send stored.
+    let updated = settings.as_ref().filter(|s| Some(*s) != current.as_ref());
+    if let Some(s) = updated {
         store.set_settings(&a.handle, s)?;
     }
     let delivered = delivered(&a.from, &a.text);
@@ -241,15 +241,15 @@ pub async fn send(store: &Store, a: SendArgs) -> Result<Outcome> {
             text: &a.text,
             delivered: &delivered,
             from: &a.from,
-            depth: hop_depth(store, &a.from)?,
+            depth,
         },
         steer: a.steer,
         change: &change,
         settings: settings.as_ref(),
     };
     let res = agent.send(id, &req, a.wait).await;
-    if let (Err(e), Some(c)) = (&res, &current)
-        && !change.is_empty()
+    if let Err(e) = &res
+        && let (Some(c), Some(_)) = (&current, updated)
         && e.receipt
             .as_ref()
             .is_none_or(|r| r.state == ReceiptState::Rejected)

@@ -103,8 +103,9 @@ Full access keeps the user's denials rather than allowing everything: the user d
 agent may not do, and agent-talk only stands in for the person who would answer the asks. On
 2.2.0, for instance, the browser plugin denies its tools to every agent after the user's
 configuration, and appends allow rules to a session's rules while the desktop app attaches a
-browser to it (read in source). A session given full access by agent-talk 0.4.0 or earlier keeps
-its allow-all rule; a repeated `--full-access` changes nothing.
+browser to it (read in source). Each `send --full-access` sets the session's rules again from the
+default agent's current ones, which replaces the allow-all rule agent-talk 0.4.0 and earlier gave
+and any rule added to the session since.
 
 The model sees a tool denied for every resource as absent, and a denied call as a tool error;
 the turn continues (2.0.23). Requests that still reach agent-talk (a plugin hook can turn an
