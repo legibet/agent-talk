@@ -2,7 +2,7 @@
 
 agent-talk is an HTTP client of the user's background service (`opencode serve --service`),
 shared by every OpenCode client, and follows turns over its SSE event stream. Verified on
-OpenCode 2.0.22.
+OpenCode 2.2.7; the TUI and desktop app cases were last checked on 2.0.23 and 2.2.0.
 
 ## Interface
 
@@ -39,8 +39,8 @@ OpenCode 2.0.22.
   back; an older message reports as absent.
 - `read` shows `user` rows as prompts and service-written `synthetic` rows as `other`. The last
   text of an assistant row that finished with `stop` is `final`, its other text `commentary`.
-- `ls` lists top-level sessions (`--all` adds sub-sessions); `--cwd` matches the directory
-  exactly. `name` and `preview` are both the session's title.
+- `ls` lists top-level sessions, archived ones included (`--all` adds sub-sessions); `--cwd`
+  matches the directory exactly. `name` and `preview` are both the session's title.
 
 ## Writers and liveness
 
@@ -60,7 +60,8 @@ indicator, and a session waiting on a permission request still counts as running
   the inbox before history, so a message moving from one to the other is not missed.
 - Queue items pending at a user interrupt stay dormant until another execution runs; after a
   `shutdown` interrupt they run at once in a successor.
-- An execution end writes an `idle` row with `outcome: succeeded|failed|interrupted`, except an
+- An execution end writes an `idle` row with `outcome: succeeded|failed|interrupted`; a failed
+  one carries its `error` and can have no assistant row (an unknown model). The exception is an
   interrupt with reason `shutdown` (a message-less permission reject, the service going down):
   no `idle`, and the aborted assistant row stays last. Read in source, not observed: a restart
   resumes such a turn behind a `synthetic` row with `metadata.notice: restart`.
@@ -82,9 +83,11 @@ a reject that finds its request gone records `resolved`. `always` would save a p
 
 A request is answered by the last rule matching action and resource in the agent's ruleset
 followed by the session's, and asks when none matches; the agent's ruleset already holds the
-user's configuration (read in source; verified on 2.0.23 and 2.2.0). A session agent-talk starts
-therefore gets session rules at creation, and again at the `send --full-access` that turns full
-access on, so that the service itself answers what would wait for an answer:
+user's configuration. A session without an agent runs the default agent, which `GET /api/agent`
+lists first: the configured `default_agent` if it is a primary agent and not hidden, else
+`build` on the same condition, else the first such agent. A session agent-talk starts therefore
+gets session rules at creation, and again at the `send --full-access` that turns full access
+on, so that the service itself answers what would wait for an answer:
 
 - the default agent's rules from its first `ask` on, in order, with every `ask` turned into
   `deny`, or into `allow` under full access. Allowed and denied requests keep their answer, the
@@ -137,7 +140,6 @@ environment does not name the caller.
 - History alone cannot tell a message-less reject from a graceful shutdown, a crash mid-step from
   a running step, a `shutdown` interrupt before the first step from steer batching, or a queued
   item delivered into a reloaded continuation from a successor execution.
-- An execution that ends `failed` was never observed.
 - The rules of a session agent-talk started are a copy taken at `new` or `send --full-access`:
   later changes to the user's configuration, approvals saved with `always` and plugin permission
   hooks do not reach them, and sub-sessions inherit them. A sub-agent, or an agent the user
@@ -147,7 +149,3 @@ environment does not name the caller.
   on 2.2.0, where no agent's denial was affected; not observed with such an agent).
 - A `send --full-access` while the desktop app has a browser attached to the session replaces the
   allow rules the attachment appended (read in source).
-- Unverified: that the first agent `GET /api/agent` lists is the default agent when the user
-  configures another one; the `404` of a reply to a request a batch reject already answered
-  (recorded `resolved`); the session list's `order=desc` and `parentID=null`; whether a title
-  set at creation survives OpenCode's title generation.

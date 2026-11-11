@@ -484,9 +484,8 @@ impl Service {
     }
 
     /// The rules of the agent a new session in `directory` runs: the default agent, which
-    /// the service lists first (unverified with a configured default agent,
-    /// docs/agents/opencode.md#limitations; read as `Value`, so that no entry is skipped
-    /// before it).
+    /// the service lists first (docs/agents/opencode.md#approvals; read as `Value`, so that
+    /// no entry is skipped before it).
     pub async fn default_agent_rules(&self, directory: &str) -> Result<Vec<Value>> {
         let agents: List<Value> = self
             .get("/api/agent", &[("location[directory]", directory.into())])

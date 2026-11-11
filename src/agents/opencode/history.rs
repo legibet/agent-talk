@@ -22,7 +22,7 @@ fn id(row: &Value) -> &str {
     row["id"].as_str().unwrap_or_default()
 }
 
-/// The error of an assistant step.
+/// The error of an assistant step, or of the `idle` row of a failed execution.
 fn error(row: &Value) -> Option<&Value> {
     Some(&row["error"]).filter(|e| !e.is_null())
 }
@@ -162,7 +162,15 @@ impl Span {
             .find_map(|r| reply(r))
             .or_else(|| assistants.iter().rev().find_map(|r| texts(r).last()))
             .map(String::from);
-        let error = assistants.iter().rev().find_map(|r| error(r)).cloned();
+        // A failed execution puts its error on the idle row, and can end without an
+        // assistant row (docs/agents/opencode.md#sending-and-turn-end).
+        let failure = match &self.end {
+            Some(End::Idle(idle)) => error(idle),
+            _ => None,
+        };
+        let error = failure
+            .or_else(|| assistants.iter().rev().find_map(|r| error(r)))
+            .cloned();
         Some(model::Turn {
             handle: handle(session_id),
             turn_id: id(&self.user).into(),
@@ -346,6 +354,15 @@ mod tests {
         assert_eq!(t.final_text, None);
         assert_eq!(t.error.unwrap()["type"], "aborted");
         assert_eq!(t.duration_ms, Some(2000));
+
+        // A failed execution (2.2.7, an unknown model): no assistant row, the error on idle.
+        let idle_failed = json!({"id":"msg_f","time":{"created":1500},"type":"idle","outcome":"failed",
+            "error":{"type":"provider.no-route","message":"Model unavailable: deepseek/no-such-model"}});
+        let t = Span::new(user.clone(), vec![idle_failed])
+            .turn("ses_x")
+            .unwrap();
+        assert_eq!(t.status, TurnStatus::Failed);
+        assert_eq!(t.error.unwrap()["type"], "provider.no-route");
 
         // A shutdown-reason interrupt (docs/agents/opencode.md#sending-and-turn-end): no
         // idle; the next execution's rows must not become this turn's reply.
