@@ -10,8 +10,8 @@ use std::path::Path;
 /// `pi --mode json` arguments for one turn; `session` is `--session-id <id>` for a new
 /// session or `--session <path>` to resume one. A resumed session takes the model of its
 /// newest `model_change` entry or assistant message, whichever is later, but the thinking
-/// level only from a `thinking_level_change` entry, which only the first run writes
-/// (docs/agents/pi.md#settings).
+/// level only from a `thinking_level_change` entry, which pi 1.0.3 writes on the first run
+/// only (docs/agents/pi.md#settings).
 pub fn args(
     [flag, session]: [&str; 2],
     model: Option<&str>,

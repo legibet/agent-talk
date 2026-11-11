@@ -2,7 +2,7 @@
 
 agent-talk runs one `pi --mode json` process per `new` or `send` and reads pi's session files for
 history, listings and the turns it is not running. pi has no shared process to join and no marker
-of a live one. Verified on pi 1.0.3.
+of a live one. Verified on pi 1.5.2, except the TUI and `--mode rpc` cases, last checked on 1.0.3.
 
 ## Interface
 
@@ -73,10 +73,11 @@ mode without blocking. `--full-access` changes nothing and is recorded as given.
 - **Model** (`--model provider/model`): a resumed session takes the model of its newest model
   change or assistant message, so `send` passes `--model` only to change it, and later loads, the
   user's included, keep the change.
-- **Effort** (`--thinking`): a resumed session takes the level of its newest thinking-level entry,
-  which only a new session writes, so on a session agent-talk started `send` passes the stored
-  effort on every run. The level pi records is the model's own mapping of the one asked. An
-  invalid level is only a warning.
+- **Effort** (`--thinking`): a resumed session takes the level of its newest thinking-level entry.
+  pi 1.0.3 writes one only for a new session; 1.5.2 also writes one when a run's level differs
+  from the branch's, so there a change stays for later loads, the user's included. On a session
+  agent-talk started `send` passes the stored effort on every run, which 1.0.3 needs. The level
+  pi records is the model's own mapping of the one asked. An invalid level is only a warning.
 - `models` reads the table of `pi --list-models` (every model of every provider with credentials)
   as `provider/model`, with pi's thinking levels as efforts for reasoning models.
 
@@ -97,4 +98,3 @@ through `agent-talk mcp` has no sender unless the server is pinned with `--calle
 - Turn ends read from the file are best effort: no marker separates a running turn from one whose
   process died, and a steer message reads as a new prompt.
 - A custom flat session directory is not read; nobody has asked for it.
-- Unverified: whether two processes racing to create one session collide.

@@ -530,7 +530,7 @@ impl Agent for Pi<'_> {
                 ));
             }
         };
-        // pi restores the model from the session file, so only a change passes it; it
+        // pi restores the model from the session file, so only a change passes it; pi 1.0.3
         // restores only the thinking level the session was created with, so the effort of a
         // session agent-talk started is passed on every run (docs/agents/pi.md#settings).
         let effort = req.settings.and_then(|s| s.effort.as_deref());

@@ -2,8 +2,8 @@
 
 Each command connects to the shared app-server daemon's control socket, subscribes to a
 thread, submits, observes and disconnects; the turn goes on in the daemon. Verified on codex-cli
-0.160.0. The daemon updates itself and can run another version than the CLI; `status` reports
-both.
+0.167.0 with the daemon on 0.167.1; the TUI cases were last checked on 0.160.0. The daemon
+updates itself and can run another version than the CLI; `status` reports both.
 
 ## Interface
 
@@ -17,15 +17,15 @@ covers many unrelated refusals, so errors are told apart by method and message.
 ## Sessions and history
 
 - `new` is `thread/start` with `approvalPolicy: never`, which inherits the daemon's sandbox, MCP
-  servers and hooks, then `turn/start`. `thread/name/set` fails for a moment after `turn/start`
-  (empty rollout), so `--name` is set before the first turn, and the thread is recorded as owned
-  only once naming succeeded: a thread with no turn is listed nowhere.
-- History (`thread/turns/list`) needs no resume. For about a second after the first
-  `turn/start` it is unreadable: `thread/resume` and `thread/turns/list` fail with `-32603 "...
-  rollout at <path> is empty"`, `thread/turns/list` also with `-32601 "list_turns is not
-  supported yet"` (cause read in daemon source), and `thread/read` answers `idle` with no turns.
-  agent-talk retries the resume once a second, its only polling on Codex; `read` and turn
-  lookup treat the window as an empty history.
+  servers and hooks, then `turn/start`. On 0.160.0 `thread/name/set` failed for a moment after
+  `turn/start` (empty rollout), so `--name` is set before the first turn, and the thread is
+  recorded as owned only once naming succeeded: a thread with no turn is listed nowhere.
+- History (`thread/turns/list`) needs no resume. For a moment after the first `turn/start` of
+  a thread without a name (about a second on 0.160.0, 0.1 s on 0.167.1) it is unreadable:
+  `thread/resume`, `thread/turns/list` and `thread/read` fail with `-32603 "... rollout at
+  <path> is empty"`, `thread/turns/list` also with `-32601 "list_turns is not supported yet"`
+  (cause read in daemon source). agent-talk retries the resume once a second, its only polling
+  on Codex; `read` and turn lookup treat the window as an empty history.
 - `read` maps `agentMessage` phases (`final_answer`, `commentary`) and shows each tool call item
   as one `other` message: commands, file changes, MCP, dynamic and collaboration tool calls, web
   searches, image views and image generations (item types of 0.167.0). Reasoning, plans, hook
@@ -46,16 +46,17 @@ covers many unrelated refusals, so errors are told apart by method and message.
   the daemon every client shares the loaded thread and gets identical events, so a turn
   agent-talk starts shows live in the user's TUI.
 - `codex exec` is always standalone; the ChatGPT desktop app and the VS Code extension run their
-  own app-server. Across processes Codex holds a per-thread writer lock, and `thread/resume` from
-  another process fails with `-32600 "thread <id> already has an active writer"` until the holder
-  exits: `E_FOREIGN_LIVE`, refused before an intent is recorded.
+  own app-server. A process holds a per-thread writer lock for as long as it has the thread
+  loaded, idle or running, `codex exec` for its whole run, and `thread/resume` from another
+  process fails with `-32600 "thread <id> already has an active writer"` until the holder lets
+  go: `E_FOREIGN_LIVE`, refused before an intent is recorded.
 - "Not loaded" cannot tell a stopped thread from one running in a standalone process; agent-talk
   proceeds through the daemon.
 - `thread/resume` loads a thread and rejoins a loaded one without replaying earlier
   notifications, except pending server requests. A thread unloads `thread_unload_delay_secs`
-  after the later of its last subscriber leaving and its last turn ending (60 s up to 0.162, 30
-  minutes on 0.163 to 0.165); a connected subscriber holds it loaded. A running thread keeps
-  running and drains its queue with nobody subscribed.
+  after the later of its last subscriber leaving and its last turn ending (60 s up to 0.162
+  and on 0.167, 30 minutes on 0.163 to 0.165); a connected subscriber holds it loaded. A running
+  thread keeps running and drains its queue with nobody subscribed.
 
 ## Sending and turn end
 
@@ -118,14 +119,14 @@ turn ids (verified for threads started over the daemon socket only); MCP server 
 carry no `CODEX_*` variable. Shell commands see `CODEX_THREAD_ID`, and whatever the daemon
 inherited from the shell that started it ([sender order](../behaviour.md#provenance-and-hops)).
 Under approval policy `never`, Codex fails MCP tool calls unless the server entry sets
-`default_tools_approval_mode = "approve"`.
+`default_tools_approval_mode = "approve"` or the thread's sandbox is `danger-full-access`.
 
 ## Limitations
 
 - `wait --turn` on a steered turn attaches the newest receipt on that turn (steered messages
   share the turn id).
-- A thread written by another app-server process is refused only at `thread/resume`, and `ls`
-  does not show which process holds it.
+- A thread held by another process (`codex exec`, the desktop app, VS Code) is refused only at
+  `thread/resume`, and `ls` does not show which process holds it.
 - Only `send` starts a dormant queued item; `wait --receipt` on one left dormant earlier reports
   it `pending`.
 - A connection lost mid-`wait` ends with `E_TRANSPORT` without a history re-read.
