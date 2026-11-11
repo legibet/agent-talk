@@ -576,7 +576,7 @@ impl<'a> Grok<'a> {
                     return Err(Error::new(
                         ErrorCode::Precondition,
                         format!(
-                            "{h} is {} in the leader; steer needs a running turn (Grok would start a fallback turn instead); send without --steer",
+                            "{h} is {} in the leader; steer needs a turn that is working; send without --steer",
                             l.activity
                         ),
                     ));
@@ -683,6 +683,7 @@ impl<'a> Grok<'a> {
         let own_pid = self.own_run(&id, dir)?;
         let state = match (own_pid, resident.map(|l| l.activity.as_str())) {
             (Some(_), _) | (None, Some("working")) => SessionState::Running,
+            (None, Some("needs_input")) => SessionState::Waiting,
             (None, Some("idle")) => SessionState::Idle,
             _ => SessionState::Unknown,
         };

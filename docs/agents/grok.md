@@ -2,8 +2,8 @@
 
 agent-talk speaks ACP (line-delimited JSON-RPC over stdio) to one `grok agent ... stdio` child per
 command: a proxy into the user's shared leader when one runs, otherwise an in-process agent
-(direct mode). Verified on Grok CLI 1.0.77; the TUI cases were last checked on 1.0.46. Grok
-updates itself, so behaviour can change under an installation.
+(direct mode). Verified on Grok CLI 1.0.77. Grok updates itself, so behaviour can change under an
+installation.
 
 ## Interface
 
@@ -36,8 +36,8 @@ leader sessions.
   `turn_completed.prompt_id`: agent-talk's client message id is the turn id.
 - A steer message is a user line with `interjection: true` inside the running turn. Its text is
   wrapped in instructions to the model; `read` shows the original (`content._meta.displayText`).
-- `summary.json` has id, cwd, title and `session_kind` (`headless` for `-p`, null for TUI, ACP
-  and leader sessions alike), so `ls` shows origin `headless` or `grok`.
+- `summary.json` has id, cwd, title and `session_kind` (`headless` for `-p`, null or absent for
+  TUI, ACP and leader sessions alike), so `ls` shows origin `headless` or `grok`.
 
 ## Writers and liveness
 
@@ -46,20 +46,23 @@ both keep appending (a prompt can get two `turn_completed`; the last counts), an
 diverge. Lines are attributed to turns by prompt id where they carry one.
 
 Inside one leader all clients share one in-memory session: `session/load` attaches live, a busy
-`session/prompt` queues a separate turn, `_x.ai/interject` joins the running turn, events fan out
-to every client, and a turn survives its client's disconnect. A TUI started with `--leader` is
-joinable the same way. The `activity` and `resident` of `_x.ai/sessions/list` describe the
+`session/prompt` queues a separate turn, `_x.ai/interject` joins the running turn, events fan out to
+every client, and a turn survives its client's disconnect. A TUI started with `--leader`, or with
+`[cli] use_leader = true` in its configuration, is joinable the same way and shows the other
+clients' turns as they run. The `activity` and `resident` of `_x.ai/sessions/list` describe the
 answering process, so they mean something only through a leader.
 
 The only holder markers are the leader's list and `<GROK_HOME>/active_sessions.json`, which lists
 live TUIs with pid (`kill -9` leaves a row, so pids are checked; `-p`, ACP and leader-only sessions
-never appear). agent-talk refuses `E_FOREIGN_LIVE` when a live TUI row names the session and no
-leader lists it `resident`, and `E_LOCKED` while its own direct child runs an unfinished turn. It
-takes its own lock only in direct mode, since clients of one leader do not exclude each other
-([architecture.md](../architecture.md#local-state)).
+never appear). A TUI without a leader keeps a row for every session it has loaded: after `/new` the
+old session stays loaded and listed until the TUI exits. agent-talk refuses `E_FOREIGN_LIVE` when a
+live TUI row names the session and no leader lists it `resident`, and `E_LOCKED` while its own
+direct child runs an unfinished turn. It takes its own lock only in direct mode, since clients of
+one leader do not exclude each other ([architecture.md](../architecture.md#local-state)).
 
 In `ls` a session is `running` while agent-talk's child runs it or the leader lists it `working`,
-`idle` when the leader lists it `idle`, else `unknown`.
+`waiting` when the leader lists it `needs_input` (a permission request is open), `idle` when the
+leader lists it `idle`, else `unknown`.
 
 ## Sending and turn end
 
@@ -72,13 +75,13 @@ In `ls` a session is `running` while agent-talk's child runs it or the leader li
   so the reply comes from the prompt's live message chunks. A permission cancellation is an
   accepted prompt whose turn ended `cancelled`.
 - Steer is `_x.ai/interject` on a session `working` in a live leader (`E_NO_STEER` without one,
-  `E_PRECONDITION` when idle). It has no client id and no expected-turn check: the ack is
-  acceptance, the turn comes from `_x.ai/session/interjection`, and if the turn ended meanwhile
-  Grok starts a fallback turn that the receipt then names. The steer message's turn ends at the
-  joined turn's `_x.ai/session/prompt_complete`, a fallback turn at its `turn_completed`
-  notification, since Grok sends no `prompt_complete` for it. A steer receipt accepted before the
-  interjection was seen names no turn, and `wait --receipt` on it is refused (`E_PRECONDITION`,
-  pointing at `read`), since nothing in the session store carries its id.
+  `E_PRECONDITION` when it is idle or waiting on a permission request). It has no client id and no
+  expected-turn check: the ack is acceptance, the turn comes from `_x.ai/session/interjection`, and
+  if the turn ended meanwhile Grok starts a fallback turn that the receipt then names. The steer
+  message's turn ends at the joined turn's `_x.ai/session/prompt_complete`, a fallback turn at its
+  `turn_completed` notification, since Grok sends no `prompt_complete` for it. A steer receipt
+  accepted before the interjection was seen names no turn, and `wait --receipt` on it is refused
+  (`E_PRECONDITION`, pointing at `read`), since nothing in the session store carries its id.
 - In direct mode the turn dies with the child: closing stdin makes Grok cancel it and write
   `turn_completed {stop_reason: cancelled}` (on 1.0.46 it died within about two seconds with no
   `turn_completed`, and a `session/cancel` sent before the prompt was running was ignored).
@@ -147,6 +150,6 @@ session); `tools/call` `_meta` carries no session
   a permission request it raises.
 - A steer receipt whose outcome is unknown and that names no turn is not refused by `wait
   --receipt`: it polls the session to the deadline.
-- Unverified: whether a TUI renders live a turn another leader client ran; leader behaviour with a
-  grok.com subscription login (it may open a relay); the effect of `GROK_DISABLE_AUTOUPDATER` on a
-  stdio agent.
+- Unverified: leader behaviour with a grok.com subscription login (it may open a relay); whether
+  `/new` in a leader TUI keeps the old session resident; the effect of `GROK_DISABLE_AUTOUPDATER` on
+  a stdio agent.
