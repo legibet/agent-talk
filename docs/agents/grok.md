@@ -2,8 +2,8 @@
 
 agent-talk speaks ACP (line-delimited JSON-RPC over stdio) to one `grok agent ... stdio` child per
 command: a proxy into the user's shared leader when one runs, otherwise an in-process agent
-(direct mode). Verified on Grok CLI 1.0.46; model setting, permission prompting and the cancel
-answer on 1.0.70. Grok updates itself, so behaviour can change under an installation.
+(direct mode). Verified on Grok CLI 1.0.77; the TUI cases were last checked on 1.0.46. Grok
+updates itself, so behaviour can change under an installation.
 
 ## Interface
 
@@ -75,11 +75,13 @@ In `ls` a session is `running` while agent-talk's child runs it or the leader li
   `E_PRECONDITION` when idle). It has no client id and no expected-turn check: the ack is
   acceptance, the turn comes from `_x.ai/session/interjection`, and if the turn ended meanwhile
   Grok starts a fallback turn that the receipt then names. The steer message's turn ends at the
-  joined turn's `_x.ai/session/prompt_complete`. A steer receipt accepted before the interjection
-  was seen names no turn, and `wait --receipt` on it is refused (`E_PRECONDITION`, pointing at
-  `read`), since nothing in the session store carries its id.
-- In direct mode the turn dies with the child (closing stdin ends it within about two seconds,
-  with no `turn_completed`), and a `session/cancel` sent before the prompt is running is ignored.
+  joined turn's `_x.ai/session/prompt_complete`, a fallback turn at its `turn_completed`
+  notification, since Grok sends no `prompt_complete` for it. A steer receipt accepted before the
+  interjection was seen names no turn, and `wait --receipt` on it is refused (`E_PRECONDITION`,
+  pointing at `read`), since nothing in the session store carries its id.
+- In direct mode the turn dies with the child: closing stdin makes Grok cancel it and write
+  `turn_completed {stop_reason: cancelled}` (on 1.0.46 it died within about two seconds with no
+  `turn_completed`, and a `session/cancel` sent before the prompt was running was ignored).
   So agent-talk observes the turn to its end even without `--wait`, in the command or in the MCP
   server ([behaviour.md](../behaviour.md#mcp-server)). When a deadline or signal ends observation,
   it waits briefly for the prompt to run, cancels it, answers its pending permission requests
@@ -102,13 +104,15 @@ client with one id, and the first answer wins. An unanswered request was still p
 - After agent-talk's direct-mode cancel, each pending request is answered `cancelled`
   ([behaviour.md](../behaviour.md#approvals)). Grok then reports `interaction_resolved`, writes
   `permission_resolved {decision: cancelled}` to `events.jsonl` and ends the prompt `cancelled`
-  within 70 ms. Unanswered, it resolves the request itself at the cancel, without a decision, and
+  within 10 ms. Unanswered, it resolves the request itself at the cancel, without a decision, and
   the `interaction_resolved` that follows would read as an answer from another client. A
   `cancelled` answer without a cancel ends the turn too (`PermissionCancelled`), and one after the
   turn ended is dropped silently.
 - Which commands prompt with yolo off is Grok's choice. On 1.0.70, without a rule, Grok resolved
   requests `allow` itself without reaching the client, while an `ask` rule in its configuration
-  (`[permission] ask = ["Bash(touch *)"]`) made it ask every time.
+  (`[permission] ask = ["Bash(touch *)"]`) made it ask every time. With that rule Grok also
+  asked with yolo on, for a command it could not split into simple ones (`sleep 20; echo
+  $VAR`), so full access does not silence the user's `ask` rules.
 
 ## Settings
 
@@ -125,8 +129,9 @@ client with one id, and the first answer wins. An unanswered request was still p
   anything is recorded; on `new` the empty session stays on disk and the error names it.
 - **Full access** sends `_meta.yoloMode: true` on `session/new` and on a direct-mode
   `session/load`. It holds for that process only and is never stored, so every direct-mode send
-  passes it again. It has no effect on a session resident in a leader, so `send --full-access`
-  there is refused (`E_UNSUPPORTED`).
+  passes it again. On a session resident in a leader it would turn full access on for every
+  client's turns until the session is unloaded, and `false` does not turn it off, so `send
+  --full-access` there is refused (`E_UNSUPPORTED`).
 
 ## Caller identity
 
@@ -142,8 +147,6 @@ session); `tools/call` `_meta` carries no session
   a permission request it raises.
 - A steer receipt whose outcome is unknown and that names no turn is not refused by `wait
   --receipt`: it polls the session to the deadline.
-- `reject_once` rests on frames captured on 1.0.46 and was not re-verified; on 1.0.70 only the
-  `cancelled` answer at a cancel was exercised.
 - Unverified: whether a TUI renders live a turn another leader client ran; leader behaviour with a
   grok.com subscription login (it may open a relay); the effect of `GROK_DISABLE_AUTOUPDATER` on a
   stdio agent.

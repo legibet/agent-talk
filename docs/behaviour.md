@@ -127,8 +127,9 @@ session keeps the change.
 
 **Full access** gives a session every permission and no approval prompts. On OpenCode it allows
 what the user's rules would ask and keeps what they deny
-([opencode.md](agents/opencode.md#approvals)). Without it the session runs under the agent's own
-configuration, except on Devin, whose ACP interface starts every session in `accept-edits`
+([opencode.md](agents/opencode.md#approvals)). On Grok the user's `ask` rules still ask, and
+agent-talk declines ([grok.md](agents/grok.md#approvals)). Without it the session runs under the
+agent's own configuration, except on Devin, whose ACP interface starts every session in `accept-edits`
 ([devin.md](agents/devin.md#approvals)). Once given, full access is not taken back. Restricted levels (read-only, workspace write) were left out: tested in
 October 2026, only Claude could enforce one with web tools allowed; Codex loses the sandbox when a
 thread unloads and its queue path cannot carry one; OpenCode's shell bypasses its edit rules; and

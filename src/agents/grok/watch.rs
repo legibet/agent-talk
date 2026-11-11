@@ -11,7 +11,7 @@ use crate::agents::history::first_line;
 use crate::agents::lifecycle::{ApprovalPolicy, record, resolve};
 use crate::model::{self, Approval, ApprovalOutcome, Error, ErrorCode, Progress, Result};
 use crate::store::Store;
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::HashSet;
 
 const REQUEST_PERMISSION: &str = "session/request_permission";
@@ -188,6 +188,21 @@ impl<'s> Watch<'s> {
         Ok(())
     }
 
+    /// A steer message that found no turn running: once the leader reported the
+    /// interjection, the fallback turn Grok starts for it is the one `prompt` names.
+    fn join_fallback(&mut self, prompt: Option<&str>) -> Result<()> {
+        if let Kind::Steer {
+            delivered: true,
+            joined: None,
+            ..
+        } = self.kind
+            && let Some(p) = prompt.filter(|p| p.starts_with("interject-fallback-"))
+        {
+            self.join(p.to_string())?;
+        }
+        Ok(())
+    }
+
     /// agent-talk sent `session/cancel`: answer each request still pending `cancelled`, as ACP
     /// requires, and every later one of the prompt too (docs/behaviour.md#approvals).
     /// Unanswered, Grok would resolve it itself without a decision
@@ -341,6 +356,7 @@ impl<'s> Watch<'s> {
                         *running = true;
                     }
                 }
+                self.join_fallback(running)?;
                 self.running_prompt = running.map(String::from);
             }
             "_x.ai/session/interjection" => {
@@ -353,7 +369,7 @@ impl<'s> Watch<'s> {
                 {
                     *delivered = true;
                     // Joined the running turn; with none running, Grok starts a fallback
-                    // turn, named by its first update.
+                    // turn, named by the queue or its first update.
                     if let Some(p) = self.running_prompt.clone() {
                         self.join(p)?;
                     }
@@ -361,11 +377,7 @@ impl<'s> Watch<'s> {
             }
             "session/update" => {
                 let p = params["_meta"]["promptId"].as_str();
-                if let Kind::Steer { joined: None, .. } = self.kind
-                    && let Some(p) = p.filter(|p| p.starts_with("interject-fallback-"))
-                {
-                    self.join(p.to_string())?;
-                }
+                self.join_fallback(p)?;
                 if p.is_none() || p != self.prompt_id() {
                     return Ok(None);
                 }
@@ -401,14 +413,34 @@ impl<'s> Watch<'s> {
                 }
             }
             "_x.ai/session_notification" => {
-                // Someone answered (or agent-talk's own answer took effect).
                 let u = &params["update"];
-                if updates::kind(u) == "interaction_resolved"
-                    && let Some(call_id) = u["tool_call_id"].as_str()
-                {
-                    resolve(self.store, &mut self.approvals, |a| {
-                        a.item_id.as_deref() == Some(call_id)
-                    });
+                match updates::kind(u) {
+                    // Someone answered (or agent-talk's own answer took effect).
+                    "interaction_resolved" => {
+                        if let Some(call_id) = u["tool_call_id"].as_str() {
+                            resolve(self.store, &mut self.approvals, |a| {
+                                a.item_id.as_deref() == Some(call_id)
+                            });
+                        }
+                    }
+                    // A fallback turn gets no `prompt_complete`
+                    // (docs/agents/grok.md#sending-and-turn-end). The update is the detail
+                    // of a turn that did not complete, as in updates.jsonl.
+                    "turn_completed" => {
+                        if let Kind::Steer {
+                            joined: Some(joined),
+                            ..
+                        } = &self.kind
+                            && joined.starts_with("interject-fallback-")
+                            && u["prompt_id"].as_str() == Some(joined.as_str())
+                        {
+                            return Ok(Some(End {
+                                turn_id: joined.clone(),
+                                result: Ok(json!({"stopReason": u["stop_reason"], "_meta": u})),
+                            }));
+                        }
+                    }
+                    _ => {}
                 }
             }
             _ => {}
@@ -643,6 +675,59 @@ mod tests {
                 Some("DONE. Codeword GAMMA.")
             )
         );
+    }
+
+    /// A steer message that finds no turn running starts a fallback turn, which ends at its
+    /// `turn_completed` (frames of grok 1.0.77, the usage cut). Another client's fallback
+    /// turn before the interjection is not the one, and the turn can end without agent text.
+    #[test]
+    fn steer_fallback_turn_ends_at_turn_completed() {
+        let store = store_with_intent("c");
+        store.accept("r", None, None, None).unwrap();
+        let fallback = "interject-fallback-01a1c99c-63f8-7083-abdf-8531e675abb1";
+        let completed = |prompt: &str, stop: &str| {
+            format!(
+                r#"{{"sessionId":"$S","update":{{"sessionUpdate":"turn_completed","prompt_id":"{prompt}","stop_reason":"{stop}"}}}}"#
+            )
+        };
+        let mut w = Watch::steer(&store, SESSION, "r", "hi", None, ApprovalPolicy::Observe);
+        frame(
+            &mut w,
+            "session/update",
+            r#"{"sessionId":"$S","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"theirs"}},"_meta":{"promptId":"interject-fallback-other"}}"#,
+        );
+        let other = completed("interject-fallback-other", "end_turn");
+        assert!(frame(&mut w, "_x.ai/session_notification", &other).is_none());
+        frame(
+            &mut w,
+            "_x.ai/session/interjection",
+            r#"{"sessionId":"$S","text":"hi"}"#,
+        );
+        assert_eq!(receipt(&store).turn_id, None);
+        frame(
+            &mut w,
+            "_x.ai/queue/changed",
+            r#"{"sessionId":"$S","entries":[],"runningPromptId":"interject-fallback-01a1c99c-63f8-7083-abdf-8531e675abb1","runningKind":"prompt"}"#,
+        );
+        assert_eq!(receipt(&store).turn_id.as_deref(), Some(fallback));
+        let end = frame(
+            &mut w,
+            "_x.ai/session_notification",
+            &completed(fallback, "cancelled"),
+        )
+        .expect("the fallback turn ended");
+        let t = w.turn(
+            "grok:s".into(),
+            end.turn_id,
+            &end.result.unwrap(),
+            "b",
+            None,
+        );
+        assert_eq!(
+            (t.turn_id.as_str(), t.status, t.final_text),
+            (fallback, TurnStatus::Interrupted, None)
+        );
+        assert_eq!(t.error.unwrap()["prompt_id"], fallback);
     }
 
     const PERMISSION: &str = r#"{"sessionId":"$S","toolCall":{"toolCallId":"call-f3cb…-0","kind":"execute","title":"Execute `env | grep -iE 'grok' | sort`","rawInput":{"variant":"Bash","command":"env | grep -iE 'grok' | sort"},"_meta":{"x.ai/tool":{"name":"run_terminal_command","read_only":false}}},"options":[{"optionId":"always-allow","kind":"allow_always","name":"Yes, and don't ask again for bash commands"},{"optionId":"allow-once","kind":"allow_once","name":"Yes, proceed"},{"optionId":"reject-once","kind":"reject_once","name":"No, and tell Grok what to do differently"},{"optionId":"reject-always","kind":"reject_always","name":"No, and don't ask again for this command"}]}"#;

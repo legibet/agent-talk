@@ -106,7 +106,7 @@ struct NewParams {
     name: Option<String>,
     /// An effort value returned by `models` for the selected model. Defaults to the agent's setting.
     effort: Option<String>,
-    /// Allow file edits, commands and network access without approval prompts. Defaults to false, which uses the agent's own permissions. The session runs unattended, so actions requiring approval are denied by the agent or declined by agent-talk.
+    /// Allow file edits, commands and network access without approval prompts. The user's own permission rules can still deny an action or ask for approval. Defaults to false, which uses the agent's own permissions. The session runs unattended, so actions requiring approval are denied by the agent or declined by agent-talk.
     full_access: Option<bool>,
     /// Wait for the first turn to end and include its result. Defaults to false.
     wait: Option<bool>,
@@ -142,7 +142,7 @@ struct SendParams {
     model: Option<String>,
     /// Switch the session to this effort value (from `models`) from this message on. Only on sessions created by agent-talk.
     effort: Option<String>,
-    /// Give the session file edits, commands and network access without approval prompts, from this message on. Only on sessions created by agent-talk. Cannot be turned off again.
+    /// Give the session file edits, commands and network access without approval prompts, from this message on. The user's own permission rules can still deny an action or ask for approval. Only on sessions created by agent-talk. Cannot be turned off again.
     full_access: Option<bool>,
     /// Wait for the turn to end and include its result. Defaults to false.
     wait: Option<bool>,

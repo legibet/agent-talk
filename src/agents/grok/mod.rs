@@ -632,7 +632,8 @@ impl<'a> Grok<'a> {
             let res = bounded(deadline, observe).await;
             let note = self.leader_change(&leader);
             // A steer message's turn ends with the joined turn's
-            // `_x.ai/session/prompt_complete`, never an error.
+            // `_x.ai/session/prompt_complete`, or a fallback turn's `turn_completed`, never
+            // an error.
             let res = res.map(|end| match end {
                 Some(End {
                     turn_id,
@@ -641,7 +642,7 @@ impl<'a> Grok<'a> {
                     h.clone(),
                     turn_id,
                     &v,
-                    "_x.ai/session/prompt_complete of the joined turn",
+                    "the joined turn's end, reported by the leader",
                     note.as_deref(),
                 )),
                 _ => None,
@@ -719,8 +720,8 @@ impl<'a> Grok<'a> {
 /// with this command and would take the turn down mid-step; end it Grok's way instead,
 /// so updates.jsonl records turn_completed (stop_reason cancelled), and answer the
 /// permission requests still open `cancelled`, as ACP requires after a cancel
-/// (docs/behaviour.md#approvals). A cancel sent before the prompt runs is ignored, hence
-/// the wait for it to start (docs/agents/grok.md#sending-and-turn-end).
+/// (docs/behaviour.md#approvals). Grok 1.0.46 ignored a cancel sent before the prompt ran,
+/// hence the wait for it to start (docs/agents/grok.md#sending-and-turn-end).
 async fn wind_down(w: &mut Watch<'_>, conn: &mut Conn, id: &str) {
     let ended = tokio::time::timeout(WIND_DOWN, w.until_running(conn)).await;
     if !matches!(ended, Ok(Ok(true))) {
@@ -912,8 +913,9 @@ impl Agent for Grok<'_> {
         let (route, mut conn) = self.route(id, &dir, Path::new(&cwd)).await?;
         let res = async {
             let direct = matches!(route, Route::Direct { .. });
-            // yoloMode only in direct mode: on a session resident in a leader it has no
-            // effect (docs/agents/grok.md#settings).
+            // yoloMode only in direct mode: on a session resident in a leader it would reach
+            // every client's turns and could not be taken back
+            // (docs/agents/grok.md#settings).
             if !direct && req.change.full_access {
                 return Err(Error::new(
                     ErrorCode::Unsupported,
