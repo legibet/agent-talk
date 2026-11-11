@@ -7,7 +7,7 @@ use crate::agents::history::first_line;
 use crate::agents::strip_provenance;
 use crate::model::{self, Caller, Error, Message, Phase, Result, Role, TurnStatus};
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -166,13 +166,17 @@ impl Line {
                     .is_some_and(|t| t.starts_with("[Request interrupted by user")))
     }
 
-    /// Local slash-command bookkeeping (`<command-name>…`, `<local-command-stdout>…`).
-    /// These lines carry no flag (no `origin`, no `promptSource`; only the companion
-    /// `<local-command-caveat>` line has `isMeta`), so the leading tag is the marker.
+    /// Local command bookkeeping: a slash command (`<command-name>…`,
+    /// `<local-command-stdout>…`) and the output of a `!` command (`<bash-stdout>…`), whose
+    /// `<bash-input>` line is the prompt. These lines carry no flag (no `origin`, no
+    /// `promptSource`; only the companion `<local-command-caveat>` line has `isMeta`), so the
+    /// leading tag is the marker.
     fn is_local_command(&self) -> bool {
         self.user_text().is_some_and(|t| {
             let t = t.trim_start();
-            t.starts_with("<command-name>") || t.starts_with("<local-command-")
+            ["<command-name>", "<local-command-", "<bash-stdout>"]
+                .iter()
+                .any(|tag| t.starts_with(tag))
         })
     }
 
@@ -391,22 +395,37 @@ pub fn transcript_turn(
         TurnEnd::Interrupt(i) | TurnEnd::NextPrompt(i) => i,
         TurnEnd::ProcessGone => entries.len(),
     };
-    let assistants: Vec<&Line> = (start..stop)
+    let assistants: Vec<(&Entry, &Line)> = (start..stop)
         .filter(|i| branch.contains(i))
-        .filter_map(|i| entries[i].line.as_ref())
-        .filter(|l| l.kind == "assistant")
+        .filter_map(|i| Some((&entries[i], entries[i].line.as_ref()?)))
+        .filter(|(_, l)| l.kind == "assistant")
         .collect();
+    // An assistant line Claude wrote in place of a reply the API refused.
+    let is_api_error = |e: &Entry| e.raw["isApiErrorMessage"] == true;
     let final_text = assistants
         .iter()
         .rev()
-        .filter_map(|l| l.message.as_ref())
+        .filter(|(e, _)| !is_api_error(e))
+        .filter_map(|(_, l)| l.message.as_ref())
         .map(|m| m.text.as_str())
         .find(|t| !t.is_empty())
         .map(String::from);
+    // A turn the API refused ends at such a line, and the TUI closes it with
+    // `turn_duration` like any other (docs/agents/claude-code.md#sending-and-turn-end).
+    let api_error = assistants
+        .last()
+        .filter(|(e, _)| is_api_error(e))
+        .map(|(e, l)| {
+            json!({
+                "type": e.raw["error"],
+                "status": e.raw["apiErrorStatus"],
+                "message": l.message.as_ref().map(|m| m.text.as_str()),
+            })
+        });
     // Without a marker, the last assistant line stopping on end_turn is the only hint.
     let by_stop_reason = if assistants
         .last()
-        .and_then(|l| l.message.as_ref())
+        .and_then(|(_, l)| l.message.as_ref())
         .and_then(|m| m.stop_reason.as_deref())
         == Some("end_turn")
     {
@@ -447,8 +466,11 @@ pub fn transcript_turn(
     model::Turn {
         handle,
         turn_id: entries[start].uuid().unwrap_or_default().into(),
-        status,
-        error: None,
+        status: match (&api_error, end) {
+            (Some(_), TurnEnd::Interrupt(_)) | (None, _) => status,
+            (Some(_), _) => TurnStatus::Failed,
+        },
+        error: api_error,
         final_text,
         duration_ms,
         basis: Some(basis),
@@ -746,6 +768,44 @@ mod tests {
             (t.status, t.duration_ms),
             (TurnStatus::Completed, Some(45007))
         );
+    }
+
+    /// A turn the API refused: a line Claude wrote in the reply's place, then
+    /// `turn_duration` (Claude Code 2.1.322, a TUI started with an unknown model; the
+    /// attachment lines between prompt and reply cut to the last one, without its content).
+    #[test]
+    fn api_error_fails_the_turn() {
+        let lines = [
+            r#"{"parentUuid":null,"isSidechain":false,"promptId":"e5fa8cb1-dd84-4ad1-92bf-bae4c0ead63d","type":"user","message":{"role":"user","content":"Reply with just: hi"},"uuid":"02f12e12-6161-4017-af81-e916c3dadece","timestamp":"2026-11-11T08:33:34.947Z","promptSource":"typed","turnOrigin":"human"}"#,
+            r#"{"parentUuid":"02f12e12-6161-4017-af81-e916c3dadece","isSidechain":false,"type":"attachment","uuid":"f2574abb-bad2-48a2-88bb-ec0516c6fe59"}"#,
+            r#"{"parentUuid":"f2574abb-bad2-48a2-88bb-ec0516c6fe59","isSidechain":false,"type":"assistant","uuid":"6332ee13-383d-4439-abe7-bd6d6bd6c0c0","timestamp":"2026-11-11T08:33:36.133Z","message":{"id":"277d7211-d18a-4d64-bc4f-f489e660214e","model":"<synthetic>","role":"assistant","stop_reason":"stop_sequence","stop_sequence":"","type":"message","content":[{"type":"text","text":"There's an issue with the selected model (claude-sonnet-0-0)."}]},"error":"model_not_found","isApiErrorMessage":true,"apiErrorStatus":404}"#,
+            r#"{"parentUuid":"6332ee13-383d-4439-abe7-bd6d6bd6c0c0","isSidechain":false,"type":"system","subtype":"turn_duration","durationMs":1207,"messageCount":16,"timestamp":"2026-11-11T08:33:36.139Z","uuid":"9db1cd2c-b980-41fb-90d6-3b00c25191ba","isMeta":false}"#,
+        ];
+        let entries = parse_entries(&lines.join("\n"));
+        let live = live_branch(&entries);
+        let end = turn_end(&entries, &live, 0).unwrap();
+        let t = transcript_turn(handle(), &entries, &live, 0, end, None);
+        assert_eq!((t.status, t.final_text), (TurnStatus::Failed, None));
+        let error = t.error.unwrap();
+        assert_eq!(
+            (&error["type"], &error["status"]),
+            (&json!("model_not_found"), &json!(404))
+        );
+    }
+
+    /// A `!` command in the TUI: the input line is the prompt, the output line is not one
+    /// (Claude Code 2.1.322).
+    #[test]
+    fn bash_mode_is_one_turn() {
+        let input = line(
+            r#"{"parentUuid":"c2f14350-3e36-467b-979a-aac1d87f01fb","isSidechain":false,"promptId":"5a09c96b-e09c-496e-bffc-8f41003fd1f9","type":"user","message":{"role":"user","content":"<bash-input>echo hi</bash-input>"},"uuid":"7557647c-d162-4ff8-9212-2288c462b46e","timestamp":"2026-11-11T08:28:22.120Z"}"#,
+        );
+        let output = line(
+            r#"{"parentUuid":"7557647c-d162-4ff8-9212-2288c462b46e","isSidechain":false,"promptId":"5a09c96b-e09c-496e-bffc-8f41003fd1f9","type":"user","message":{"role":"user","content":"<bash-stdout>hi</bash-stdout><bash-stderr></bash-stderr>"},"uuid":"0b7e3cd3-da58-40e0-a393-26b9c00b5a1d","timestamp":"2026-11-11T08:28:22.864Z","turnOrigin":"human"}"#,
+        );
+        assert!(input.is_prompt());
+        assert!(!output.is_prompt());
+        assert!(to_message(&output, "t", "i").is_none());
     }
 
     /// A concurrent resume (B) branches off A's tool_use; A's later lines are the live

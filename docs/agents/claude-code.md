@@ -1,9 +1,8 @@
 # Claude Code
 
 One `claude -p` process per `new` or `send` runs the turn; history, other processes' turns and
-listings come from Claude's transcripts and `claude agents`. Verified on Claude Code 2.1.322; the
-cases that need a TUI driven were last checked on 2.1.288 to 2.1.311. Claude Code updates itself,
-so behaviour can change under an installation.
+listings come from Claude's transcripts and `claude agents`. Verified on Claude Code 2.1.322.
+Claude Code updates itself, so behaviour can change under an installation.
 
 ## Interface
 
@@ -23,9 +22,10 @@ names, plus `haiku` (accepted on 2.1.291): the one model list agent-talk carries
   first `cwd`; when that is gone it refuses (`E_PRECONDITION`) rather than run elsewhere.
   `ls --cwd` computes Claude's folder name (the cut of long paths read in the 2.1.322 binary).
 - The input `uuid` becomes the prompt line's `uuid`, so the turn id is known before the run.
-- Turns group by `promptId`. User lines of tool results only, meta lines, compaction summaries,
-  sub-agent lines, local-command bookkeeping and interrupt markers start no turn; runtime input
-  (a task notification) does, shown `from: runtime`.
+- Turns group by `promptId`. User lines of tool results only, meta lines (a sub-agent's report
+  back is one), compaction summaries, sub-agent lines, local-command bookkeeping (the output
+  line of a `!` command included; its input line is the prompt) and interrupt markers start no
+  turn; runtime input (a task notification) does, shown `from: runtime`.
 - The live branch is the `parentUuid` chain from the newest line, or from the newest
   `last-prompt.leafUuid` when the newest line does not descend from it; `logicalParentUuid`
   crosses a compaction. Other branches appear only in `read --raw`, and `wait` on a turn there is
@@ -37,10 +37,12 @@ names, plus `haiku` (accepted on 2.1.291): the one model list agent-talk carries
 ## Writers and liveness
 
 Claude has no lock between processes: a `--resume` during another process's turn writes a second
-branch, and the next `--resume` follows only the newest leaf, dropping the other. agent-talk
-therefore takes its own lock ([architecture.md](../architecture.md#local-state)) and refuses to
-send while any live process holds the session, an idle TUI included: `E_LOCKED` for an
-agent-talk child, `E_FOREIGN_LIVE` otherwise, `E_CAP_MISSING` when `claude agents` fails.
+branch, and the next `--resume` follows only the newest `last-prompt` leaf, dropping the other. A
+TUI writes that record rarely, so after a `-p` writer joined a TUI's turn the TUI's later turns are
+off the resumed branch. agent-talk therefore takes its own lock
+([architecture.md](../architecture.md#local-state)) and refuses to send while any live process holds
+the session, an idle TUI included: `E_LOCKED` for an agent-talk child, `E_FOREIGN_LIVE` otherwise,
+`E_CAP_MISSING` when `claude agents` fails.
 
 `claude agents --json --all` lists every live process (TUI, `-p`, `claude --bg`) with pid and a
 `busy`/`idle` status. It also lists ended background sessions, with a `state` and no pid, so only
@@ -57,7 +59,9 @@ the listing, since a dropped entry could be the writer; an absent one is accepte
 - Other turns are read from the transcript, best effort. The TUI ends a turn with
   `system/turn_duration`, or a `[Request interrupted by user]` line after Esc; `-p` writes no
   marker. So a turn ends at a marker, a later prompt on the live branch, or once no live process
-  holds the session (`completed` only when the last assistant line stopped on `end_turn`).
+  holds the session (`completed` only when the last assistant line stopped on `end_turn`). A
+  turn whose last assistant line is one Claude wrote for a refused API request
+  (`isApiErrorMessage`) is `failed`, though the TUI closes it with `turn_duration` too.
   Liveness is checked before the read, so a read after every writer is gone is complete.
 - No steer (`E_NO_STEER`): a line written to a running process is absorbed into the turn or
   becomes the next one at Claude's discretion. No queue: a running turn's process holds the
@@ -86,8 +90,10 @@ Every shell command below a session inherits `CLAUDE_CODE_SESSION_ID`, which is 
 in the sender order ([behaviour.md](../behaviour.md#provenance-and-hops)). Claude sets it in each
 MCP server's environment to the spawning session, overriding an inherited value. Claude speaks MCP
 2026-07-28 without `initialize`; `tools/call` `_meta` has no session id, only
-`claudecode/toolUseId`, kept as the caller's `turn`. A TUI keeps its servers when it changes to
-another session, and they keep the id it started with (2.1.322).
+`claudecode/toolUseId`, kept as the caller's `turn`. A TUI keeps its servers through `/clear`,
+`/resume` and `/branch`, and they keep the session id of the moment they were spawned, the
+startup session unless the user reconnects the server with `/mcp`; shell commands see the
+current id.
 
 ## Limitations
 
@@ -95,8 +101,13 @@ another session, and they keep the id it started with (2.1.322).
   answerer, and agent-talk relies on Claude's own denial.
 - Other processes' turn ends are best effort, and after `system/turn_duration` `claude agents`
   can still say `busy` while a background agent is pending (the `basis` reports both).
-- A message sent through `agent-talk mcp` from a TUI that changed session names the session the
-  TUI started with as its sender, which may have no transcript.
+- A message sent through `agent-talk mcp` from a TUI that changed session with `/clear`,
+  `/resume` or `/branch` names the session the TUI held when the server was spawned, which may
+  have no transcript; reconnecting the server with `/mcp` corrects it.
+- A sub-agent's report back is a meta line, so the model's answer to it joins the turn of the
+  prompt before it, which then shows two final replies. A task notification that the model does
+  not answer starts a turn with no end marker: `wait` on it reports `running` until a later
+  prompt or the TUI's exit.
 - Unverified: `CLAUDE_CODE_SESSION_ID` in a globally registered MCP server under `-p` (verified
-  there with `--mcp-config`, and for a global server in a TUI); which TUI commands (`/clear`,
-  `/resume`) leave a server with the old session; the end marker of TUI turns that fail mid-turn.
+  there with `--mcp-config`, and for a global server in a TUI); the end marker of a TUI turn
+  that fails after a tool call.
