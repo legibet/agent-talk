@@ -1,9 +1,9 @@
 # Devin CLI
 
 agent-talk drives local Devin sessions over ACP, one `devin acp` child per command, and reads
-history from Devin's SQLite session store. Verified on Devin CLI 3000.11.92; points marked
-3000.11.228 were verified on that version. Devin updates itself in the background
-(`auto_update`), so behaviour can change under an installation.
+history from Devin's SQLite session store. Verified on Devin CLI 3000.12.43; the TUI cases were
+last checked on 3000.11.92. Devin updates itself in the background (`auto_update`), so behaviour
+can change under an installation.
 
 ## Interface
 
@@ -12,8 +12,9 @@ ACP (line-delimited JSON-RPC over stdio) to one `devin acp` child per `new`, `se
 ([architecture.md](../architecture.md#local-state)). The child uses the CLI's stored login; no
 `authenticate` call is needed.
 
-`devin -p` is not used: it prints the final text only, names no session, ends the turn at the
-first permission request, and rewrites the session's `working_directory` even when it is refused.
+`devin -p` is not used: it prints the final text only, names no session, rejects every
+permission request itself, and rewrites the session's `working_directory` even when it is
+refused.
 
 ## Sessions and history
 
@@ -26,8 +27,8 @@ first permission request, and rewrites the session's `working_directory` even wh
   chains under one `message_id`.
 - `session/prompt` takes a client message id as `_meta["cognition.ai/clientMessageId"]` (a UUID;
   anything else is ignored silently), echoes it in the `user_message_chunk` and stores it with
-  the user node (`metadata.extensions["chisel/client-message-id"]`). `-p` and the TUI set one too.
-  A prompt's turn id is that id, else the node's `message_id`.
+  the user node (`metadata.extensions["chisel/client-message-id"]`). The TUI set one too on
+  3000.11.92; `-p` sets none. A prompt's turn id is that id, else the node's `message_id`.
 - `read`: a user node with `is_user_input` is a `prompt`; the assistant node that ends a turn
   (`finish_reason: stop`, no tool calls) is `final`, other assistant text `commentary`; each tool
   call is one `other` message, its status from the matching tool node. Item ids are
@@ -41,8 +42,8 @@ first permission request, and rewrites the session's `working_directory` even wh
 - `new` is `session/new`, the settings, then the prompt. Devin writes the session row only at the
   first prompt, so a refused setting leaves just a lock file, and the error says so; the session
   is recorded as owned at `session/new`. `--name` is `_cognition.ai/session/rename` once the
-  first turn is over, because the title Devin writes after the first prompt overrides an earlier
-  rename; a failed rename is a note on the turn, not a failure.
+  first turn is over, because on 3000.11.92 the title Devin writes after the first prompt
+  overrode an earlier rename; a failed rename is a note on the turn, not a failure.
 - `ls` is `session/list`, followed through `nextCursor`, newest `updatedAt` first; `name` is the
   title, `preview` the chain's first prompt. `origin` is `devin` for every session agent-talk did
   not start: TUI, `-p` and ACP sessions look the same.
@@ -58,8 +59,8 @@ none of its own. Nor does it probe the lock file: a probe takes Devin's lock for
 Devin process opening the session at that moment would fail.
 
 `session/list` reports the holder in `_meta`: `cognition.ai/isLocked` and
-`cognition.ai/lockHolderPid`, which is `null` once the holder exited (3000.11.228) while the lock
-file keeps its pid. That, not a recorded pid being alive, tells `ls` and `wait` whether
+`cognition.ai/lockHolderPid`, which is `null` once the holder exited while the lock file keeps
+its pid. That, not a recorded pid being alive, tells `ls` and `wait` whether
 agent-talk's child still holds the session, because pids are reused. In `ls` a session is
 `running` while the listing names a child agent-talk recorded for it as the holder and that
 child's turn has no end in the chain; otherwise `unknown` with `loaded: yes` while locked (an
@@ -80,7 +81,8 @@ it does not say.
   tool call. An error response before acceptance rejects the receipt, one after it fails the
   turn; a connection lost after acceptance leaves the outcome unknown.
 - Closing the child's stdin or SIGTERM ends it at once; the lock is released and the running turn
-  dies, leaving only its user node. So a command observes its turn to the end even without
+  dies, leaving only its user node, or what a cancel leaves when a tool call was running. So a
+  command observes its turn to the end even without
   `--wait`, and over MCP the server keeps it ([behaviour.md](../behaviour.md#mcp-server)). At a
   deadline or signal agent-talk ends the turn with `session/cancel`, then answers pending
   permission requests `cancelled`; the response comes `cancelled` at once. A cancel during a tool
@@ -92,9 +94,9 @@ it does not say.
   (its pid may have been reused): `interrupted`, or `unknown` when its user node is missing.
   Otherwise it is `session/list` saying explicitly that no process holds the session: `unknown`,
   since a killed turn and one that ended without a final reply (a `-p` run after a rejected
-  permission) leave the same chain. The chain is read once more after the proof, in case the
-  writer finished in between. Each `session/list` starts a `devin acp`, so it is asked at most
-  every five seconds.
+  permission on 3000.11.92) leave the same chain. The chain is read once more after the proof,
+  in case the writer finished in between. Each `session/list` starts a `devin acp`, so it is
+  asked at most every five seconds.
 
 ## Approvals
 
@@ -103,12 +105,13 @@ configuration (`devin acp` takes no `--permission-mode`): workspace edits run, o
 MCP calls ask, and the user's `permissions.allow` rules apply. Sessions agent-talk starts
 therefore run in `accept-edits` rather than the user's default.
 
-ACP offers no `normal` mode, the CLI's default: a session stored in it loads as `accept-edits`,
-and the `devin acp` process stores that when it exits, even without a prompt (3000.12.43; on
-3000.11.228 only a prompt stored it). So `send` refuses a `normal` session agent-talk did not
-start before `session/load`. Any other session it did not start is sent to only when the mode
-`session/load` reports equals its stored `agent_mode`, read again after the load (the lock then
-excludes every other writer). Both refusals are `E_UNSUPPORTED`, before anything is recorded.
+ACP offers `accept-edits`, `smart`, `ask`, `plan` and `bypass`, but neither `normal`, the CLI's
+default, nor `autonomous`: a session stored in one of those two loads as `accept-edits`, and the
+`devin acp` process stores that when it exits, even without a prompt (on 3000.11.228 only a
+prompt stored it). So `send` refuses a session agent-talk did not start before `session/load`
+unless ACP offers its stored mode. Such a session is sent to only when the mode `session/load`
+reports equals its stored `agent_mode`, read again after the load (the lock then excludes every
+other writer). Both refusals are `E_UNSUPPORTED`, before anything is recorded.
 The first check is not atomic with the load: a session that another process turns `normal` in
 between is refused after the load, and the child's exit then stores `accept-edits`. `read` and
 `wait` work on every session.
@@ -120,8 +123,8 @@ user's sessions requests are recorded and left pending ([behaviour.md](../behavi
 When agent-talk cancels a turn, the `cancelled` answers follow the `session/cancel`, because
 Devin reads a `cancelled` answer that comes first as a skip ("User skipped this tool call") and
 the model goes on. After the cancel the turn ends the same way with or without the answer (a
-`Canceled` tool node, the response `cancelled`); left unanswered, the request is dropped with a
-warning in Devin's log, and an answer after the response is accepted silently (3000.11.228).
+`Canceled` tool node, the response `cancelled`): Devin withdraws the request itself with
+`$/cancel_request` and ignores a later answer.
 
 Full access is `session/set_mode {modeId: "bypass"}`, which Devin stores with the session and
 every later load keeps, including the user's TUI.
@@ -158,18 +161,17 @@ there.
 - A Devin caller is `unknown`, or attributed to the agent whose session variable Devin inherited
   (a Devin started from a Claude shell carries `CLAUDE_CODE_SESSION_ID`), unless pinned with
   `--from` or `--caller`.
-- Sessions agent-talk starts run in `accept-edits`, not the user's default mode, and a
-  `normal`-mode session agent-talk did not start is refused for `send`, until Devin offers
-  `normal` over ACP.
-- A turn killed with its process leaves no marker, so a later reader cannot tell it from a running
-  one without the lock, nor from one that ended without a final reply, nor a prompt joined
-  mid-turn from one whose process died.
+- Sessions agent-talk starts run in `accept-edits`, not the user's default mode, and a session
+  agent-talk did not start in a mode ACP does not offer (`normal`, `autonomous`) is refused for
+  `send`.
+- A turn killed with its process before a tool call leaves no marker, so a later reader cannot
+  tell it from a running one without the lock, nor from one that ended without a final reply,
+  nor a prompt joined mid-turn from one whose process died.
 - A pending approval on the user's session cannot be answered by anyone while agent-talk's child
   holds the lock. `send --wait` waits for its deadline and then cancels the turn; `send` without
   `--wait` on the CLI observes until it is interrupted; an MCP call with `wait=false` keeps the
   turn until the server exits.
 - Each `devin acp` run (also for `ls`, `models` and `wait`'s holder checks) leaves a log file
   under `~/.local/share/devin/cli/logs/`; `models` also leaves a lock file.
-- Unverified: errors from the model service over ACP, `session/close`, whether a TUI shows a
-  turn another process ran once it reopens the session, and whether a load also changes the
-  stored mode of a session in a mode other than `normal` that ACP opens differently.
+- Unverified: errors from the model service over ACP, and whether a TUI shows a turn another
+  process ran once it reopens the session.

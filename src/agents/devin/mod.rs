@@ -101,6 +101,11 @@ impl Listed {
     }
 }
 
+/// The permission modes ACP offers. A session stored in one of them is opened in it; one
+/// stored in any other (`normal`, `autonomous`) is opened in `accept-edits`
+/// (docs/agents/devin.md#approvals).
+const ACP_MODES: [&str; 5] = ["accept-edits", "smart", "ask", "plan", "bypass"];
+
 /// The refusal of a `send` to a session agent-talk did not start, which Devin stored in the
 /// permission mode `stored` and ACP opens in `opened` (docs/agents/devin.md#approvals).
 fn mode_differs(h: &str, stored: &str, opened: &str) -> Error {
@@ -315,9 +320,9 @@ impl<'a> Devin<'a> {
     /// Record the intent, submit its text as a prompt on the open session and observe it
     /// until it ends or `wait`'s deadline passes, then settle the receipt. Without a deadline
     /// the outcome goes to `wait`'s keeper, if any, once the prompt is accepted. `name` is set
-    /// once the turn is over, since Devin's automatic title after the first prompt would
-    /// override an earlier rename (docs/agents/devin.md#sessions-and-history). The caller
-    /// closes `conn`.
+    /// once the turn is over, since Devin's automatic title after the first prompt overrode
+    /// an earlier rename on 3000.11.92 (docs/agents/devin.md#sessions-and-history). The
+    /// caller closes `conn`.
     async fn run(
         &self,
         conn: &mut Conn,
@@ -639,11 +644,11 @@ impl Agent for Devin<'_> {
         }
         let policy = approval_policy(self.store, &h)?;
         let owned = self.store.is_owned(&h)?;
-        // ACP offers no `normal` mode: it opens such a session in `accept-edits`, and the
+        // ACP opens a session stored in a mode it does not offer in another one, and the
         // child stores that when it exits, prompt or not. So the session is refused before
         // the load (docs/agents/devin.md#approvals).
-        if !owned && row.agent_mode == "normal" {
-            return Err(mode_differs(&h, &row.agent_mode, "accept-edits"));
+        if !owned && !ACP_MODES.contains(&row.agent_mode.as_str()) {
+            return Err(mode_differs(&h, &row.agent_mode, "another mode"));
         }
         let mut conn = self.connect(Path::new(&row.cwd)).await?;
         let res = async {
@@ -763,9 +768,8 @@ impl Agent for Devin<'_> {
                 if let Some(gone) = gone {
                     // agent-talk's own child died or was ended with the turn: interrupted.
                     // Nobody holding a foreign turn proves only that it will not go on: a
-                    // killed turn and one that ended without a final reply (a `-p` run after
-                    // a rejected permission) leave the same chain
-                    // (docs/agents/devin.md#sending-and-turn-end).
+                    // killed turn and one that ended without a final reply leave the same
+                    // chain (docs/agents/devin.md#sending-and-turn-end).
                     let (status, message) = match (child, span) {
                         (Some(_), Some(_)) => (
                             TurnStatus::Interrupted,
