@@ -8,9 +8,9 @@
 //!
 //! Turns: a `user` node with `metadata.is_user_input` opens one, its turn id the client
 //! message id Devin stored for it, else its `message_id`. A turn ends at a final assistant
-//! node or at a tool node Devin's cancel marked `Canceled`; a prompt that comes before either
-//! leaves it `unknown`, since the chain does not tell a dead process from two prompts
-//! answered together.
+//! node, or at a tool node Devin's cancel marked `Canceled` or the TUI user denied; a prompt
+//! that comes before any of them leaves it `unknown`, since the chain does not tell a dead
+//! process from two prompts answered together.
 
 use crate::agents::history::first_line;
 use crate::model::{self, Message, Phase, Result, Role, TurnStatus};
@@ -127,6 +127,13 @@ fn is_canceled(n: &Value) -> bool {
     role(n) == "tool" && extension(n, "chisel/tool_failure")["reason"] == "Canceled"
 }
 
+/// A tool node whose call the user denied in the TUI, where Devin ends the turn. After a
+/// rejection over ACP or in `-p` (`interactive: false`) the model goes on.
+fn is_denied(n: &Value) -> bool {
+    role(n) == "tool"
+        && extension(n, "chisel/tool_failure")["reason"]["Rejected"]["interactive"] == true
+}
+
 /// The turn id of a prompt node: its client message id, else its `message_id`.
 fn turn_id(n: &Value) -> String {
     extension(n, "chisel/client-message-id")
@@ -141,7 +148,7 @@ fn turn_id(n: &Value) -> String {
 pub enum End {
     /// At this final assistant node.
     Completed(usize),
-    /// At this canceled tool node.
+    /// At this canceled or denied tool node.
     Interrupted(usize),
     /// The next prompt came before either: the process that took this one died, or Devin
     /// answered both prompts together; the chain does not tell which.
@@ -171,7 +178,7 @@ impl History {
                         Some(End::Superseded)
                     } else if is_final(n) {
                         Some(End::Completed(j))
-                    } else if is_canceled(n) {
+                    } else if is_canceled(n) || is_denied(n) {
                         Some(End::Interrupted(j))
                     } else {
                         None
@@ -290,7 +297,7 @@ impl History {
                 TurnStatus::Interrupted,
                 None,
                 Some(json!({"message": content(&self.nodes[j])})),
-                "sessions.db: a tool call canceled by session/cancel",
+                "sessions.db: a tool call canceled by session/cancel or denied in the TUI",
             ),
             End::Superseded => (
                 TurnStatus::Unknown,
@@ -415,6 +422,24 @@ mod tests {
             prompt("u6", Some("c6"), "still running"),
             assistant("a6", "", "tool_calls", &exec("exec:3#4", "make")),
         ])
+    }
+
+    /// A Deny in the TUI ends the turn at the tool node; a rejection over ACP does not
+    /// (Devin 3000.12.43).
+    #[test]
+    fn a_tui_denial_ends_the_turn() {
+        let rejected = |interactive: bool| json!({"chisel/tool_failure": {"reason": {"Rejected": {"interactive": interactive}}}});
+        let h = History::new(vec![
+            prompt("u1", Some("c1"), "touch x"),
+            assistant("a1", "", "tool_calls", &exec("exec:0#1", "touch x")),
+            tool("exec:0#1", &rejected(true)),
+            prompt("u2", Some("c2"), "touch y"),
+            assistant("a2", "", "tool_calls", &exec("exec:1#2", "touch y")),
+            tool("exec:1#2", &rejected(false)),
+            assistant("a3", "Not allowed.", "stop", &json!([])),
+        ]);
+        let ends: Vec<_> = h.spans.iter().map(|s| s.end).collect();
+        assert_eq!(ends, [Some(End::Interrupted(2)), Some(End::Completed(6))]);
     }
 
     #[test]

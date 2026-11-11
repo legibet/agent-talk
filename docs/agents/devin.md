@@ -1,9 +1,8 @@
 # Devin CLI
 
 agent-talk drives local Devin sessions over ACP, one `devin acp` child per command, and reads
-history from Devin's SQLite session store. Verified on Devin CLI 3000.12.43; the TUI cases were
-last checked on 3000.11.92. Devin updates itself in the background (`auto_update`), so behaviour
-can change under an installation.
+history from Devin's SQLite session store. Verified on Devin CLI 3000.12.43. Devin updates
+itself in the background (`auto_update`), so behaviour can change under an installation.
 
 ## Interface
 
@@ -27,15 +26,17 @@ refused.
   chains under one `message_id`.
 - `session/prompt` takes a client message id as `_meta["cognition.ai/clientMessageId"]` (a UUID;
   anything else is ignored silently), echoes it in the `user_message_chunk` and stores it with
-  the user node (`metadata.extensions["chisel/client-message-id"]`). The TUI set one too on
-  3000.11.92; `-p` sets none. A prompt's turn id is that id, else the node's `message_id`.
+  the user node (`metadata.extensions["chisel/client-message-id"]`). The TUI sets one too; `-p`
+  sets none. A prompt's turn id is that id, else the node's `message_id`.
 - `read`: a user node with `is_user_input` is a `prompt`; the assistant node that ends a turn
   (`finish_reason: stop`, no tool calls) is `final`, other assistant text `commentary`; each tool
   call is one `other` message, its status from the matching tool node. Item ids are
   `<message_id>-<phase>` and the tool call id, both stable across the copies. `--raw` gives the
   span's `chat_message` records.
 - In the chain a turn ends at the first later `final` node, or `interrupted` at a tool node
-  Devin's cancel marked `Canceled`. A prompt that comes before either leaves the earlier turn
+  Devin's cancel marked `Canceled` or the user denied in the TUI (`Rejected {interactive:
+  true}`; after a rejection over ACP or in `-p` the model goes on). A prompt that comes before
+  any of them leaves the earlier turn
   `unknown`: the process that took it died, or Devin answered both together (a prompt sent on the
   holding connection mid-turn is inserted after the running tool result), and the chain does not
   tell which.
@@ -50,13 +51,13 @@ refused.
 
 ## Writers and liveness
 
-A process holds `session_locks/<id>.lock` from opening a session until it exits, idle or not, and
-a second opener is refused: `session/load` fails `-32015` with
-`data["cognition.ai/errorKind"] = "session_locked"` and `lockHolderPid`, before anything is
-written. agent-talk maps it to `E_LOCKED` when the pid is a child it recorded for the session,
-else `E_FOREIGN_LIVE`, keeping the agent's error. Since Devin enforces this lock, agent-talk takes
-none of its own. Nor does it probe the lock file: a probe takes Devin's lock for an instant, and a
-Devin process opening the session at that moment would fail.
+A process holds `session_locks/<id>.lock` from opening a session until it exits or, in the TUI,
+moves to another session (`/clear`, `/resume`), idle or not, and a second opener is refused:
+`session/load` fails `-32015` with `data["cognition.ai/errorKind"] = "session_locked"` and
+`lockHolderPid`, before anything is written. agent-talk maps it to `E_LOCKED` when the pid is a
+child it recorded for the session, else `E_FOREIGN_LIVE`, keeping the agent's error. Since Devin
+enforces this lock, agent-talk takes none of its own. Nor does it probe the lock file: a probe takes
+Devin's lock for an instant, and a Devin process opening the session at that moment would fail.
 
 `session/list` reports the holder in `_meta`: `cognition.ai/isLocked` and
 `cognition.ai/lockHolderPid`, which is `null` once the holder exited while the lock file keeps
@@ -173,5 +174,4 @@ there.
   turn until the server exits.
 - Each `devin acp` run (also for `ls`, `models` and `wait`'s holder checks) leaves a log file
   under `~/.local/share/devin/cli/logs/`; `models` also leaves a lock file.
-- Unverified: errors from the model service over ACP, and whether a TUI shows a turn another
-  process ran once it reopens the session.
+- Unverified: errors from the model service over ACP.
