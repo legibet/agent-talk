@@ -402,7 +402,7 @@ pub fn resume_error(e: Error) -> Error {
     Error {
         code: ErrorCode::ForeignLive,
         message: format!(
-            "{}: the thread is open in another Codex app-server process (the ChatGPT desktop app and the VS Code extension run their own), which holds its writer lock; close it there or wait, then retry",
+            "{}: the thread is open in another Codex process (a TUI outside the daemon, codex exec, the ChatGPT desktop app or the VS Code extension), which holds its writer lock; close it there or wait, then retry",
             e.message
         ),
         ..e
@@ -571,7 +571,7 @@ mod tests {
         let v = incoming(ACTIVE_WRITER).error.unwrap();
         let e = resume_error(Error::from_agent(classify_error(&v), v));
         assert_eq!(e.code, ErrorCode::ForeignLive);
-        assert!(e.message.contains("another Codex app-server process"));
+        assert!(e.message.contains("another Codex process"));
         let v = e.agent_error.unwrap();
         assert_eq!(v.code, -32600);
         assert_eq!(

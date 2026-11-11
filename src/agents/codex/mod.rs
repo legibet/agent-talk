@@ -738,13 +738,18 @@ impl Agent for Codex<'_> {
             }
             let h = handle(&t.id);
             let owned = self.store.is_owned(&h)?;
+            // The daemon labels every thread it creates with its first client's name, which
+            // can be agent-talk's on a thread it did not start
+            // (docs/agents/codex.md#sessions-and-history).
             let origin = if owned {
                 "agent-talk".to_string()
             } else {
-                t.originator.unwrap_or_else(|| match t.source {
-                    Value::String(s) => s,
-                    other => other.to_string(),
-                })
+                t.originator
+                    .filter(|o| o != "agent-talk")
+                    .unwrap_or_else(|| match t.source {
+                        Value::String(s) => s,
+                        other => other.to_string(),
+                    })
             };
             items.push(Session {
                 handle: h,

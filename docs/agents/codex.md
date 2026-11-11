@@ -2,8 +2,8 @@
 
 Each command connects to the shared app-server daemon's control socket, subscribes to a
 thread, submits, observes and disconnects; the turn goes on in the daemon. Verified on codex-cli
-0.167.0 with the daemon on 0.167.1; the TUI cases were last checked on 0.160.0. The daemon
-updates itself and can run another version than the CLI; `status` reports both.
+0.167.0 with the daemon on 0.167.1. The daemon updates itself and can run another version than
+the CLI; `status` reports both.
 
 ## Interface
 
@@ -39,17 +39,27 @@ covers many unrelated refusals, so errors are told apart by method and message.
   file repeats and only its newest row counts. The state-DB-only listing avoids the repeats but
   has null `originator` and stale `updatedAt` on most rows. A thread that is not loaded shows
   `state: unknown`.
+- `origin` is the thread's `originator`, else its `source`. The daemon gives every thread it
+  creates the `clientInfo.name` of the first client that connected after it started, whoever
+  created the thread, so for a daemon thread the label does not say which client made it. A
+  standalone process labels its own threads: `codex-tui` for a TUI outside the daemon,
+  `codex_exec` for `codex exec`. agent-talk shows `agent-talk` only on threads it started and
+  falls back to `source` when the daemon put that name on another client's thread. A TUI names
+  its thread itself after the first prompt, so `name` is set on threads the user never named.
 
 ## Writers and liveness
 
-- The TUI runs inside the daemon unless started with `--no-daemon` or before the daemon. Within
-  the daemon every client shares the loaded thread and gets identical events, so a turn
-  agent-talk starts shows live in the user's TUI.
-- `codex exec` is always standalone; the ChatGPT desktop app and the VS Code extension run their
-  own app-server. A process holds a per-thread writer lock for as long as it has the thread
-  loaded, idle or running, `codex exec` for its whole run, and `thread/resume` from another
-  process fails with `-32600 "thread <id> already has an active writer"` until the holder lets
-  go: `E_FOREIGN_LIVE`, refused before an intent is recorded.
+- The TUI runs inside the daemon unless the daemon was not running or an option needs an app-server
+  of its own: `--no-daemon`, a `-c` or `--search` override other than a `features.*` boolean or
+  `tui.fullscreen_transcript`, `--profile`, `--oss`, `--strict-config` (the TUI says so in a startup
+  warning). Within the daemon every client shares the loaded thread and gets identical events, so a
+  turn agent-talk starts shows live in the user's TUI; a queued message shows there only once its
+  turn starts.
+- `codex exec` and a TUI outside the daemon are standalone; the ChatGPT desktop app and the VS Code
+  extension run their own app-server. A process holds a per-thread writer lock for as long as it has
+  the thread loaded, idle or running, `codex exec` for its whole run, and `thread/resume` from
+  another process fails with `-32600 "thread <id> already has an active writer"` until the holder
+  lets go: `E_FOREIGN_LIVE`, refused before an intent is recorded.
 - "Not loaded" cannot tell a stopped thread from one running in a standalone process; agent-talk
   proceeds through the daemon.
 - `thread/resume` loads a thread and rejoins a loaded one without replaying earlier
@@ -97,7 +107,9 @@ Every subscribed connection gets the same request id, and any answer resolves it
 (`serverRequest/resolved`); an unanswered one was still pending after 20 s, the longest window
 observed. Closing a connection is not an answer; a later resume replays the request, so requests
 are recorded once by request and item id. Declined command items appear only in live events, not
-in history.
+in history; a TUI shows another client's decline as a command that exited with status 1. A TUI
+offers the request's `availableDecisions`: where `decline` is missing, as for an escalated
+command, the user's only refusal there is `cancel`, which interrupts the turn.
 
 ## Settings
 
@@ -125,11 +137,10 @@ Under approval policy `never`, Codex fails MCP tool calls unless the server entr
 
 - `wait --turn` on a steered turn attaches the newest receipt on that turn (steered messages
   share the turn id).
-- A thread held by another process (`codex exec`, the desktop app, VS Code) is refused only at
-  `thread/resume`, and `ls` does not show which process holds it.
+- A thread held by another process (`codex exec`, a TUI outside the daemon, the desktop app, VS
+  Code) is refused only at `thread/resume`, and `ls` shows it `unknown`, like a stopped thread.
 - Only `send` starts a dormant queued item; `wait --receipt` on one left dormant earlier reports
   it `pending`.
 - A connection lost mid-`wait` ends with `E_TRANSPORT` without a history re-read.
 - `status` marks a method unavailable only when the daemon reports it missing.
-- Unverified: how a terminal TUI renders a decline from agent-talk; `send` changing the model
-  (effort and full access were exercised).
+- Unverified: `send` changing the model (effort and full access were exercised).
